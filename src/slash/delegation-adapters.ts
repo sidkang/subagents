@@ -390,6 +390,9 @@ export function toSubagentDelegationResponse(
 	}
 	const usage = child?.usage;
 	const childLaunchContractDigest = (child as { launchContractDigest?: string } | undefined)?.launchContractDigest;
+	const childSessionFile = typeof child?.sessionFile === "string" && child.sessionFile.trim()
+		? child.sessionFile
+		: undefined;
 	return {
 		requestId: request.requestId,
 		ownerRunId: request.ownerRunId,
@@ -401,6 +404,7 @@ export function toSubagentDelegationResponse(
 		...(child?.model ? { model: child.model } : {}),
 		...(child?.thinking ? { thinking: child.thinking } : {}),
 		...(typeof child?.exitCode === "number" ? { exitCode: child.exitCode } : {}),
+		...(childSessionFile ? { sessionFile: childSessionFile } : {}),
 		...(childLaunchContractDigest ? { launchContractDigest: childLaunchContractDigest } : {}),
 		...(projectedResult ? { result: projectedResult } : {}),
 		...(usage ? {

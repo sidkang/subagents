@@ -4,11 +4,11 @@
 >
 > **本文基线：** `main` 的 `fff1801cd229512f6c04b6a682856cb52fa93815`（`pi-subagents` 0.45.2）
 >
-> **状态：** 设计与移植说明。本提交只增加文档，**尚未**把下述 M1/M2 运行时代码移植到这个 fork。
+> **状态：** M1/M2 已迁入这个 fork 的 source tree；本文是其产品合同、维护边界和未来 rebase 指南。
 
-本 fork 的目标是把目前在外部 delivery bundle 中以 `patch-package` 与独立 overlay
-实现的能力，变成这个 fork 中可正常审阅、测试和提交的源代码。这样后续开发和上游
-rebase 不需要在 `node_modules` 中重新手工应用一组跨文件补丁。
+本 fork 已把原先在外部 delivery bundle 中以 `patch-package` 与独立 overlay 实现的能力，
+迁入可正常审阅、测试和提交的 source tree。后续开发和上游 rebase 不需要在
+`node_modules` 中重新手工应用一组跨文件补丁。
 
 本文记录的是已经验证过的产品合同，而不是要求原样复制旧补丁。旧实现以
 `pi-subagents@0.44.0`、上游 commit
@@ -87,11 +87,12 @@ working-copy change。这样 Source 后续 snapshot、兄弟 Child 的创建和 
 
 实现必须保留以下约束：
 
-1. **snapshot-first：** capture 和 cleanup 的工作副本检查先执行 `jj util snapshot`；在
-   第一次 snapshot 成功前不得执行 `jj workspace update-stale`。否则外部 rewrite 后的
-   未 snapshot 文件可能丢失。
+1. **snapshot-first：** 在确认 workspace name、canonical path 和 Child change 属于记录对象后，
+   capture 和 cleanup 的工作副本检查先执行 `jj util snapshot`；在第一次 snapshot 成功前不得
+   执行 `jj workspace update-stale`。否则外部 rewrite 后的未 snapshot 文件可能丢失。
 2. **精确身份：** cleanup 记录并验证 workspace name、canonical path、Child change id 和
-   base commit id；不能只按 name 删除。
+   base commit id；不能只按 name 删除。snapshot 后还必须重新验证完整拓扑，才可删除 synthetic
+   path、forget workspace 或 abandon change。
 3. **拓扑检查：** destructive cleanup 前确认当前 `@` 仍是记录的 Child change、其 parents
    与 `D0` 对应，且没有 live foreign descendants。
 4. **保守失败：** path 缺失、name 被重绑、snapshot/forget 失败、change 不匹配或出现未知
@@ -102,10 +103,10 @@ working-copy change。这样 Source 后续 snapshot、兄弟 Child 的创建和 
 这些检查只保护一个 `worktree:true` Child；它们不是 workflow recovery ledger，也不改变
 上游的并发或 handoff 产品语义。
 
-### 3.4 0.45.2 的预期实现落点
+### 3.4 0.45.2 的 source-owned 实现落点
 
 当前 fork 的 Git backend 集中在 `src/runs/shared/worktree.ts`，并由
-`src/runs/shared/parallel-handoff.ts` 重建 cleanup。建议：
+`src/runs/shared/parallel-handoff.ts` 重建 cleanup。M1 已按以下边界实现：
 
 - 在 `worktree.ts` 内形成明确的 Git/JJ backend seam，而不是把 JJ 命令散落到 executor；
 - 给 `WorktreeInfo` / cleanup task 增加可序列化、可区分 backend 的 identity；保留已有
@@ -173,9 +174,9 @@ Host 临时根优先使用 canonical `/tmp`（macOS 常为 `/private/tmp`）；�
 - 无法确认、Parent crash 或 hard kill 时保留目录给 OS 临时目录治理；
 - scratch 不进入 JJ patch，不承担 handoff/retained/recovery 语义。
 
-### 4.4 0.45.2 的预期实现落点
+### 4.4 0.45.2 的 source-owned 实现落点
 
-当前版本相较旧 0.44 已扩展了 workflow mission、async 和 Child execution 路径。移植时至少审查：
+当前版本相较旧 0.44 已扩展了 workflow mission、async 和 Child execution 路径。M2 已在以下位置接线；未来 rebase 至少复查这些位置：
 
 | 责任 | 当前候选文件 |
 |---|---|
@@ -187,8 +188,8 @@ Host 临时根优先使用 canonical `/tmp`（macOS 常为 `/private/tmp`）；�
 | Companion 源文件 | 新增 `src/runs/shared/workflow-shared-scratch-child.ts` |
 | Host scope 实现 | 新增 `src/runs/shared/workflow-shared-scratch.ts` |
 
-不能假定旧版 `subagent-executor.ts` 的少量 hunk 可直接应用：0.45.2 的 workflow launch 还会记录
-mission、heartbeat、async child 和 launch observers。M2 必须包裹现有 `launch`，不能跳过或复制
+旧版 `subagent-executor.ts` 的少量 hunk 不能直接当作未来 rebase 的来源：0.45.2 的 workflow launch
+还会记录 mission、heartbeat、async child 和 launch observers。M2 只包裹现有 `launch`，不会跳过或复制
 这些职责。
 
 ## 5. delegation `sessionFile`
@@ -196,11 +197,9 @@ mission、heartbeat、async child 和 launch observers。M2 必须包裹现有 `
 旧 0.44 delivery bundle 额外把实际 Child `sessionFile` 投影到公开的 structural delegation
 terminal response，供 Host integration 验证 Child session cwd。
 
-当前 0.45.2 已在多处内部 result / prompt-template bridge 记录 `sessionFile`，但
-`src/api/delegation.ts` 的 `SubagentDelegationTerminalResponse` 仍应在移植前逐项核验。若公开
-terminal contract 尚未包含该字段，应以一次小而独立的 source commit 增加它，并在
-`src/slash/delegation-adapters.ts` 中投影实际 Child sessionFile。不要把这个兼容字段与 M1/M2
-逻辑混在同一巨大改动中。
+本 fork 已将 `sessionFile?: string` 加入 `src/api/delegation.ts` 的
+`SubagentDelegationTerminalResponse`，并由 `src/slash/delegation-adapters.ts` 投影实际 Child
+sessionFile。该字段保持为可选的结构化兼容字段；它不改变 M1/M2 的生命周期或调度语义。
 
 ## 6. 推荐的提交顺序
 

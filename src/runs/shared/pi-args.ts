@@ -15,6 +15,13 @@ import {
 import { resolvePiPackageRoot } from "./pi-spawn.ts";
 import { RUNTIME_EXTENSION_ACK_PATH_ENV } from "./runtime-acknowledged-extensions.ts";
 import {
+	companionExtensionPath,
+	getActiveWorkflowSharedScratchEnv,
+	shouldInjectWorkflowSharedScratchCompanion,
+	WORKFLOW_SHARED_SCRATCH_ENV,
+} from "./workflow-shared-scratch.ts";
+
+import {
 	STRUCTURED_OUTPUT_CAPTURE_ENV,
 	STRUCTURED_OUTPUT_SCHEMA_ENV,
 } from "./structured-output.ts";
@@ -593,6 +600,10 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	}
 	for (const extPath of toolPlan.extensionArgs)
 		args.push("--extension", extPath);
+	// subagents: always-load workflow shared-scratch companion when Host scope is active.
+	if (shouldInjectWorkflowSharedScratchCompanion()) {
+		args.push("--extension", companionExtensionPath());
+	}
 
 	if (!input.inheritProjectContext) {
 		args.push("--no-context-files");
@@ -818,6 +829,17 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 
 	env[SUBAGENT_PARENT_SESSION_ENV] =
 		input.parentSessionId ?? process.env[SUBAGENT_PARENT_SESSION_ENV] ?? "";
+
+	// subagents: neutralize ambient Parent process.env so unproven mount
+	// authority cannot leak into Child spawn env ({ ...process.env, ...env }).
+	// Use explicit empty string (not undefined): a real Node child cannot receive
+	// literal undefined, and empty is treated as no-op by the companion. Then
+	// overwrite with proven ALS / runner-local path only. Never mutate process.env.
+	env[WORKFLOW_SHARED_SCRATCH_ENV] = "";
+	const scratchEnv = getActiveWorkflowSharedScratchEnv();
+	if (scratchEnv) {
+		Object.assign(env, scratchEnv);
+	}
 
 	return {
 		args,

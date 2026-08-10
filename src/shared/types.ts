@@ -264,6 +264,11 @@ export interface ParallelHandoffCleanupTask {
 	preserved?: boolean;
 	reason?: string;
 	errors?: string[];
+	/** Optional JJ cleanup identity (manifest v1 compatible optional fields). */
+	backend?: "jj";
+	workspaceChangeId?: string;
+	/** Initial D0 commit id (capture base / parent check). */
+	workspaceCommitId?: string;
 }
 
 export interface ParallelHandoffGroup {

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+- Add a fork-owned per-Child JJ worktree backend: `worktree:true` in a JJ repository creates independently captured and conservatively cleaned JJ workspaces, while Git fallback and `worktree:false` behavior stay unchanged.
+- Add workflow-scoped Sandbox shared scratch: one Host scratch per native workflow, mounted by a Child Companion at `/workflow-shared` without replacing `/workspace`, with scoped async-runner transport and conservative cleanup.
+- Project an actual Child `sessionFile` on the public structural delegation terminal response.
+
 ## [0.49.0] - 2026-08-13
 
 ### Added
