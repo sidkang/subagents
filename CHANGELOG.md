@@ -7,6 +7,9 @@
 - Add workflow-scoped Sandbox shared scratch: one Host scratch per native workflow, mounted by a Child Companion at `/workflow-shared` without replacing `/workspace`, with scoped async-runner transport and conservative cleanup.
 - Project an actual Child `sessionFile` on the public structural delegation terminal response.
 
+### Fixed
+- Fork-only: ignore a stale Pi extension context while emitting the advisory async process-terminal event. The durable terminal proof is already persisted; unrelated event-emission errors still surface. Keep the source annotation until upstream supplies an equivalent guard.
+
 ## [0.49.0] - 2026-08-13
 
 ### Added

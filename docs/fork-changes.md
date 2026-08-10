@@ -201,6 +201,23 @@ terminal response，供 Host integration 验证 Child session cwd。
 `SubagentDelegationTerminalResponse`，并由 `src/slash/delegation-adapters.ts` 投影实际 Child
 sessionFile。该字段保持为可选的结构化兼容字段；它不改变 M1/M2 的生命周期或调度语义。
 
+## 5.1 Fork-only：async terminal 的 stale context 防护
+
+上游 `pi-subagents@0.45.2` 的 detached runner close callback 会直接通过启动时捕获的
+`ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof)` 发送通知。如果 Pi 在 Child
+结束前已 reload 或替换 session，该 context 会失效；此时一个仅用于 UI 通知的 emit 会在 durable
+`process-terminal.json` 已落盘后抛出并使宿主崩溃。
+
+fork 在 `src/runs/background/async-execution.ts` 以明确的 `Fork sync` 注释包裹这两个 callback：
+
+- 只吞掉 Pi 的 stale-extension-context error；其他 emit error 必须继续抛出；
+- 不把旧 session 的事件转发给 replacement context；磁盘 proof 才是权威记录；
+- 上游同步时复查两条 async runner spawn path。上游若提供语义等价的 stale-only 防护，应删除本
+  fork helper、调用点注释和对应 regression test，而不是叠加第二层 guard。
+
+这不是 M1 或 M2 的生命周期改造；它只确保已持久化的 terminal proof 不会因为过期的 advisory
+notification 而杀死 Pi。
+
 ## 6. 推荐的提交顺序
 
 不要创建一个无法审阅的大型 fork diff。推荐分层提交：
