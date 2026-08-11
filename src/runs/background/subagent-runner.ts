@@ -73,7 +73,10 @@ import {
 	Semaphore,
 } from "../shared/parallel-utils.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan, type SubagentTaskDelivery } from "../shared/pi-args.ts";
-import { installRunnerWorkflowSharedScratchFromConfig } from "../shared/workflow-shared-scratch.ts";
+import {
+	installRunnerWorkflowScratchLaunchBinding,
+	type WorkflowScratchLaunchBinding,
+} from "../shared/workflow-scratch.ts";
 import { readRuntimeAcknowledgedExtensions } from "../shared/runtime-acknowledged-extensions.ts";
 import { outputEntryFromAsyncResult, resolveOutputReferences } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, readStructuredOutput } from "../shared/structured-output.ts";
@@ -196,8 +199,8 @@ interface SubagentRunConfig {
 	runnerProcessInstanceId?: string;
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
-	/** Host path for workflow shared scratch (subagents detached transport; validated before install). */
-	workflowSharedScratchHostPath?: string;
+	/** Detached Workflow Scratch association; validated before runner-local install. */
+	workflowScratchBinding?: WorkflowScratchLaunchBinding;
 }
 
 interface StepResult {
@@ -4931,9 +4934,9 @@ async function runConfiguredSubagent(config: SubagentRunConfig): Promise<void> {
 }
 
 function startConfiguredSubagent(config: SubagentRunConfig): void {
-	// subagents: install validated runner-local scratch authority from launchConfig
-	// before any buildPiArgs call. Invalid/absent path fails closed (no mount).
-	installRunnerWorkflowSharedScratchFromConfig(config.workflowSharedScratchHostPath);
+	// Fork sync: install only a validated detached Workflow Scratch Launch Binding
+	// before buildPiArgs. Invalid/absent bindings fail closed with no mount.
+	installRunnerWorkflowScratchLaunchBinding(config.workflowScratchBinding);
 	runConfiguredSubagent(config).catch((runErr) => {
 		console.error("Subagent runner error:", runErr);
 		process.exit(1);

@@ -1,4 +1,4 @@
-# Fork 改造说明：JJ workspace 与 Sandbox shared scratch
+# Fork 改造说明：JJ workspace 与 Workflow Scratch
 
 > **适用仓库：** `sidkang/subagents`
 >
@@ -22,7 +22,7 @@
 | 模块 | 解决的问题 | 不解决的问题 |
 |---|---|---|
 | **M1：per-Child JJ worktree backend** | 在 JJ 仓库中让每个 `worktree:true` Child 有独立代码 workspace | workflow 级共享 workspace、自动合并、自动 integrate |
-| **M2：workflow-scoped Sandbox shared scratch** | 让同一 native `workflowScript` 的 Sandbox Child 共享临时协作文件 | VCS 传输、长期 artifact、访问控制或文件锁 |
+| **M2：Workflow Scratch** | 让同一 native `workflowScript` 的 leaf Child 共享一个 Host 临时协作目录（经 Sandbox 挂载到 Guest） | VCS 传输、长期 artifact、访问控制或文件锁 |
 
 上游仍应拥有：
 
@@ -41,9 +41,9 @@ registry 协议。
 三个 first-class overlay。这个方式在小改动时合理，但现在的改造已跨越：
 
 - worktree backend 选择、JJ 创建、capture 与保守 cleanup；
-- workflow Host scratch 生命周期；
-- Child spawn env、Companion extension 注入；
-- foreground 与 detached async runner 的 scratch authority 传递；
+- Workflow Scratch Scope 生命周期；
+- Child spawn env、Mount Adapter 注入；
+- foreground 与 detached async runner 的 Launch Binding 传递；
 - handoff 的 JJ cleanup identity；
 - delegation terminal `sessionFile` 投影。
 
@@ -117,51 +117,64 @@ working-copy change。这样 Source 后续 snapshot、兄弟 Child 的创建和 
 - 在 `parallel-handoff.ts` 中根据记录的 backend 重建 JJ discard，绝不把 JJ workspace
   当作 Git branch/worktree 删除。
 
-## 4. M2：workflow 范围的 Sandbox 共享 scratch
+## 4. M2：Workflow Scratch
 
 ### 4.1 Host/Guest 合同
 
-每次顶层 native `workflowScript` 创建一个独立的 Host 临时目录。它与 Git/JJ 无关：
+**Workflow Scratch** 是每个顶层 native `workflowScript` 的一份 package 创建 Host 临时协作目录。
+它与 Git/JJ/VCS 无关，也不替代 Child 的 `/workspace`：
 
 ```text
-Host：唯一的 subagents-wf-shared-* 临时目录
+Host：唯一的 subagents-wf-scratch-* 临时目录（Workflow Scratch Scope）
 Guest：固定 /workflow-shared（rw）
 ```
 
-同一 workflow 的所有 leaf Child 得到同一个 scratch；不同 workflow 得到不同 scratch。
+同一 workflow 的所有 leaf Child 绑定到同一个 Host root；不同 workflow 得到不同 root。
 Sandbox Child 仍保留其原有的代码路径：
 
 ```text
 /workspace        当前 Child 自己的 cwd（通常是其 Git/JJ worktree）
-/workflow-shared  当前 workflow 的合作临时目录
+/workflow-shared  当前 workflow 的合作临时目录（Workflow Scratch）
 ```
 
 `/workflow-shared` 不是 `/workspace` 的替代品，也不是自动 patch merge 机制。A/B 可把报告、
 测试输出或待处理资料写入 scratch，C 必须显式读取、应用或重建结果。
 
-### 4.2 authority 与 Companion
+### 4.2 authority、Launch Binding 与 Mount Adapter
 
-Host path 不进入模型 prompt 或 workflowScript 参数。它仅在每次 Child spawn 时，经内部环境
-字段传递：
+`subagents` 拥有三层 fork 边界：
+
+1. **Workflow Scratch Scope** — Host root 创建、ALS 作用域、tracked launch、精确 root 清理；
+2. **Workflow Scratch Launch Binding** — `{ hostRoot }` 的受信任关联；env 与 detached
+   launchConfig 只是 transport，不是 authority；
+3. **Workflow Scratch Mount Adapter** — 仅在存在 proven binding 时动态注入 Child 的
+   package-private 扩展，只做一次 Sandbox Session Mount Override 映射。
+
+Host root 不进入模型 prompt 或 workflowScript 参数。Child spawn 仅投影私有 env：
 
 ```text
-SUBAGENTS_WORKFLOW_SHARED_SCRATCH=<proven host path>
+SUBAGENTS_WORKFLOW_SCRATCH_ROOT=<proven host root>
 ```
 
-Host 侧用 `AsyncLocalStorage` 保存当前 workflow scope，不能修改全局 `process.env`。对 detached
-async Child，path 必须写入 runner launchConfig；runner 应清除 ambient 环境中的该字段，验证
-launchConfig 的 path 后再安装 runner-local authority。
+Host 侧用 `AsyncLocalStorage` 保存当前 scope，不能修改全局 `process.env`。`buildPiArgs`
+必须先中和该私有 env，再只从 active ALS 或已校验的 runner-local binding 覆盖。对 detached
+async Child，closed binding 写入 runner launchConfig JSON；runner 清除 ambient env 后，
+仅安装通过严格校验的 `{ hostRoot }`（存在、绝对路径、package 前缀、位于选定 temp root 下）。
+无效或缺失 binding fail closed：不注入 adapter、不挂载。
 
-Child 侧加载一个静态 **Companion extension**：
+Child 侧的 **Mount Adapter** 只做一件事：
 
-1. env 不存在、为空或被中和时，Companion 是 no-op；
-2. env 有效时，Companion 在 extension factory 阶段注册 Sandbox Session Mount Override；
-3. Override 把 Host scratch 以 `rw` 映射到 Guest `/workflow-shared`；
-4. Companion 只追加简短协作提示，不替换 Child 原系统提示，也不暴露 Host absolute path。
+```text
+{ mounts: [{ hostPath: binding.hostRoot, guestPath: "/workflow-shared", access: "rw" }] }
+```
+
+1. env 不存在、为空或被中和时是 no-op；
+2. env 有效时在 extension factory 阶段注册 `sandbox:session-mount-override:query`；
+3. 不注册 `before_agent_start`、不改 prompt、不碰 Agent/JJ/orchestration/cleanup。
 
 Sandbox 的 override 是 construction-time、每 generation 的唯一 provider 合同：0 个 provider
 使用 Owner mounts；1 个合法 provider 使用 override；多于 1 个或 payload 不合法必须 fail
-closed。Companion 因此不能与另一个 Session Mount Override provider 并行注册。
+closed。Mount Adapter 因此不能与另一个 Session Mount Override provider 并行注册。
 
 Guest path 不使用 `/tmp/...`：Microsandbox 会在 Guest `/tmp` 使用 tmpfs，可能遮蔽嵌套 bind。
 Host 临时根优先使用 canonical `/tmp`（macOS 常为 `/private/tmp`）；只有 `/tmp` 不可用时才回退
@@ -172,6 +185,7 @@ Host 临时根优先使用 canonical `/tmp`（macOS 常为 `/private/tmp`）；�
 - workflow body 结束后，等所有已追踪的 Child launch settle，再删除该精确 scratch root；
 - `async: true` 必须在 execute 前禁用 eager cleanup；返回 async job / detached Child 是后备检查；
 - 无法确认、Parent crash 或 hard kill 时保留目录给 OS 临时目录治理；
+- 不发明 durable terminal ref ledger、token file、marker、protocol version、GC 或兼容 shim；
 - scratch 不进入 JJ patch，不承担 handoff/retained/recovery 语义。
 
 ### 4.4 0.45.2 的 source-owned 实现落点
@@ -180,13 +194,13 @@ Host 临时根优先使用 canonical `/tmp`（macOS 常为 `/private/tmp`）；�
 
 | 责任 | 当前候选文件 |
 |---|---|
-| workflow scope、foreground/async `runWorkflowScript` 包裹 | `src/runs/foreground/subagent-executor.ts` |
-| Child argv、env、subagent-only extension 注入 | `src/runs/shared/pi-args.ts` |
+| Workflow Scratch Scope、foreground/async `runWorkflowScript` 包裹 | `src/runs/foreground/subagent-executor.ts` |
+| Child argv、env、Mount Adapter 注入 | `src/runs/shared/pi-args.ts` |
 | 真正 Child launch 对 `buildPiArgs` 的调用 | `src/runs/foreground/execution.ts` |
-| detached launchConfig 写入与 runner env scrub | `src/runs/background/async-execution.ts` |
-| detached runner 的 validated local install | `src/runs/background/subagent-runner.ts` |
-| Companion 源文件 | 新增 `src/runs/shared/workflow-shared-scratch-child.ts` |
-| Host scope 实现 | 新增 `src/runs/shared/workflow-shared-scratch.ts` |
+| detached launchConfig binding 写入与 runner env scrub | `src/runs/background/async-execution.ts` |
+| detached runner 的 validated Launch Binding install | `src/runs/background/subagent-runner.ts` |
+| Host Scope / Launch Binding | 新增 `src/runs/shared/workflow-scratch.ts` |
+| Child Mount Adapter | 新增 `src/runs/shared/workflow-scratch-mount-adapter.ts` |
 
 旧版 `subagent-executor.ts` 的少量 hunk 不能直接当作未来 rebase 的来源：0.45.2 的 workflow launch
 还会记录 mission、heartbeat、async child 和 launch observers。M2 只包裹现有 `launch`，不会跳过或复制
@@ -226,8 +240,8 @@ notification 而杀死 Pi。
 2. **feat(delegation):** 如仍需要，独立完成 `sessionFile` 公共 projection；
 3. **feat(worktree):** 定义 backend seam、保留 Git backend，并添加 JJ backend 的 create/diff/
    cleanup 与 focused unit tests；
-4. **feat(sandbox):** 添加 Host scratch scope、Companion、foreground workflow wiring；
-5. **feat(sandbox):** 添加 detached async transport、env scrub 和 runner-local validation；
+4. **feat(scratch):** 添加 Workflow Scratch Scope、Mount Adapter、foreground workflow wiring；
+5. **feat(scratch):** 添加 detached Launch Binding transport、env scrub 和 runner-local validation；
 6. **test(e2e):** 以真实 Pi + Sandbox + JJ 验证 A/B 并行、C 顺序、mount、cleanup 和 canary
    isolation；
 7. **build(pi-stuff):** 在 fork runtime 验证后，才把外部 delivery bundle 从 patch/overlay 切换为
@@ -265,7 +279,7 @@ notification 而杀死 Pi。
 
 - 后续上游同步先 rebase/merge 到 fork，再让 M1/M2 测试指出真正的行为差异；不要重新生成一个
   不透明的 `node_modules` patch。
-- M1 与 M2 分别拥有自己的测试和模块边界；JJ 代码不得依赖 Sandbox，Companion 也不得改变
+- M1 与 M2 分别拥有自己的测试和模块边界；JJ 代码不得依赖 Sandbox，Mount Adapter 也不得改变
   Git/JJ backend 选择。
 - 任何会删除 workspace、abandon change 或移除 scratch 的新逻辑都要遵循“身份可证明才删除，
   否则保留”的原则。

@@ -127,11 +127,11 @@ import {
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
 import {
-	disableWorkflowSharedScratchCleanup,
-	openWorkflowSharedScratch,
-	trackWorkflowSharedScratchLaunch,
-	withWorkflowSharedScratch,
-} from "../shared/workflow-shared-scratch.ts";
+	disableWorkflowScratchCleanup,
+	openWorkflowScratchScope,
+	trackWorkflowScratchLaunch,
+	withWorkflowScratchScope,
+} from "../shared/workflow-scratch.ts";
 import {
 	type AgentProgress,
 	type AsyncJobState,
@@ -5015,7 +5015,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				appendWorkflowEvent({ type: "subagent.workflow.started" });
 				const { workflowScript, async: _workflowAsync, chatProgress: _chatProgress, ...workflowRequest } = requestParams;
 				void Promise.resolve().then(async () => {
-					const scratch = openWorkflowSharedScratch();
+					const scratch = openWorkflowScratchScope();
 					try {
 					await scratch.run(async () => {
 					const workflowResults: SingleResult[] = [];
@@ -5108,10 +5108,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								if (workflowUsageBudget.budget && childParams.async === true) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, "workflow usageBudget does not support async runs.run launches."));
 								const budgetState = usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults));
 								if (budgetState?.exhausted) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, usageBudgetExceededMessage(budgetState)));
-								const settleScratch = trackWorkflowSharedScratchLaunch();
+								const settleScratch = trackWorkflowScratchLaunch();
 								try {
 									// An explicit async Child can outlive this workflow body even if launch later throws.
-									if (childParams.async === true) disableWorkflowSharedScratchCleanup();
+									if (childParams.async === true) disableWorkflowScratchCleanup();
 									const childPhase = typeof childParams.phase === "string" && childParams.phase.trim() ? childParams.phase.trim() : undefined;
 									const childLabel = typeof childParams.label === "string" && childParams.label.trim() ? childParams.label.trim() : undefined;
 									recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
@@ -5168,7 +5168,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 										typeof result.details.asyncId === "string" ||
 										result.details.results.some((childResult) => childResult.detached === true)
 									) {
-										disableWorkflowSharedScratchCleanup();
+										disableWorkflowScratchCleanup();
 									}
 									workflowResults.push(...result.details.results);
 									const child = workflowChildResult(key, result);
@@ -5244,9 +5244,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const update = workflowChatProgressUpdate(_id, chatProgress, liveWorkflow);
 				if (update) onUpdate?.(update);
 			};
+			const workflowScript = requestParams.workflowScript;
+			if (workflowScript === undefined) throw new Error("workflowScript is required");
 			try {
-				const workflow = await withWorkflowSharedScratch(async () => runWorkflowScript({
-					script: requestParams.workflowScript,
+				const workflow = await withWorkflowScratchScope(async () => runWorkflowScript({
+					script: workflowScript,
 					timeoutMs: timeout,
 					signal,
 					prompts: workflowPrompts,
@@ -5269,10 +5271,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						if (workflowUsageBudget.budget && childParams.async === true) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, "workflow usageBudget does not support async runs.run launches."));
 						const budgetState = usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults));
 						if (budgetState?.exhausted) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, usageBudgetExceededMessage(budgetState)));
-						const settleScratch = trackWorkflowSharedScratchLaunch();
+						const settleScratch = trackWorkflowScratchLaunch();
 						try {
 							// An explicit async Child can outlive this workflow body even if launch later throws.
-							if (childParams.async === true) disableWorkflowSharedScratchCleanup();
+							if (childParams.async === true) disableWorkflowScratchCleanup();
 							const childPhase = typeof childParams.phase === "string" && childParams.phase.trim() ? childParams.phase.trim() : undefined;
 							const childLabel = typeof childParams.label === "string" && childParams.label.trim() ? childParams.label.trim() : undefined;
 							recordMissionWorkflowChild(missionBinding, _id, key, {
@@ -5307,7 +5309,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								typeof result.details.asyncId === "string" ||
 								result.details.results.some((childResult) => childResult.detached === true)
 							) {
-								disableWorkflowSharedScratchCleanup();
+								disableWorkflowScratchCleanup();
 							}
 							workflowResults.push(...result.details.results);
 							if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
