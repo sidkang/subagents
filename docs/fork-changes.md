@@ -2,7 +2,7 @@
 
 > **适用仓库：** `sidkang/subagents`
 >
-> **本文基线：** `main` 的 `fff1801cd229512f6c04b6a682856cb52fa93815`（`pi-subagents` 0.45.2）
+> **本文基线：** `main` 的 `a660ea30621272e163187d34e45763c5b51bdc0f`（`pi-subagents` 0.49.0）
 >
 > **状态：** M1/M2 已迁入这个 fork 的 source tree；本文是其产品合同、维护边界和未来 rebase 指南。
 
@@ -12,7 +12,7 @@
 
 本文记录的是已经验证过的产品合同，而不是要求原样复制旧补丁。旧实现以
 `pi-subagents@0.44.0`、上游 commit
-`96c3fec9b502c61295e244c3fce4d97ff22b13b3` 为基线；本 fork 已是 0.45.2，移植时
+`96c3fec9b502c61295e244c3fce4d97ff22b13b3` 为基线；本 fork 已是 0.49.0，移植时
 必须以当前源代码的职责边界重新实现和测试，不能盲目 cherry-pick 旧 patch。
 
 ## 1. 改造范围
@@ -103,7 +103,7 @@ working-copy change。这样 Source 后续 snapshot、兄弟 Child 的创建和 
 这些检查只保护一个 `worktree:true` Child；它们不是 workflow recovery ledger，也不改变
 上游的并发或 handoff 产品语义。
 
-### 3.4 0.45.2 的 source-owned 实现落点
+### 3.4 0.49.0 的 source-owned 实现落点
 
 当前 fork 的 Git backend 集中在 `src/runs/shared/worktree.ts`，并由
 `src/runs/shared/parallel-handoff.ts` 重建 cleanup。M1 已按以下边界实现：
@@ -188,7 +188,7 @@ Host 临时根优先使用 canonical `/tmp`（macOS 常为 `/private/tmp`）；�
 - 不发明 durable terminal ref ledger、token file、marker、protocol version、GC 或兼容 shim；
 - scratch 不进入 JJ patch，不承担 handoff/retained/recovery 语义。
 
-### 4.4 0.45.2 的 source-owned 实现落点
+### 4.4 0.49.0 的 source-owned 实现落点
 
 当前版本相较旧 0.44 已扩展了 workflow mission、async 和 Child execution 路径。M2 已在以下位置接线；未来 rebase 至少复查这些位置：
 
@@ -202,8 +202,9 @@ Host 临时根优先使用 canonical `/tmp`（macOS 常为 `/private/tmp`）；�
 | Host Scope / Launch Binding | 新增 `src/runs/shared/workflow-scratch.ts` |
 | Child Mount Adapter | 新增 `src/runs/shared/workflow-scratch-mount-adapter.ts` |
 
-旧版 `subagent-executor.ts` 的少量 hunk 不能直接当作未来 rebase 的来源：0.45.2 的 workflow launch
-还会记录 mission、heartbeat、async child 和 launch observers。M2 只包裹现有 `launch`，不会跳过或复制
+旧版 `subagent-executor.ts` 的少量 hunk 不能直接当作未来 rebase 的来源：0.49.0 的 workflow launch
+还会记录 mission、heartbeat、async child、output-path claims、live-card progress 和 launch observers。
+上游已删除 `patchMissionObjective`；M2 不得恢复该调用。M2 只包裹现有 `launch`，不会跳过或复制
 这些职责。
 
 ## 5. delegation `sessionFile`
@@ -217,7 +218,7 @@ sessionFile。该字段保持为可选的结构化兼容字段；它不改变 M1
 
 ## 5.1 Fork-only：async terminal 的 stale context 防护
 
-上游 `pi-subagents@0.45.2` 的 detached runner close callback 会直接通过启动时捕获的
+上游 `pi-subagents@0.49.0` 的 detached runner close callback 会直接通过启动时捕获的
 `ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof)` 发送通知。如果 Pi 在 Child
 结束前已 reload 或替换 session，该 context 会失效；此时一个仅用于 UI 通知的 emit 会在 durable
 `process-terminal.json` 已落盘后抛出并使宿主崩溃。
