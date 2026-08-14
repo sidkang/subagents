@@ -4,6 +4,8 @@
 
 # pi-subagents
 
+This fork snapshot is `pi-subagents@0.49.0+sid.1` on upstream `0.49.0` / `a660ea30621272e163187d34e45763c5b51bdc0f`. See [Fork changes](./docs/fork-changes.md).
+
 `pi-subagents` lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
 
 <https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1>

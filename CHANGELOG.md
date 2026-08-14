@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Changed
+- Identify this fork snapshot as `pi-subagents@0.49.0+sid.1` on upstream `0.49.0` / `a660ea30621272e163187d34e45763c5b51bdc0f`.
+
 ### Added
 - Add a fork-owned per-Child JJ worktree backend: `worktree:true` in a JJ repository creates independently captured and conservatively cleaned JJ workspaces, while Git fallback and `worktree:false` behavior stay unchanged.
 - Add Workflow Scratch: one package-created Host temporary cooperative directory per top-level native `workflowScript`, shared by that workflow's leaf Children via a private Mount Adapter at Guest `/workflow-shared` without replacing `/workspace`, with Launch Binding transport for detached runners and conservative scope cleanup.

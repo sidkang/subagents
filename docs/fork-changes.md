@@ -2,7 +2,11 @@
 
 > **适用仓库：** `sidkang/subagents`
 >
-> **本文基线：** `main` 的 `a660ea30621272e163187d34e45763c5b51bdc0f`（`pi-subagents` 0.49.0）
+> **Fork version:** `0.49.0+sid.1`
+>
+> **Upstream version:** `0.49.0`
+>
+> **Upstream base:** `a660ea30621272e163187d34e45763c5b51bdc0f`
 >
 > **状态：** M1/M2 已迁入这个 fork 的 source tree；本文是其产品合同、维护边界和未来 rebase 指南。
 
@@ -12,7 +16,7 @@
 
 本文记录的是已经验证过的产品合同，而不是要求原样复制旧补丁。旧实现以
 `pi-subagents@0.44.0`、上游 commit
-`96c3fec9b502c61295e244c3fce4d97ff22b13b3` 为基线；本 fork 已是 0.49.0，移植时
+`96c3fec9b502c61295e244c3fce4d97ff22b13b3` 为基线；本 fork 现为 `0.49.0+sid.1`（上游 0.49.0），移植时
 必须以当前源代码的职责边界重新实现和测试，不能盲目 cherry-pick 旧 patch。
 
 ## 1. 改造范围
