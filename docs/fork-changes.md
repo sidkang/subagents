@@ -9,6 +9,9 @@
 > **Upstream base:** `a660ea30621272e163187d34e45763c5b51bdc0f`
 >
 > **状态：** M1/M2 已迁入这个 fork 的 source tree；本文是其产品合同、维护边界和未来 rebase 指南。
+>
+> **验证合同：** 可重复验证矩阵、聚焦测试入口和被淘汰方案见
+> [`fork-validation.md`](./fork-validation.md)。
 
 本 fork 已把原先在外部 delivery bundle 中以 `patch-package` 与独立 overlay 实现的能力，
 迁入可正常审阅、测试和提交的 source tree。后续开发和上游 rebase 不需要在
@@ -256,7 +259,7 @@ notification 而杀死 Pi。
 
 ## 7. 验收要求
 
-每次 port 或 rebase 后，至少验证：
+执行顺序和聚焦测试入口见 [`fork-validation.md`](./fork-validation.md)。每次 port 或 rebase 后，至少验证：
 
 - 上游 unit/typecheck 全绿；
 - `worktree:false` 不执行 JJ；
