@@ -140,3 +140,4 @@ JJ 聚焦测试要求 `jj` 在 `PATH` 中。真实 Sandbox + JJ 场景还要求�
 - 任何 destructive cleanup 都遵循“身份可证明才删除，否则保留”。
 - unit、integration 和 E2E 的结论必须按实际运行层级表述，不能用浅层测试替代真实运行证明。
 - 安装说明必须指向这个 fork；不要让 fork README 的功能文档跳回 upstream `main`。
+- 未完成的计划写在 GitHub Issues，不写进合同文档。
