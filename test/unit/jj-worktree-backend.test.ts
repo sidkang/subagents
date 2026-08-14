@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	rmSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -58,6 +59,25 @@ function createTempGitRepo(prefix) {
 	return dir;
 }
 
+function writeGetAgentDirStub(staging) {
+	const utilsDir = join(staging, "src", "shared");
+	mkdirSync(utilsDir, { recursive: true });
+	writeFileSync(
+		join(utilsDir, "utils.ts"),
+		[
+			'import * as os from "node:os";',
+			'import * as path from "node:path";',
+			"export function getAgentDir() {",
+			"\tconst configured = process.env.PI_CODING_AGENT_DIR;",
+			'\tif (configured === "~") return os.homedir();',
+			'\tif (configured?.startsWith("~/")) return path.join(os.homedir(), configured.slice(2));',
+			'\treturn configured || path.join(os.homedir(), ".pi", "agent");',
+			"}",
+			"",
+		].join("\n"),
+	);
+}
+
 async function loadBackend() {
 	assert.ok(existsSync(overlaySource));
 	assert.ok(existsSync(overlayInstalled), "run npm ci so postinstall installs overlay");
@@ -76,6 +96,7 @@ async function loadBackend() {
 		join(policyDir, "authority.ts"),
 		["export function resolveAuthorityDecision() { return 'auto'; }", ""].join("\n"),
 	);
+	writeGetAgentDirStub(staging);
 	globalThis.__subagentsBackendStagings ??= [];
 	globalThis.__subagentsBackendStagings.push(staging);
 	return import(pathToFileURL(join(sharedDir, "jj-worktree-backend.ts")).href + `?t=${Date.now()}-${Math.random()}`);
@@ -496,6 +517,55 @@ test("Git fallback: isJjWorktreeCwd false; stock worktree path remains Git", asy
 		assert.match(worktree, /if \(isJjWorktreeCwd\(cwd\)\) \{\s*return createJjWorktrees/);
 	} finally {
 		rmSync(gitRepo, { recursive: true, force: true });
+	}
+});
+
+test("JJ: rejects worktree base directories inside Pi extensions and symlink aliases", async () => {
+	const mod = await loadBackend();
+	const { createJjWorktrees } = mod;
+	const source = createTempJjSource("subagents-jj-ext-dir-");
+	const tempHome = mkdtempSync(join(tmpdir(), "subagents-jj-ext-home-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const previousHome = process.env.HOME;
+	const previousUserProfile = process.env.USERPROFILE;
+	const extensionsDir = join(tempHome, ".pi", "agent", "extensions");
+	const aliasDir = join(tempHome, "extension-alias");
+	try {
+		process.env.HOME = tempHome;
+		process.env.USERPROFILE = tempHome;
+		delete process.env.PI_CODING_AGENT_DIR;
+		mkdirSync(extensionsDir, { recursive: true });
+		symlinkSync(extensionsDir, aliasDir, process.platform === "win32" ? "junction" : "dir");
+
+		assert.throws(
+			() => createJjWorktrees(source, "extension-dir", 1, { baseDir: extensionsDir }),
+			/worktree base directory cannot be inside Pi extensions directory/i,
+		);
+		assert.throws(
+			() => createJjWorktrees(source, "extension-subdir", 1, { baseDir: join(extensionsDir, "checkout") }),
+			/worktree base directory cannot be inside Pi extensions directory/i,
+		);
+		assert.throws(
+			() => createForkWorktrees(source, "extension-dir-route", 1, { baseDir: extensionsDir }),
+			/worktree base directory cannot be inside Pi extensions directory/i,
+		);
+		assert.throws(
+			() => createJjWorktrees(source, "extension-symlink", 1, { baseDir: join(aliasDir, "checkout") }),
+			/worktree base directory cannot be inside Pi extensions directory/i,
+		);
+		assert.throws(
+			() => createForkWorktrees(source, "extension-symlink-route", 1, { baseDir: join(aliasDir, "checkout") }),
+			/worktree base directory cannot be inside Pi extensions directory/i,
+		);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		if (previousHome === undefined) delete process.env.HOME;
+		else process.env.HOME = previousHome;
+		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+		else process.env.USERPROFILE = previousUserProfile;
+		rmSync(source, { recursive: true, force: true });
+		rmSync(tempHome, { recursive: true, force: true });
 	}
 });
 
@@ -1065,6 +1135,7 @@ test("persisted JJ handoff → discardPreservedWorktrees forgets workspace + rem
 			join(sharedDir, "parallel-handoff.ts"),
 		);
 		cpSync(overlayInstalled, join(sharedDir, "jj-worktree-backend.ts"));
+		writeGetAgentDirStub(staging);
 		// Minimal worktree.ts that routes JJ cleanup to the real overlay backend.
 		writeFileSync(
 			join(sharedDir, "worktree.ts"),
@@ -1579,6 +1650,7 @@ test("reconstructed handoff cleans W+D; malicious empty manifests cannot abandon
 			join(sharedDir, "parallel-handoff.ts"),
 		);
 		cpSync(overlayInstalled, join(sharedDir, "jj-worktree-backend.ts"));
+		writeGetAgentDirStub(staging);
 		writeFileSync(
 			join(sharedDir, "worktree.ts"),
 			`import { cleanupJjWorktrees } from "./jj-worktree-backend.ts";
