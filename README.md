@@ -12,11 +12,19 @@ This fork snapshot is `pi-subagents@0.49.0+sid.1` on upstream `0.49.0` / `a660ea
 
 ## Install
 
+This fork is not published as the npm package `pi-subagents`. `pi install npm:pi-subagents` installs upstream `pi-subagents`, not this fork.
+
+For Pi-Stuff users, the supported delivery path is from the `pi-stuff` repository:
+
 ```bash
-pi install npm:pi-subagents
+mise push subagents
 ```
 
-That is the only required step.
+Other consumers must pin an immutable fork commit themselves:
+
+```text
+git+https://github.com/sidkang/subagents.git#<full-commit-sha>
+```
 
 ## Try this first
 
