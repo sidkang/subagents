@@ -125,6 +125,12 @@ import {
 	type WorktreeSetup,
 } from "../shared/worktree.ts";
 import {
+	disableWorkflowScratchCleanup,
+	openWorkflowScratchScope,
+	trackWorkflowScratchLaunch,
+	withWorkflowScratchScope,
+} from "../shared/workflow-scratch.ts";
+import {
 	type AgentProgress,
 	type AsyncJobState,
 	type AsyncStatus,
@@ -3895,6 +3901,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				appendWorkflowEvent({ type: "subagent.workflow.started" });
 				const { workflowScript, async: _workflowAsync, chatProgress: _chatProgress, ...workflowRequest } = requestParams;
 				void Promise.resolve().then(async () => {
+					const scratch = openWorkflowScratchScope();
+					try {
+						await scratch.run(async () => {
 					const workflowResults: SingleResult[] = [];
 					const { action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, usageBudget: _usageBudget, missionId: _missionId, mission: _mission, ...workflowChildDefaults } = workflowRequest;
 					const workflowOutput = typeof workflowChildDefaults.output === "string" || typeof workflowChildDefaults.output === "boolean" ? workflowChildDefaults.output : undefined;
@@ -3990,9 +3999,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								if (workflowUsageBudget.budget && childParams.async === true) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, "workflow usageBudget does not support async runs.run launches."));
 								const budgetState = usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults));
 								if (budgetState?.exhausted) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, usageBudgetExceededMessage(budgetState)));
-								const childPhase = typeof childParams.phase === "string" && childParams.phase.trim() ? childParams.phase.trim() : undefined;
-								const childLabel = typeof childParams.label === "string" && childParams.label.trim() ? childParams.label.trim() : undefined;
-								recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
+								const settleScratch = trackWorkflowScratchLaunch();
+								try {
+									// An explicit async Child can outlive this workflow body even if launch later throws.
+									if (childParams.async === true) disableWorkflowScratchCleanup();
+									const childPhase = typeof childParams.phase === "string" && childParams.phase.trim() ? childParams.phase.trim() : undefined;
+									const childLabel = typeof childParams.label === "string" && childParams.label.trim() ? childParams.label.trim() : undefined;
+									recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
 									status: "running",
 									...(typeof childParams.agent === "string" && childParams.agent.trim() ? { agent: childParams.agent.trim() } : {}),
 									...(childLabel ? { label: childLabel } : {}),
@@ -4041,20 +4054,26 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 											heartbeat: { status: step.status, ...(childPhase ? { phase: childPhase } : {}) },
 										});
 									}, ctx, preserveActiveSession);
-								});
-								workflowResults.push(...result.details.results);
-								for (const childResult of result.details.results) {
-									if (childResult.savedOutputPath) producedChildOutputPaths.add(childResult.savedOutputPath);
-								}
-								const child = workflowChildResult(key, result);
-								const step = status.steps?.find((candidate) => candidate.workflowKey === key);
-								if (step) {
-									step.async = Boolean(result.details.asyncId || result.details.asyncDir);
-									if (child.runId) step.runId = child.runId;
-								}
-								if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
-								const childStatus = missionWorkflowChildStatus(result);
-								recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
+									});
+									if (
+										typeof result.details.asyncId === "string" ||
+										result.details.results.some((childResult) => childResult.detached === true)
+									) {
+										disableWorkflowScratchCleanup();
+									}
+									workflowResults.push(...result.details.results);
+									for (const childResult of result.details.results) {
+										if (childResult.savedOutputPath) producedChildOutputPaths.add(childResult.savedOutputPath);
+									}
+									const child = workflowChildResult(key, result);
+									const step = status.steps?.find((candidate) => candidate.workflowKey === key);
+									if (step) {
+										step.async = Boolean(result.details.asyncId || result.details.asyncDir);
+										if (child.runId) step.runId = child.runId;
+									}
+									if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
+									const childStatus = missionWorkflowChildStatus(result);
+									recordMissionWorkflowChild(missionBinding, workflowRunId, key, {
 									status: childStatus,
 									...(child.runId ? { runId: child.runId } : {}),
 									...(result.details.results[0]?.agent ? { agent: result.details.results[0].agent } : {}),
@@ -4068,6 +4087,9 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									if (childJob) { childJob.parentWorkflowRunId = workflowRunId; childJob.workflowKey = key; }
 								}
 								return child;
+								} finally {
+									settleScratch();
+								}
 							},
 							status: async (keyOrRunId, workflowSignal) => workflowChildResult(keyOrRunId, await execute(randomUUID(), { action: "status", id: keyOrRunId }, workflowSignal, undefined, ctx, preserveActiveSession)),
 						});
@@ -4105,6 +4127,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						deps.state.activeAsyncCapacity = workflowCapacity?.reconcile(new Set(deps.state.workflowControllers?.keys() ?? []))
 							?? deps.state.activeAsyncCapacity;
 					}
+						}); // scratch.run
+					} finally {
+						scratch.dispose();
+					}
 				});
 				return attachWorkflowMission(withRunFanoutBudget({
 					content: [{ type: "text", text: formatAsyncStartedMessage(`Async workflow [${workflowRunId}]`, ctx.hasUI === true) }],
@@ -4123,9 +4149,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const update = workflowChatProgressUpdate(_id, chatProgress, liveWorkflow);
 				if (update) onUpdate?.(update);
 			};
+			const workflowScript = requestParams.workflowScript;
+			if (workflowScript === undefined) throw new Error("workflowScript is required");
 			try {
-				const workflow = await runWorkflowScript({
-					script: requestParams.workflowScript,
+				const workflow = await withWorkflowScratchScope(async () => runWorkflowScript({
+					script: workflowScript,
 					timeoutMs: timeout,
 					signal,
 					...(workflowState ? { state: workflowState } : {}),
@@ -4147,9 +4175,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						if (workflowUsageBudget.budget && childParams.async === true) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, "workflow usageBudget does not support async runs.run launches."));
 						const budgetState = usageBudgetState(workflowUsageBudget.budget, sumResultsCost(workflowResults));
 						if (budgetState?.exhausted) return workflowChildResult(key, buildRequestedModeError(childParams as SubagentParamsLike, usageBudgetExceededMessage(budgetState)));
-						const childPhase = typeof childParams.phase === "string" && childParams.phase.trim() ? childParams.phase.trim() : undefined;
-						const childLabel = typeof childParams.label === "string" && childParams.label.trim() ? childParams.label.trim() : undefined;
-						recordMissionWorkflowChild(missionBinding, _id, key, {
+						const settleScratch = trackWorkflowScratchLaunch();
+						try {
+							// An explicit async Child can outlive this workflow body even if launch later throws.
+							if (childParams.async === true) disableWorkflowScratchCleanup();
+							const childPhase = typeof childParams.phase === "string" && childParams.phase.trim() ? childParams.phase.trim() : undefined;
+							const childLabel = typeof childParams.label === "string" && childParams.label.trim() ? childParams.label.trim() : undefined;
+							recordMissionWorkflowChild(missionBinding, _id, key, {
 							status: "running",
 							...(typeof childParams.agent === "string" && childParams.agent.trim() ? { agent: childParams.agent.trim() } : {}),
 							...(childLabel ? { label: childLabel } : {}),
@@ -4176,15 +4208,21 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									heartbeat: { status: progressStatus, ...(childPhase ? { phase: childPhase } : {}) },
 								});
 							}, ctx, preserveActiveSession);
-						});
-						workflowResults.push(...result.details.results);
-						for (const childResult of result.details.results) {
-							if (childResult.savedOutputPath) producedChildOutputPaths.add(childResult.savedOutputPath);
-						}
-						if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
-						const child = workflowChildResult(key, result);
-						const childStatus = missionWorkflowChildStatus(result);
-						recordMissionWorkflowChild(missionBinding, _id, key, {
+							});
+							if (
+								typeof result.details.asyncId === "string" ||
+								result.details.results.some((childResult) => childResult.detached === true)
+							) {
+								disableWorkflowScratchCleanup();
+							}
+							workflowResults.push(...result.details.results);
+							for (const childResult of result.details.results) {
+								if (childResult.savedOutputPath) producedChildOutputPaths.add(childResult.savedOutputPath);
+							}
+							if (result.details.asyncDir && missionBinding) writeMissionAsyncBinding(result.details.asyncDir, missionBinding);
+							const child = workflowChildResult(key, result);
+							const childStatus = missionWorkflowChildStatus(result);
+							recordMissionWorkflowChild(missionBinding, _id, key, {
 							status: childStatus,
 							...(child.runId ? { runId: child.runId } : {}),
 							...(result.details.results[0]?.agent ? { agent: result.details.results[0].agent } : {}),
@@ -4193,10 +4231,13 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							...(["completed", "failed"].includes(childStatus) ? { completedAt: new Date().toISOString() } : {}),
 							heartbeat: { status: childStatus, ...(childPhase ? { phase: childPhase } : {}) },
 						});
-						return child;
+							return child;
+						} finally {
+							settleScratch();
+						}
 					},
 					status: async (keyOrRunId, workflowSignal) => workflowChildResult(keyOrRunId, await execute(randomUUID(), { action: "status", id: keyOrRunId }, workflowSignal, undefined, ctx, preserveActiveSession)),
-				});
+				}));
 				const traceLines = workflow.trace.map((entry) => `- ${entry.operation} ${entry.key}: ${entry.state}${entry.runId ? ` (${entry.runId})` : ""}${entry.durationMs !== undefined ? ` in ${entry.durationMs}ms` : ""}${entry.error ? ` — ${entry.error}` : ""}`);
 				const sections = ["Workflow completed.", `Return:\n${formatWorkflowValue(workflow.value)}`];
 				if (workflow.emits.length > 0) sections.push(`Emitted:\n${workflow.emits.map(formatWorkflowValue).join("\n")}`);

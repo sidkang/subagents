@@ -14,6 +14,7 @@ import type { AgentConfig } from "../../agents/agents.ts";
 import { appendAgentRefinementOverlay } from "../../agents/agent-refinements.ts";
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
+import { getActiveWorkflowScratchLaunchBinding, WORKFLOW_SCRATCH_ROOT_ENV } from "../shared/workflow-scratch.ts";
 import { injectOutputPathSystemPrompt, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveChainPath, resolveExistingReadPaths, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
@@ -488,7 +489,15 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, onProcessTerminal
 	fs.mkdirSync(TEMP_ROOT_DIR, { recursive: true });
 	const cfgPath = getAsyncConfigPath(suffix);
 	const runnerProcessInstanceId = randomUUID();
-	const launchConfig = { ...cfg, runnerProcessInstanceId };
+	// Fork sync: persist the active Workflow Scratch Launch Binding in detached
+	// launchConfig, never through inherited runner env. Remove when upstream owns
+	// equivalent detached binding transport.
+	const workflowScratchBinding = getActiveWorkflowScratchLaunchBinding();
+	const launchConfig = {
+		...cfg,
+		runnerProcessInstanceId,
+		...(workflowScratchBinding ? { workflowScratchBinding } : {}),
+	};
 	fs.writeFileSync(cfgPath, JSON.stringify(launchConfig));
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 	const nodeCommand = resolveNodeExecutable();
@@ -514,15 +523,19 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, onProcessTerminal
 			stdoutFd = fs.openSync(logPaths.stdoutPath, "a");
 			stderrFd = fs.openSync(logPaths.stderrPath, "a");
 		}
+		// Fork sync: scrub ambient scratch env from the detached runner. The runner
+		// installs only the validated launchConfig binding before buildPiArgs.
+		const runnerEnv: NodeJS.ProcessEnv = {
+			...process.env,
+			...(piPackageRoot ? { [PI_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot } : {}),
+		};
+		delete runnerEnv[WORKFLOW_SCRATCH_ROOT_ENV];
 		const proc = spawn(nodeCommand, [jitiCliPath, runner, cfgPath], {
 			cwd,
 			detached: true,
 			stdio: ["ignore", stdoutFd ?? "ignore", stderrFd ?? "ignore"],
 			windowsHide: true,
-			env: {
-				...process.env,
-				...(piPackageRoot ? { [PI_CODING_AGENT_PACKAGE_ROOT_ENV]: piPackageRoot } : {}),
-			},
+			env: runnerEnv,
 		});
 		closeFd(stdoutFd);
 		closeFd(stderrFd);
