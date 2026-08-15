@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
+import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, emitAsyncProcessTerminalEvent, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ProcessTerminalV1 } from "../../src/shared/types.ts";
 
 const agent = (name: string, toolBudget?: AgentConfig["toolBudget"]): AgentConfig => ({
 	name,
@@ -24,7 +26,43 @@ const ctx = {
 	modelScope: undefined,
 };
 
+const terminalProof: ProcessTerminalV1 = {
+	version: 1,
+	state: "observed",
+	runId: "run-1",
+	runnerProcessInstanceId: "runner-1",
+	observedAt: 1,
+	instances: [],
+};
+
 describe("async runner execution", () => {
+	it("drops a stale context when an async runner emits its terminal proof", () => {
+		let calls = 0;
+		const pi = {
+			events: {
+				emit() {
+					calls++;
+					throw new Error("This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().");
+				},
+			},
+		} as Pick<ExtensionAPI, "events">;
+
+		assert.doesNotThrow(() => emitAsyncProcessTerminalEvent(pi, terminalProof));
+		assert.equal(calls, 1);
+	});
+
+	it("does not mistake a subscriber error mentioning reload for a stale context", () => {
+		const pi = {
+			events: {
+				emit() {
+					throw new Error("subscriber failed: stale after session replacement or reload");
+				},
+			},
+		} as Pick<ExtensionAPI, "events">;
+
+		assert.throws(() => emitAsyncProcessTerminalEvent(pi, terminalProof), /subscriber failed/);
+	});
+
 	it("formats interactive yield and headless auto-drain guidance separately", () => {
 		const interactive = formatAsyncStartedMessage("Async: worker [interactive]", true);
 		assert.match(interactive, /interactive session[\s\S]*return control/i);

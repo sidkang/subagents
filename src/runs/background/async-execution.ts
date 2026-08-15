@@ -42,6 +42,7 @@ import {
 	type Details,
 	type IntercomBridgeConfig,
 	type JsonSchemaObject,
+	type ProcessTerminalV1,
 	type MaxOutputConfig,
 	type NestedRouteInfo,
 	type ResolvedControlConfig,
@@ -75,6 +76,38 @@ import { resolvePermissionRules, type PermissionConfig } from "../shared/permiss
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
+
+function isStaleExtensionContextError(error: unknown): boolean {
+	// Fork sync: Pi currently exposes this stale-context prefix without a stable
+	// error code. Keep it narrow: subscriber errors mentioning a reload must
+	// still surface rather than being mistaken for an extension-context failure.
+	return error instanceof Error
+		&& error.message.startsWith(
+			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().",
+		);
+}
+
+/**
+ * Fork sync note (sidkang/subagents): upstream through 81fb689 closes async
+ * runners with a callback that directly calls `ctx.pi.events.emit(...)`. Pi may have
+ * invalidated that captured context by then, which made a terminal UI notice
+ * crash the host after its durable process-terminal proof was already written.
+ *
+ * Keep this stale-only guard when syncing until upstream fixes the equivalent
+ * callbacks. Do not route the event through a replacement context: this proof
+ * belongs to the old session, while its on-disk record remains authoritative.
+ */
+export function emitAsyncProcessTerminalEvent(
+	pi: Pick<ExtensionAPI, "events">,
+	proof: ProcessTerminalV1,
+): void {
+	try {
+		pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return;
+		throw error;
+	}
+}
 
 function resolveJitiCliFromPackageJson(packageJsonPath: string): string | undefined {
 	if (!fs.existsSync(packageJsonPath)) return undefined;
@@ -471,7 +504,7 @@ interface SpawnRunnerResult {
 	startupDidNotProceed?: boolean;
 }
 
-function spawnRunner(cfg: object, suffix: string, cwd: string, onProcessTerminal?: (proof: unknown) => void): SpawnRunnerResult {
+function spawnRunner(cfg: object, suffix: string, cwd: string, onProcessTerminal?: (proof: ProcessTerminalV1) => void): SpawnRunnerResult {
 	if (!jitiCliPath) {
 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
 	}
@@ -1171,7 +1204,8 @@ export function executeAsyncChain(
 			},
 			id,
 			runnerCwd,
-			(proof) => ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof),
+			// Fork sync: terminal notifications must tolerate a stale captured Pi context.
+			(proof) => emitAsyncProcessTerminalEvent(ctx.pi, proof),
 		);
 	} catch (error) {
 		params.activeAsyncCapacity?.rollback();
@@ -1629,7 +1663,8 @@ export function executeAsyncSingle(
 			},
 			id,
 			runnerCwd,
-			(proof) => ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof),
+			// Fork sync: terminal notifications must tolerate a stale captured Pi context.
+			(proof) => emitAsyncProcessTerminalEvent(ctx.pi, proof),
 		);
 	} catch (error) {
 		params.activeAsyncCapacity?.rollback();
