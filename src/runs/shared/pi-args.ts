@@ -15,6 +15,13 @@ import {
 import { resolvePiPackageRoot } from "./pi-spawn.ts";
 import { RUNTIME_EXTENSION_ACK_PATH_ENV } from "./runtime-acknowledged-extensions.ts";
 import {
+	getActiveWorkflowScratchLaunchEnv,
+	shouldInjectWorkflowScratchMountAdapter,
+	workflowScratchMountAdapterPath,
+	WORKFLOW_SCRATCH_ROOT_ENV,
+} from "./workflow-scratch.ts";
+
+import {
 	STRUCTURED_OUTPUT_CAPTURE_ENV,
 	STRUCTURED_OUTPUT_SCHEMA_ENV,
 } from "./structured-output.ts";
@@ -593,6 +600,16 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	}
 	for (const extPath of toolPlan.extensionArgs)
 		args.push("--extension", extPath);
+	// Fork sync: project an active Workflow Scratch Launch Binding through the
+	// package-private Child Mount Adapter. Inject after --no-extensions so ambient
+	// extension disable cannot drop it; skip only an exact duplicate path. Remove
+	// when upstream owns this seam.
+	if (shouldInjectWorkflowScratchMountAdapter()) {
+		const mountAdapterPath = workflowScratchMountAdapterPath();
+		if (!toolPlan.extensionArgs.includes(mountAdapterPath)) {
+			args.push("--extension", mountAdapterPath);
+		}
+	}
 
 	if (!input.inheritProjectContext) {
 		args.push("--no-context-files");
@@ -818,6 +835,13 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 
 	env[SUBAGENT_PARENT_SESSION_ENV] =
 		input.parentSessionId ?? process.env[SUBAGENT_PARENT_SESSION_ENV] ?? "";
+
+	// Fork sync: neutralize ambient Parent env so it cannot become Workflow
+	// Scratch authority. Then project only the active scoped/validated Launch
+	// Binding. Remove when upstream provides equivalent Child launch binding.
+	env[WORKFLOW_SCRATCH_ROOT_ENV] = "";
+	const scratchEnv = getActiveWorkflowScratchLaunchEnv();
+	if (scratchEnv) Object.assign(env, scratchEnv);
 
 	return {
 		args,
