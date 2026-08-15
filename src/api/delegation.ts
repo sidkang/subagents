@@ -100,6 +100,7 @@ export interface SubagentDelegationTerminalResponse extends SubagentDelegationSt
 	model?: string;
 	thinking?: string;
 	exitCode?: number;
+	sessionFile?: string;
 	launchContractDigest?: string;
 	result?: SubagentDelegationValue;
 	usage?: SubagentDelegationUsage;
