@@ -50,6 +50,28 @@ function safeHandoffAgentName(agent: string): string {
 	return agent.replace(/[^\w.-]/g, "_");
 }
 
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+	for (const value of values) {
+		if (typeof value === "string" && value) return value;
+	}
+	return undefined;
+}
+
+function jjCleanupIdentity(
+	task: { backend?: unknown; workspaceChangeId?: unknown; workspaceCommitId?: unknown },
+	worktree?: { backend?: unknown; workspaceChangeId?: unknown; workspaceCommitId?: unknown },
+	previous?: { backend?: unknown; workspaceChangeId?: unknown; workspaceCommitId?: unknown },
+): { backend?: "jj"; workspaceChangeId?: string; workspaceCommitId?: string } {
+	if (task.backend !== "jj" && worktree?.backend !== "jj" && previous?.backend !== "jj") return {};
+	const workspaceChangeId = firstNonEmptyString(task.workspaceChangeId, worktree?.workspaceChangeId, previous?.workspaceChangeId);
+	const workspaceCommitId = firstNonEmptyString(task.workspaceCommitId, worktree?.workspaceCommitId, previous?.workspaceCommitId);
+	return {
+		backend: "jj",
+		...(workspaceChangeId ? { workspaceChangeId } : {}),
+		...(workspaceCommitId ? { workspaceCommitId } : {}),
+	};
+}
+
 function missingDiff(input: { manifestPath: string; stepIndex: number; taskIndex: number; agent: string; branch?: string }): WorktreeDiff {
 	const patchPath = path.join(path.dirname(input.manifestPath), `missing-diff-step-${input.stepIndex}-task-${input.taskIndex}-${safeHandoffAgentName(input.agent)}.patch`);
 	try {
@@ -90,6 +112,30 @@ export function writeParallelHandoffGroup(input: {
 	if (existing && (existing.runId !== input.runId || existing.mode !== input.mode || existing.source !== input.source)) {
 		throw new Error(`Parallel handoff manifest belongs to a different run: ${input.manifestPath}`);
 	}
+	const previousTasks = new Map(
+		(existing?.groups.find((group) => group.stepIndex === input.stepIndex)?.cleanup.tasks ?? []).map((task) => [task.index, task]),
+	);
+	const setupByIndex = new Map(input.setup.worktrees.map((worktree) => [worktree.index, worktree]));
+	const rawCleanup = input.cleanup ?? {
+		state: "partial" as const,
+		pruned: false,
+		tasks: input.setup.worktrees.map((worktree) => ({
+			index: worktree.index,
+			path: worktree.path,
+			branch: worktree.branch,
+			worktreeRemoved: false,
+			branchRemoved: false,
+			preserved: true,
+			reason: "cleanup pending durable handoff capture",
+			...(worktree.backend === "jj" ? { backend: "jj" as const } : {}),
+			...(typeof worktree.workspaceChangeId === "string" && worktree.workspaceChangeId
+				? { workspaceChangeId: worktree.workspaceChangeId }
+				: {}),
+			...(typeof worktree.workspaceCommitId === "string" && worktree.workspaceCommitId
+				? { workspaceCommitId: worktree.workspaceCommitId }
+				: {}),
+		})),
+	};
 	const group: ParallelHandoffGroup = {
 		stepIndex: input.stepIndex,
 		baseCommit: input.setup.baseCommit,
@@ -124,17 +170,11 @@ export function writeParallelHandoffGroup(input: {
 				},
 			};
 		}),
-		cleanup: input.cleanup ?? {
-			state: "partial",
-			pruned: false,
-			tasks: input.setup.worktrees.map((worktree) => ({
-				index: worktree.index,
-				path: worktree.path,
-				branch: worktree.branch,
-				worktreeRemoved: false,
-				branchRemoved: false,
-				preserved: true,
-				reason: "cleanup pending durable handoff capture",
+		cleanup: {
+			...rawCleanup,
+			tasks: rawCleanup.tasks.map((task) => ({
+				...task,
+				...jjCleanupIdentity(task, setupByIndex.get(task.index), previousTasks.get(task.index)),
 			})),
 		},
 	};
@@ -192,9 +232,11 @@ export function discardPreservedWorktrees(
 		const pending = group.cleanup.tasks.filter((task) => task.preserved && (!task.worktreeRemoved || !task.branchRemoved));
 		if (pending.length === 0) continue;
 		attempted += pending.length;
+		const jjGroup = pending.some((task) => task.backend === "jj");
 		const report = cleanupWorktrees({
 			cwd: group.repoRoot,
 			baseCommit: group.baseCommit,
+			...(jjGroup ? { backend: "jj" as const } : {}),
 			worktrees: pending.map((task) => ({
 				path: task.path,
 				agentCwd: task.path,
@@ -202,18 +244,27 @@ export function discardPreservedWorktrees(
 				index: task.index,
 				nodeModulesLinked: false,
 				syntheticPaths: [],
+				...(task.backend === "jj" ? { backend: "jj" as const } : {}),
+				...(typeof task.workspaceChangeId === "string" && task.workspaceChangeId
+					? { workspaceChangeId: task.workspaceChangeId }
+					: {}),
+				...(typeof task.workspaceCommitId === "string" && task.workspaceCommitId
+					? { workspaceCommitId: task.workspaceCommitId }
+					: {}),
 			})),
 		}, { kind: "discard", authorization });
 		const updates = new Map(report.tasks.map((task) => [task.index, task.worktreeRemoved && task.branchRemoved
 			? task
 			: { ...task, preserved: true, reason: task.reason ?? "discard cleanup remains incomplete" }]));
+		const allWClean = group.cleanup.tasks.every((task) => {
+			const next = updates.get(task.index) ?? task;
+			return next.worktreeRemoved && next.branchRemoved;
+		});
+		const complete = allWClean && report.pruned;
 		group.cleanup = {
-			state: group.cleanup.tasks.every((task) => {
-				const next = updates.get(task.index) ?? task;
-				return next.worktreeRemoved && next.branchRemoved;
-			}) && report.pruned ? "complete" : "partial",
+			state: complete ? "complete" : "partial",
 			tasks: group.cleanup.tasks.map((task) => updates.get(task.index) ?? task),
-			pruned: report.pruned,
+			pruned: complete,
 			...(report.errors ? { errors: report.errors } : {}),
 		};
 	}
@@ -221,17 +272,32 @@ export function discardPreservedWorktrees(
 	writeAtomicJson(resolvedPath, manifest);
 	const remaining = manifest.groups.flatMap((group) => group.cleanup.tasks.map((task) => ({ group, task })))
 		.filter(({ task }) => task.preserved && (!task.worktreeRemoved || !task.branchRemoved));
-	const lines = attempted === 0
-		? [`No preserved worktrees remain in ${resolvedPath}.`]
-		: [`Discard processed ${attempted} preserved worktree${attempted === 1 ? "" : "s"}.`, `Manifest: ${resolvedPath}`];
+	const lines =
+		attempted === 0
+			? [`No preserved worktrees remain in ${resolvedPath}.`]
+			: [`Discard processed ${attempted} preserved worktree${attempted === 1 ? "" : "s"}.`, `Manifest: ${resolvedPath}`];
 	if (remaining.length > 0) {
 		lines.push("", "Some worktrees remain. Inspect and remove them manually if appropriate:");
 		for (const { group, task } of remaining) {
-			lines.push(
-				`  git -C ${JSON.stringify(group.repoRoot)} status --short`,
-				`  git -C ${JSON.stringify(group.repoRoot)} worktree remove --force ${JSON.stringify(task.path)}`,
-				`  git -C ${JSON.stringify(group.repoRoot)} branch -D ${JSON.stringify(task.branch)}`,
-			);
+			if (task.backend === "jj") {
+				const recovery = [`  jj -R ${JSON.stringify(group.repoRoot)} workspace list`];
+				if (typeof task.workspaceChangeId === "string" && task.workspaceChangeId) {
+					recovery.push(`  jj -R ${JSON.stringify(group.repoRoot)} log -r ${JSON.stringify(task.workspaceChangeId)} --no-graph`);
+				}
+				if (typeof task.workspaceCommitId === "string" && task.workspaceCommitId) {
+					recovery.push(`  jj -R ${JSON.stringify(group.repoRoot)} show ${JSON.stringify(task.workspaceCommitId)}`);
+				}
+				recovery.push(
+					"  Cleanup requires proving the exact current commit, workspace name/root, D0 parents, and that there are no foreign descendants.",
+				);
+				lines.push(...recovery);
+			} else {
+				lines.push(
+					`  git -C ${JSON.stringify(group.repoRoot)} status --short`,
+					`  git -C ${JSON.stringify(group.repoRoot)} worktree remove --force ${JSON.stringify(task.path)}`,
+					`  git -C ${JSON.stringify(group.repoRoot)} branch -D ${JSON.stringify(task.branch)}`,
+				);
+			}
 		}
 	}
 	return { manifest, text: lines.join("\n") };

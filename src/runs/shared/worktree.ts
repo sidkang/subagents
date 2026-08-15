@@ -5,12 +5,21 @@ import * as path from "node:path";
 import { resolveAuthorityDecision, type AuthorityPolicyConfig } from "../../policy/authority.ts";
 import { PROJECT_SUBAGENTS_RELATIVE_DIR } from "../../shared/artifacts.ts";
 import { getAgentDir } from "../../shared/utils.ts";
+import {
+	cleanupJjWorktrees,
+	createJjWorktrees,
+	diffJjWorktrees,
+	isJjWorktreeCwd,
+	resolveExpectedJjWorktreeAgentCwd,
+} from "./jj-worktree-backend.ts";
 
 export interface WorktreeSetup {
 	cwd: string;
 	worktrees: WorktreeInfo[];
 	baseCommit: string;
 	capturedDiffs?: WorktreeDiff[];
+	/** Present only for JJ-backed setups (subagents). */
+	backend?: "jj";
 }
 
 export interface WorktreeInfo {
@@ -20,6 +29,10 @@ export interface WorktreeInfo {
 	index: number;
 	nodeModulesLinked: boolean;
 	syntheticPaths: string[];
+	/** JJ cleanup identity (optional; Git path ignores). */
+	backend?: "jj";
+	workspaceChangeId?: string;
+	workspaceCommitId?: string;
 }
 
 export interface WorktreeDiff {
@@ -43,6 +56,11 @@ export interface WorktreeCleanupTask {
 	preserved?: boolean;
 	reason?: string;
 	errors?: string[];
+	/** Optional JJ cleanup identity (Git reports omit these). */
+	backend?: "jj";
+	workspaceChangeId?: string;
+	/** Initial D0 commit id (capture base / parent check / discard identity). */
+	workspaceCommitId?: string;
 }
 
 export type WorktreeCleanupIntent =
@@ -234,6 +252,9 @@ function resolveRepoCwdRelative(cwd: string): string {
 }
 
 export function resolveExpectedWorktreeAgentCwd(cwd: string, runId: string, index: number, baseDir?: string): string {
+	if (isJjWorktreeCwd(cwd)) {
+		return resolveExpectedJjWorktreeAgentCwd(cwd, runId, index, baseDir);
+	}
 	const cwdRelative = resolveRepoCwdRelative(cwd);
 	const repoRoot = runGitChecked(cwd, ["rev-parse", "--show-toplevel"]).trim();
 	const worktreePath = buildWorktreePath(resolveWorktreeBaseDir(baseDir, repoRoot), runId, index);
@@ -665,6 +686,9 @@ function hasWorktreeChanges(diff: WorktreeDiff): boolean {
 }
 
 export function createWorktrees(cwd: string, runId: string, count: number, options?: CreateWorktreesOptions): WorktreeSetup {
+	if (isJjWorktreeCwd(cwd)) {
+		return createJjWorktrees(cwd, runId, count, options);
+	}
 	const repo = resolveRepoState(cwd);
 	const setupHook = resolveWorktreeSetupHook(repo.toplevel, options?.setupHook);
 	const baseDir = resolveWorktreeBaseDir(options?.baseDir, repo.toplevel);
@@ -700,6 +724,9 @@ export function createWorktrees(cwd: string, runId: string, count: number, optio
 }
 
 export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: string): WorktreeDiff[] {
+	if ((setup as { backend?: string }).backend === "jj" || setup.worktrees.some((wt) => (wt as { backend?: string }).backend === "jj")) {
+		return diffJjWorktrees(setup, agents, diffsDir);
+	}
 	try {
 		fs.mkdirSync(diffsDir, { recursive: true });
 	} catch {
@@ -729,6 +756,9 @@ export function cleanupWorktrees(
 	setup: WorktreeSetup,
 	intent: WorktreeCleanupIntent = { kind: "preserve", ...(setup.capturedDiffs ? { capturedDiffs: setup.capturedDiffs } : {}) },
 ): WorktreeCleanupReport {
+	if ((setup as { backend?: string }).backend === "jj" || setup.worktrees.some((wt) => (wt as { backend?: string }).backend === "jj")) {
+		return cleanupJjWorktrees(setup, intent);
+	}
 	const tasks: WorktreeCleanupTask[] = [];
 	for (let index = setup.worktrees.length - 1; index >= 0; index--) {
 		tasks.push(cleanupSingleWorktree(setup, setup.worktrees[index]!, intent));
