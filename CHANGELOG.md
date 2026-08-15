@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+- Add a fork-owned per-Child JJ worktree backend: `worktree:true` in a JJ repository creates independently captured and conservatively cleaned JJ workspaces, while Git fallback and `worktree:false` behavior stay unchanged.
+- Add Workflow Scratch: one package-created Host temporary cooperative directory per top-level native `workflowScript`, shared by that workflow's leaf Children via a private Mount Adapter at Guest `/workflow-shared` without replacing `/workspace`, with Launch Binding transport for detached runners and conservative scope cleanup.
+- Project an actual Child `sessionFile` on the public structural delegation terminal response.
+
 ### Fixed
+- Fork-only: ignore a stale Pi extension context while emitting the advisory async process-terminal event. The durable terminal proof is already persisted; unrelated event-emission errors still surface. Keep the source annotation until upstream supplies an equivalent guard.
 - Fall back from an implicit `defaultContext: fork` to `fresh` when the parent session file or current leaf is not available yet, instead of failing the first launch. Explicit `context: "fork"` remains fail-fast. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #1137.
 - Preserve a child's file-only report when its output path also names the workflow summary output.
 - Keep concurrent async result promotion from deleting a newer payload or another promoter's published result. Thanks to [@albertgwo](https://github.com/albertgwo) for #1130.
@@ -11,6 +17,7 @@
 - Preserve workflow child task output when neither the workflow nor child configures an output file (#1136).
 
 ### Changed
+- Identify this fork snapshot as `pi-subagents@0.50.0+sid.1` on upstream `0.50.0` / `81fb6894acd1d2b70570e2184731fe028385dc4c`.
 - Clarify that subagent reviews and gates should stay async unless foreground behavior is the actual requirement.
 - Remove `prompts.render` from `workflowScript`; pass explicit task text to `runs.run` or use `/prompt-workflow` for reusable prompt templates.
 

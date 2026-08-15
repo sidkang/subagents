@@ -8,13 +8,14 @@
  *   npx pi-subagents --remove # Remove the extension
  */
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 
 const EXTENSION_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "subagent");
-const REPO_URL = "https://github.com/nicobailon/pi-subagents.git";
+const REPO_URL = "https://github.com/sidkang/subagents.git";
+const REPO_REF = "dev";
 
 const args = process.argv.slice(2);
 const isRemove = args.includes("--remove") || args.includes("-r");
@@ -60,7 +61,7 @@ if (fs.existsSync(EXTENSION_DIR)) {
 	if (isGitRepo) {
 		console.log("Updating existing installation...");
 		try {
-			execSync("git pull", { cwd: EXTENSION_DIR, stdio: "inherit" });
+			execFileSync("git", ["pull"], { cwd: EXTENSION_DIR, stdio: "inherit" });
 			console.log("\npi-subagents updated");
 		} catch (err) {
 			console.error("Failed to update. Try removing and reinstalling:");
@@ -76,7 +77,7 @@ if (fs.existsSync(EXTENSION_DIR)) {
 	// Fresh install
 	console.log(`Cloning to ${EXTENSION_DIR}...`);
 	try {
-		execSync(`git clone ${REPO_URL} "${EXTENSION_DIR}"`, { stdio: "inherit" });
+		execFileSync("git", ["clone", "--branch", REPO_REF, "--single-branch", REPO_URL, EXTENSION_DIR], { stdio: "inherit" });
 		console.log("\npi-subagents installed");
 	} catch (err) {
 		console.error("Failed to clone repository");

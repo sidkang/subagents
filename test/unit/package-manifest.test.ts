@@ -173,6 +173,15 @@ test("old pi package scope is not used by source or tests", () => {
 	}
 });
 
+test("fork installer clones the sidkang repository dev branch", () => {
+	const installer = fs.readFileSync(path.join(projectRoot, "install.mjs"), "utf-8");
+	assert.match(installer, /const REPO_URL = "https:\/\/github\.com\/sidkang\/subagents\.git"/);
+	assert.match(installer, /const REPO_REF = "dev"/);
+	assert.match(installer, /execFileSync\("git", \["clone", "--branch", REPO_REF, "--single-branch", REPO_URL, EXTENSION_DIR\]/);
+	assert.doesNotMatch(installer, /nicobailon\/pi-subagents/);
+	assert.doesNotMatch(installer, /execSync\(/);
+});
+
 test("Pi package resolution stays export-map safe", () => {
 	for (const file of [...collectSourceFiles(path.join(projectRoot, "src")), ...collectSourceFiles(path.join(projectRoot, "test"))]) {
 		const source = fs.readFileSync(file, "utf-8");
