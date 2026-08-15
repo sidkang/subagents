@@ -2,11 +2,11 @@
 
 > **仓库：** `sidkang/subagents`
 >
-> **Fork version:** `0.50.0+sid.1`
+> **Fork version:** `0.50.0+sid.2`
 >
 > **Upstream version:** `0.50.0`
 >
-> **Upstream base:** `81fb6894acd1d2b70570e2184731fe028385dc4c`
+> **Upstream base:** `a14687b38761ba8e2d0fb41563401d0db12ec465`
 >
 > **验证：** [`fork-validation.md`](./fork-validation.md)
 

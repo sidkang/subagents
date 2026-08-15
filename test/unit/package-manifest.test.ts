@@ -173,6 +173,21 @@ test("old pi package scope is not used by source or tests", () => {
 	}
 });
 
+test("fork installer clones the sidkang repository dev branch", () => {
+	const installer = fs.readFileSync(path.join(projectRoot, "install.mjs"), "utf-8");
+	assert.match(installer, /const REPO_URL = "https:\/\/github\.com\/sidkang\/subagents\.git"/);
+	assert.match(installer, /const REPO_REF = "dev"/);
+	assert.match(installer, /execFileSync\("git", \["clone", "--branch", REPO_REF, "--single-branch", REPO_URL, EXTENSION_DIR\]/);
+	// Existing-install update must target REPO_URL + REPO_REF via execFileSync arrays,
+	// never bare pull or shell-constructed execSync.
+	assert.match(installer, /execFileSync\("git", \["fetch", REPO_URL, REPO_REF\]/);
+	assert.match(installer, /execFileSync\("git", \["checkout", "-B", REPO_REF, "FETCH_HEAD"\]/);
+	assert.doesNotMatch(installer, /execFileSync\("git", \["pull"\]/);
+	assert.doesNotMatch(installer, /\["pull"\]/);
+	assert.doesNotMatch(installer, /nicobailon\/pi-subagents/);
+	assert.doesNotMatch(installer, /execSync\(/);
+});
+
 test("Pi package resolution stays export-map safe", () => {
 	for (const file of [...collectSourceFiles(path.join(projectRoot, "src")), ...collectSourceFiles(path.join(projectRoot, "test"))]) {
 		const source = fs.readFileSync(file, "utf-8");

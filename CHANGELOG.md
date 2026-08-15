@@ -4,11 +4,15 @@
 
 ### Added
 - Add `PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS` so a host embedding the extension can bound how long a contended filesystem retry blocks its thread. Unset by default. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1143.
+- Add a fork-owned per-Child JJ worktree backend: `worktree:true` in a JJ repository creates independently captured and conservatively cleaned JJ workspaces, while Git fallback and `worktree:false` behavior stay unchanged.
+- Add Workflow Scratch: one package-created Host temporary cooperative directory per top-level native `workflowScript`, shared by that workflow's leaf Children via a private Mount Adapter at Guest `/workflow-shared` without replacing `/workspace`, with Launch Binding transport for detached runners and conservative scope cleanup.
+- Project an actual Child `sessionFile` on the public structural delegation terminal response.
 
 ### Fixed
 - Skip fallback models that are unavailable in the active registry, so shared agent configs still run where their primary model is available. Thanks to [@JPFrancoia](https://github.com/JPFrancoia) for #1147.
 - Sweep expired wait subscriptions armed by another session, so a record left behind by a session that never returns stops accumulating in the subscriptions directory. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1142.
 - Keep `mcp:<server>` direct tools available when pi-mcp-adapter cache identity includes a request-header command. Thanks to [@xz-dev](https://github.com/xz-dev) for #1141.
+- Fork-only: ignore a stale Pi extension context while emitting the advisory async process-terminal event. The durable terminal proof is already persisted; unrelated event-emission errors still surface. Keep the source annotation until upstream supplies an equivalent guard.
 - Fall back from an implicit `defaultContext: fork` to `fresh` when the parent session file or current leaf is not available yet, instead of failing the first launch. Explicit `context: "fork"` remains fail-fast. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #1137.
 - Preserve a child's file-only report when its output path also names the workflow summary output.
 - Keep concurrent async result promotion from deleting a newer payload or another promoter's published result. Thanks to [@albertgwo](https://github.com/albertgwo) for #1130.
@@ -22,6 +26,7 @@
 - Document that a host's session lifetime owns completion wakes, and how to key an idle check on live run state rather than parent activity. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1144.
 - Remove legacy subagent tool compatibility fields for append-step control, schedule aliases, async recovery metadata, and string mission goals.
 - Remove chain approval checkpoint steps and the `approve-checkpoint` / `reject-checkpoint` controls.
+- Identify this fork snapshot as `pi-subagents@0.50.0+sid.2` on upstream `0.50.0` / `a14687b38761ba8e2d0fb41563401d0db12ec465`.
 - Clarify that subagent reviews and gates should stay async unless foreground behavior is the actual requirement.
 - Remove `prompts.render` from `workflowScript`; pass explicit task text to `runs.run` or use `/prompt-workflow` for reusable prompt templates.
 
