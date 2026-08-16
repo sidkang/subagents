@@ -65,7 +65,6 @@ describe("public subagent execution normalization", () => {
 			{ concurrency: 2 },
 			{ action: "get", chainName: "review-pipeline" },
 			{ action: "create", config: { name: "review-pipeline", steps: [{ agent: "worker" }] } },
-			{ clarify: true, workflowScript: "return 1" },
 			{ resume: "retained-run", workflowScript: "return 1" },
 			{},
 			{ workflowScript: " " },
@@ -73,6 +72,22 @@ describe("public subagent execution normalization", () => {
 			{ action: "schedule.create", every: "1h", agent: "worker", workflowScript: "return 1" },
 		] as const) {
 			assert.equal(normalizePublicSubagentExecution(params).ok, false, JSON.stringify(params));
+		}
+	});
+
+	it("rejects clarify by field presence for both true and false", () => {
+		for (const params of [
+			{ clarify: true, workflowScript: "return 1" },
+			{ clarify: false, workflowScript: "return 1" },
+			{ clarify: true, agent: "worker", task: "work" },
+			{ clarify: false, agent: "worker", task: "work" },
+		] as const) {
+			const result = normalizePublicSubagentExecution(params);
+			assert.equal(result.ok, false, JSON.stringify(params));
+			if (!result.ok) {
+				assert.match(result.error, /does not support clarify UI/);
+				assert.equal(result.mode, "workflow");
+			}
 		}
 	});
 });

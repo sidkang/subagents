@@ -87,7 +87,7 @@ Use the available tools.`;
 			respond(context) {
 				const resultCount = (context.messages as Array<{ role?: string; toolName?: string }>).filter((message) => message.role === "toolResult" && message.toolName === "subagent").length;
 				if (resultCount === 0) {
-					return subagentCall({ agent: "extension-worker", task: "Report active tools.", context: "fresh", async: false, clarify: false, agentScope: "project" }, "call-direct-extension");
+					return subagentCall({ agent: "extension-worker", task: "Report active tools.", context: "fresh", async: false, agentScope: "project" }, "call-direct-extension");
 				}
 				if (resultCount === 1) {
 					return subagentCall({
@@ -106,12 +106,11 @@ Use the available tools.`;
 							},
 						]);`,
 						async: false,
-						clarify: false,
 						agentScope: "project",
 					}, "call-workflow-extension");
 				}
 				if (resultCount === 2) {
-					return subagentCall({ agent: "missing-extension-worker", task: "Report active tools.", context: "fresh", async: false, clarify: false, agentScope: "project" }, "call-missing-extension");
+					return subagentCall({ agent: "missing-extension-worker", task: "Report active tools.", context: "fresh", async: false, agentScope: "project" }, "call-missing-extension");
 				}
 				return "Child tool checks complete.";
 			},
@@ -165,7 +164,7 @@ Report active tools.`;
 			respond(context) {
 				const resultCount = (context.messages as Array<{ role?: string; toolName?: string }>).filter((message) => message.role === "toolResult" && message.toolName === "subagent").length;
 				if (resultCount > 0) return "Async child tool check complete.";
-				return subagentCall({ agent: "async-extension-worker", task: "Report active tools.", context: "fresh", async: false, clarify: false, agentScope: "project" }, "call-async-extension");
+				return subagentCall({ agent: "async-extension-worker", task: "Report active tools.", context: "fresh", async: false, agentScope: "project" }, "call-async-extension");
 			},
 			timeoutMs: 60_000,
 		});
@@ -200,7 +199,6 @@ Report active tools.`;
 						task: "Return the marker from the faux child provider.",
 						context: "fresh",
 						async: false,
-						clarify: false,
 						agentScope: "project",
 					},
 				}),
