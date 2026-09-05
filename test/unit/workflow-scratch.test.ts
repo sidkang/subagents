@@ -1,409 +1,205 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, it } from "node:test";
-import workflowScratchMountAdapter from "../../src/runs/shared/workflow-scratch-mount-adapter.ts";
+import { createWorkflowScratchMountAdapter } from "../../src/runs/shared/workflow-scratch-mount-adapter.ts";
 import {
-	WORKFLOW_SCRATCH_ROOT_ENV,
-	clearRunnerWorkflowScratchLaunchBindingForTests,
-	disableWorkflowScratchCleanup,
-	getActiveWorkflowScratchLaunchBinding,
-	getActiveWorkflowScratchLaunchEnv,
-	installRunnerWorkflowScratchLaunchBinding,
-	openWorkflowScratchScope,
-	resolveWorkflowScratchTempRoot,
-	shouldInjectWorkflowScratchMountAdapter,
-	trackWorkflowScratchLaunch,
-	validateWorkflowScratchLaunchBinding,
-	withWorkflowScratchScope,
-	workflowScratchMountAdapterPath,
+ WORKFLOW_SCRATCH_ROOT_ENV,
+ clearRunnerWorkflowScratchLaunchBindingForTests,
+ getActiveWorkflowScratchLaunchBinding,
+ installRunnerWorkflowScratchLaunchBinding,
+ openWorkflowScratchScope,
+ resolveWorkflowScratchTempRoot,
+ runWorkflowScriptWithScratch,
+ trackWorkflowScratchLaunch,
+ validateWorkflowScratchLaunchBinding,
+ withWorkflowScratchScope,
 } from "../../src/runs/shared/workflow-scratch.ts";
-import { buildPiArgs, cleanupTempDir } from "../../src/runs/shared/pi-args.ts";
-import { runWorkflowScript } from "../../src/workflows/scripted-workflow.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 
 const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const inheritedScratch = process.env[WORKFLOW_SCRATCH_ROOT_ENV];
-const hadInheritedScratch = Object.prototype.hasOwnProperty.call(
-	process.env,
-	WORKFLOW_SCRATCH_ROOT_ENV,
-);
-
-function restoreScratchEnv(): void {
-	if (hadInheritedScratch) process.env[WORKFLOW_SCRATCH_ROOT_ENV] = inheritedScratch;
-	else delete process.env[WORKFLOW_SCRATCH_ROOT_ENV];
-}
-
-function isInsideResolvedRoot(candidate: string, root: string): boolean {
-	const rel = relative(root, candidate);
-	return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`));
-}
-
-/** Writable base that is not the Host temp root and not inside it. */
-function resolveOutsideScratchBase(tempRoot: string): string | undefined {
-	let realTemp: string;
-	try {
-		realTemp = realpathSync(tempRoot);
-	} catch {
-		return undefined;
-	}
-	const candidates = ["/var/tmp", "/private/var/tmp", homedir()];
-	for (const candidate of candidates) {
-		try {
-			if (!existsSync(candidate) || !statSync(candidate).isDirectory()) continue;
-			const realBase = realpathSync(candidate);
-			if (isInsideResolvedRoot(realBase, realTemp)) continue;
-			return realBase;
-		} catch {
-			// Unreadable/unusable candidate.
-		}
-	}
-	return undefined;
-}
-
 afterEach(() => {
-	clearRunnerWorkflowScratchLaunchBindingForTests();
-	restoreScratchEnv();
+ clearRunnerWorkflowScratchLaunchBindingForTests();
+ if (inheritedScratch === undefined) delete process.env[WORKFLOW_SCRATCH_ROOT_ENV];
+ else process.env[WORKFLOW_SCRATCH_ROOT_ENV] = inheritedScratch;
 });
 
-function buildMinimalPiArgs(overrides: Parameters<typeof buildPiArgs>[0] = {}) {
-	return buildPiArgs({
-		baseArgs: ["-p"],
-		task: "scratch test",
-		sessionEnabled: false,
-		inheritProjectContext: false,
-		inheritSkills: false,
-		...overrides,
-	});
+function build(overrides: Partial<Parameters<typeof buildInProcessChildLaunch>[0]> = {}) {
+ return buildInProcessChildLaunch({
+  cwd: root, sessionEnabled: false, inheritProjectContext: false,
+  inheritGlobalContext: false, inheritSkills: false, extensions: [],
+  host: "parent", childAgentName: "worker", childIndex: 0, ...overrides,
+ });
 }
 
+function mountFrom(launch: ReturnType<typeof build>): unknown {
+ const hook = launch.session.hooks.find((candidate) => candidate.name === "workflow-scratch-mount");
+ if (!hook) return undefined;
+ const handlers = new Map<string, (payload: unknown) => void>();
+ hook.factory({ events: { on: (name: string, fn: (payload: unknown) => void) => handlers.set(name, fn) } } as never);
+ let provided: unknown;
+ handlers.get("sandbox:session-mount-override:query")?.({ provide: (value: unknown) => { provided = value; } });
+ return provided;
+}
+const expectedMount = (hostRoot: string) => ({ mounts: [{ hostPath: hostRoot, guestPath: "/workflow-shared", access: "rw" }] });
+
 describe("Workflow Scratch", () => {
-	it("prefers canonical /tmp and falls back only when /tmp is unusable", () => {
-		if (existsSync("/tmp") && statSync("/tmp").isDirectory()) {
-			assert.equal(typeof resolveWorkflowScratchTempRoot(), "string");
-		}
-		assert.equal(
-			resolveWorkflowScratchTempRoot({
-				existsSync: (value) => value === "/tmp",
-				statSync: () => ({ isDirectory: () => true }),
-				realpathSync: () => "/canonical/tmp",
-				tmpdir: () => "/unused",
-			}),
-			"/canonical/tmp",
-		);
-		assert.equal(
-			resolveWorkflowScratchTempRoot({
-				existsSync: () => false,
-				tmpdir: () => "/fallback",
-			}),
-			"/fallback",
-		);
-	});
+ it("prefers canonical /tmp and falls back only when unusable", () => {
+  assert.equal(resolveWorkflowScratchTempRoot({ existsSync: () => true, statSync: () => ({ isDirectory: () => true }), realpathSync: () => "/canonical/tmp", tmpdir: () => "/unused" }), "/canonical/tmp");
+  assert.equal(resolveWorkflowScratchTempRoot({ existsSync: () => false, tmpdir: () => "/fallback" }), "/fallback");
+ });
 
-	it("scopes scratch per workflow and defers removal until tracked launches settle", async () => {
-		const paths = await Promise.all([
-			withWorkflowScratchScope(async (first) => {
-				const settle = trackWorkflowScratchLaunch();
-				assert.deepEqual(getActiveWorkflowScratchLaunchBinding(), {
-					hostRoot: first.hostRoot,
-				});
-				assert.deepEqual(getActiveWorkflowScratchLaunchEnv(), {
-					[WORKFLOW_SCRATCH_ROOT_ENV]: first.hostRoot,
-				});
-				assert.ok(existsSync(first.hostRoot));
-				settle();
-				return first.hostRoot;
-			}),
-			withWorkflowScratchScope(async (second) => second.hostRoot),
-		]);
-		assert.notEqual(paths[0], paths[1]);
-		assert.ok(!existsSync(paths[0]));
-		assert.ok(!existsSync(paths[1]));
+ it("isolates scopes and defers cleanup until tracked launches settle", async () => {
+  const paths = await Promise.all([withWorkflowScratchScope(async (s) => s.hostRoot), withWorkflowScratchScope(async (s) => s.hostRoot)]);
+  assert.notEqual(paths[0], paths[1]);
+  for (const path of paths) assert.ok(!existsSync(path));
+  const handle = openWorkflowScratchScope();
+  let settle = () => {};
+  await handle.run(async () => { settle = trackWorkflowScratchLaunch(); });
+  handle.dispose();
+  assert.ok(existsSync(handle.scope.hostRoot));
+  settle(); settle();
+  assert.ok(!existsSync(handle.scope.hostRoot));
+ });
 
-		const handle = openWorkflowScratchScope();
-		const heldPath = handle.scope.hostRoot;
-		let settle: (() => void) | undefined;
-		await handle.run(async () => {
-			settle = trackWorkflowScratchLaunch();
-		});
-		handle.dispose();
-		assert.ok(existsSync(heldPath));
-		settle?.();
-		assert.ok(!existsSync(heldPath));
-	});
+ it("rejects ambient env authority and clears it only in runner launch env", () => {
+  process.env[WORKFLOW_SCRATCH_ROOT_ENV] = "/poison";
+  assert.equal(getActiveWorkflowScratchLaunchBinding(), undefined);
+  const foreground = build();
+  assert.equal(mountFrom(foreground), undefined);
+  assert.equal(foreground.session.processEnv, undefined);
+  const background = build({ host: "runner" });
+  assert.equal(background.session.processEnv?.[WORKFLOW_SCRATCH_ROOT_ENV], undefined);
+  assert.equal(mountFrom(background), undefined);
+  assert.equal(process.env[WORKFLOW_SCRATCH_ROOT_ENV], "/poison");
+ });
 
-	it("does not accept ambient scratch as mount authority and neutralizes it for Child spawn", () => {
-		const poison = mkdtempSync(join(tmpdir(), "subagents-ambient-poison-"));
-		try {
-			process.env[WORKFLOW_SCRATCH_ROOT_ENV] = poison;
-			assert.equal(getActiveWorkflowScratchLaunchBinding(), undefined);
-			assert.equal(getActiveWorkflowScratchLaunchEnv(), undefined);
-			assert.equal(shouldInjectWorkflowScratchMountAdapter(), false);
+ it("captures native per-session mount bindings without mutating parent env", async () => {
+  process.env[WORKFLOW_SCRATCH_ROOT_ENV] = "/poison";
+  const handles = [openWorkflowScratchScope(), openWorkflowScratchScope()];
+  try {
+   const launches = await Promise.all(handles.map((handle) => handle.run(async () => build())));
+   // Evaluate after leaving ALS: each hook must keep its own binding.
+   launches.forEach((launch, i) => {
+    assert.deepEqual(mountFrom(launch), expectedMount(handles[i].scope.hostRoot));
+    assert.equal(launch.session.processEnv, undefined);
+    assert.equal(launch.session.hooks.filter((h) => h.name === "workflow-scratch-mount").length, 1);
+    assert.ok(!launch.session.appendSystemPrompt?.includes(handles[i].scope.hostRoot));
+   });
+   const runner = await handles[0].run(async () => build({ host: "runner" }));
+   assert.equal(runner.session.processEnv?.[WORKFLOW_SCRATCH_ROOT_ENV], handles[0].scope.hostRoot);
+   assert.equal(process.env[WORKFLOW_SCRATCH_ROOT_ENV], "/poison");
+  } finally { for (const handle of handles) handle.dispose(); }
+ });
 
-			const built = buildMinimalPiArgs();
-			try {
-				assert.equal(built.env[WORKFLOW_SCRATCH_ROOT_ENV], "");
-				assert.ok(!built.args.includes(workflowScratchMountAdapterPath()));
-			} finally {
-				cleanupTempDir(built.tempDir);
-			}
-		} finally {
-			rmSync(poison, { recursive: true, force: true });
-		}
-	});
+ it("validates detached bindings with a closed shape and existing temp root", async () => {
+  await withWorkflowScratchScope(async (scope) => {
+   const binding = { hostRoot: scope.hostRoot };
+   assert.deepEqual(validateWorkflowScratchLaunchBinding(binding), binding);
+   for (const invalid of [scope.hostRoot, { ...binding, extra: true }, { hostPath: scope.hostRoot }, { hostRoot: "/missing/subagents-wf-scratch-123" }]) {
+    assert.equal(validateWorkflowScratchLaunchBinding(invalid), undefined);
+   }
+  });
+  const handle = openWorkflowScratchScope();
+  try {
+   installRunnerWorkflowScratchLaunchBinding({ hostRoot: handle.scope.hostRoot });
+   assert.deepEqual(mountFrom(build({ host: "runner" })), expectedMount(handle.scope.hostRoot));
+   installRunnerWorkflowScratchLaunchBinding("invalid");
+   assert.equal(mountFrom(build({ host: "runner" })), undefined);
+  } finally { handle.dispose(); }
+ });
 
-	it("injects only the active binding's Host root and Mount Adapter into Child launch arguments", async () => {
-		await withWorkflowScratchScope(async (scope) => {
-			const built = buildMinimalPiArgs();
-			try {
-				assert.equal(built.env[WORKFLOW_SCRATCH_ROOT_ENV], scope.hostRoot);
-				assert.ok(built.args.includes("--extension"));
-				assert.ok(built.args.includes(workflowScratchMountAdapterPath()));
-				assert.equal(
-					built.args.filter((arg) => arg === workflowScratchMountAdapterPath()).length,
-					1,
-				);
-			} finally {
-				cleanupTempDir(built.tempDir);
-			}
+ it("rejects roots with the wrong prefix or outside the temp root", (t) => {
+  const wrong = mkdtempSync(join(resolveWorkflowScratchTempRoot(), "not-scratch-"));
+  try { assert.equal(validateWorkflowScratchLaunchBinding({ hostRoot: wrong }), undefined); }
+  finally { rmSync(wrong, { recursive: true, force: true }); }
+  const base = ["/var/tmp", "/private/var/tmp", homedir()].find((candidate) => {
+   try {
+    const rel = relative(realpathSync(resolveWorkflowScratchTempRoot()), realpathSync(candidate));
+    return statSync(candidate).isDirectory() && (rel === ".." || rel.startsWith(`..${sep}`));
+   } catch { return false; }
+  });
+  if (!base) { t.skip("no writable base outside scratch temp root"); return; }
+  const outside = mkdtempSync(join(base, "subagents-wf-scratch-"));
+  try { assert.equal(validateWorkflowScratchLaunchBinding({ hostRoot: outside }), undefined); }
+  finally { rmSync(outside, { recursive: true, force: true }); }
+ });
 
-			// Ambient extension disable must not drop the package-private adapter.
-			const noAmbient = buildMinimalPiArgs({ extensions: [] });
-			try {
-				assert.ok(noAmbient.args.includes("--no-extensions"));
-				assert.ok(noAmbient.args.includes(workflowScratchMountAdapterPath()));
-				assert.equal(noAmbient.env[WORKFLOW_SCRATCH_ROOT_ENV], scope.hostRoot);
-			} finally {
-				cleanupTempDir(noAmbient.tempDir);
-			}
-		});
-	});
+ it("registers a mount provider only, with an immutable binding snapshot", () => {
+  const binding = { hostRoot: "/trusted/root" };
+  const factory = createWorkflowScratchMountAdapter(binding);
+  binding.hostRoot = "/changed";
+  let handler: ((payload: unknown) => void) | undefined;
+  factory({ events: { on: (name: string, callback: typeof handler) => {
+   assert.equal(name, "sandbox:session-mount-override:query"); handler = callback;
+  } } } as never);
+  let value: unknown;
+  handler?.({ provide: (override: unknown) => { value = override; } });
+  assert.deepEqual(value, expectedMount("/trusted/root"));
+  assert.ok(Object.isFrozen(value));
+  handler?.(null);
+ });
 
-	it("suppresses exact Mount Adapter path duplicates when already listed in extensions", async () => {
-		await withWorkflowScratchScope(async () => {
-			const adapterPath = workflowScratchMountAdapterPath();
-			const built = buildMinimalPiArgs({ extensions: [adapterPath] });
-			try {
-				// Hits toolPlan.extensionArgs.includes(path): path is already present,
-				// so the post --no-extensions injection must not re-add it.
-				assert.ok(built.args.includes("--no-extensions"));
-				assert.equal(
-					built.args.filter((arg) => arg === adapterPath).length,
-					1,
-				);
-			} finally {
-				cleanupTempDir(built.tempDir);
-			}
-		});
-	});
+ it("runs A/B then C with shared scratch and isolates concurrent workflows", async () => {
+  const roots: string[] = [];
+  const run = () => runWorkflowScriptWithScratch({
+   script: 'await runs.all([{key:"a",agent:"worker",task:"a"},{key:"b",agent:"worker",task:"b"}]); return runs.run("c",{agent:"worker",task:"c"});',
+   async launch(key) {
+    const binding = getActiveWorkflowScratchLaunchBinding()!;
+    assert.ok(binding);
+    if (key === "a") roots.push(binding.hostRoot);
+    assert.deepEqual(mountFrom(build()), expectedMount(binding.hostRoot));
+    if (key === "c") {
+     assert.equal(readFileSync(join(binding.hostRoot, "a"), "utf8"), "a");
+     assert.equal(readFileSync(join(binding.hostRoot, "b"), "utf8"), "b");
+    } else writeFileSync(join(binding.hostRoot, key), key);
+    return { key, ok: true, output: key, artifactPaths: [] };
+   },
+   async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+  });
+  await Promise.all([run(), run()]);
+  assert.equal(roots.length, 2); assert.notEqual(roots[0], roots[1]);
+  for (const path of roots) assert.ok(!existsSync(path));
+ });
 
-	it("validates detached Launch Binding strictly and leaves async scratch for OS cleanup", async () => {
-		const valid = mkdtempSync(
-			join(resolveWorkflowScratchTempRoot(), "subagents-wf-scratch-"),
-		);
-		try {
-			const binding = { hostRoot: valid };
-			assert.deepEqual(validateWorkflowScratchLaunchBinding(binding), {
-				hostRoot: valid,
-			});
-			assert.equal(validateWorkflowScratchLaunchBinding(valid), undefined);
-			assert.equal(
-				validateWorkflowScratchLaunchBinding({ hostRoot: valid, extra: true }),
-				undefined,
-			);
-			assert.equal(validateWorkflowScratchLaunchBinding({ hostPath: valid }), undefined);
-			assert.deepEqual(installRunnerWorkflowScratchLaunchBinding(binding), {
-				hostRoot: valid,
-			});
-			assert.deepEqual(getActiveWorkflowScratchLaunchBinding(), {
-				hostRoot: valid,
-			});
-			assert.deepEqual(getActiveWorkflowScratchLaunchEnv(), {
-				[WORKFLOW_SCRATCH_ROOT_ENV]: valid,
-			});
+ it("preserves scratch when a child detaches", async () => {
+  let path: string | undefined;
+  try {
+   await assert.rejects(runWorkflowScriptWithScratch({
+    script: 'return runs.run("child", {agent:"worker",task:"pause"});',
+    async launch(key) {
+     path = getActiveWorkflowScratchLaunchBinding()!.hostRoot;
+     return { key, ok: false, detached: true, output: "paused", artifactPaths: [] };
+    },
+    async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+   }));
+   assert.ok(path && existsSync(path));
+  } finally { if (path) rmSync(path, { recursive: true, force: true }); }
+ });
 
-			// Bare string and ambient-style values fail closed.
-			clearRunnerWorkflowScratchLaunchBindingForTests();
-			assert.equal(installRunnerWorkflowScratchLaunchBinding(valid), undefined);
-			assert.equal(getActiveWorkflowScratchLaunchBinding(), undefined);
-		} finally {
-			clearRunnerWorkflowScratchLaunchBindingForTests();
-			rmSync(valid, { recursive: true, force: true });
-		}
+ it("cleans a failed synchronous launch but preserves uncertain explicit async launches", async () => {
+  for (const async of [false, true]) {
+   let path: string | undefined;
+   try {
+    await assert.rejects(runWorkflowScriptWithScratch({
+     script: `return runs.run("child", {agent:"worker",task:"fail",async:${async}});`,
+     async launch() { path = getActiveWorkflowScratchLaunchBinding()!.hostRoot; throw new Error("launch failed"); },
+     async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+    }));
+    assert.ok(path); assert.equal(existsSync(path), async);
+   } finally { if (path) rmSync(path, { recursive: true, force: true }); }
+  }
+ });
 
-		const handle = openWorkflowScratchScope();
-		const heldPath = handle.scope.hostRoot;
-		await handle.run(async () => disableWorkflowScratchCleanup());
-		handle.dispose();
-		assert.ok(existsSync(heldPath));
-		rmSync(heldPath, { recursive: true, force: true });
-	});
-
-	it("rejects Launch Binding roots with the wrong basename prefix", () => {
-		const tempRoot = resolveWorkflowScratchTempRoot();
-		const wrongPrefix = mkdtempSync(join(tempRoot, "subagents-not-wf-scratch-"));
-		try {
-			assert.equal(
-				validateWorkflowScratchLaunchBinding({ hostRoot: wrongPrefix }),
-				undefined,
-			);
-		} finally {
-			rmSync(wrongPrefix, { recursive: true, force: true });
-		}
-	});
-
-	it("rejects Launch Binding roots outside the temp root", (t) => {
-		const tempRoot = resolveWorkflowScratchTempRoot();
-		const outsideBase = resolveOutsideScratchBase(tempRoot);
-		if (!outsideBase) {
-			t.skip("no writable directory outside the Workflow Scratch temp root");
-			return;
-		}
-		const outsideCorrectPrefix = mkdtempSync(join(outsideBase, "subagents-wf-scratch-"));
-		try {
-			assert.equal(
-				validateWorkflowScratchLaunchBinding({ hostRoot: outsideCorrectPrefix }),
-				undefined,
-			);
-		} finally {
-			rmSync(outsideCorrectPrefix, { recursive: true, force: true });
-		}
-	});
-
-	it("Mount Adapter supplies one rw /workflow-shared override and registers no prompt hooks", async () => {
-		const hostRoot = mkdtempSync(join(tmpdir(), "subagents-scratch-adapter-"));
-		const previous = process.env[WORKFLOW_SCRATCH_ROOT_ENV];
-		try {
-			process.env[WORKFLOW_SCRATCH_ROOT_ENV] = hostRoot;
-			const events = new Map<string, (payload: unknown) => void>();
-			const handlers = new Map<string, (payload: unknown) => unknown>();
-			const fakePi = {
-				events: {
-					on(channel: string, handler: (payload: unknown) => void) {
-						events.set(channel, handler);
-						return () => events.delete(channel);
-					},
-				},
-				on(channel: string, handler: (payload: unknown) => unknown) {
-					handlers.set(channel, handler);
-					return () => handlers.delete(channel);
-				},
-			};
-			workflowScratchMountAdapter(fakePi as never);
-
-			let provided: unknown;
-			events.get("sandbox:session-mount-override:query")?.({
-				provide(value: unknown) {
-					provided = value;
-				},
-			});
-			assert.deepEqual(provided, {
-				mounts: [
-					{
-						hostPath: hostRoot,
-						guestPath: "/workflow-shared",
-						access: "rw",
-					},
-				],
-			});
-			// Pure mount adapter: no model-facing prompt mutation.
-			assert.equal(handlers.has("before_agent_start"), false);
-			assert.equal(handlers.size, 0);
-		} finally {
-			if (previous === undefined) delete process.env[WORKFLOW_SCRATCH_ROOT_ENV];
-			else process.env[WORKFLOW_SCRATCH_ROOT_ENV] = previous;
-			rmSync(hostRoot, { recursive: true, force: true });
-		}
-	});
-
-	it("is a no-op when the private env is absent or neutralized", () => {
-		const events = new Map<string, (payload: unknown) => void>();
-		const handlers = new Map<string, (payload: unknown) => unknown>();
-		const fakePi = {
-			events: {
-				on(channel: string, handler: (payload: unknown) => void) {
-					events.set(channel, handler);
-					return () => events.delete(channel);
-				},
-			},
-			on(channel: string, handler: (payload: unknown) => unknown) {
-				handlers.set(channel, handler);
-				return () => handlers.delete(channel);
-			},
-		};
-
-		delete process.env[WORKFLOW_SCRATCH_ROOT_ENV];
-		workflowScratchMountAdapter(fakePi as never);
-		assert.equal(events.size, 0);
-		assert.equal(handlers.size, 0);
-
-		process.env[WORKFLOW_SCRATCH_ROOT_ENV] = "";
-		workflowScratchMountAdapter(fakePi as never);
-		assert.equal(events.size, 0);
-		assert.equal(handlers.size, 0);
-	});
-
-	it("Worker launch callback sees the active Workflow Scratch binding", async () => {
-		await withWorkflowScratchScope(async (scope) => {
-			let seenBinding: ReturnType<typeof getActiveWorkflowScratchLaunchBinding>;
-			let seenEnv: ReturnType<typeof getActiveWorkflowScratchLaunchEnv>;
-			let launchInvoked = false;
-			const result = await runWorkflowScript({
-				script: `return await runs.run("scratch-child", { agent: "worker", task: "touch scratch" });`,
-				async launch(key) {
-					launchInvoked = true;
-					seenBinding = getActiveWorkflowScratchLaunchBinding();
-					seenEnv = getActiveWorkflowScratchLaunchEnv();
-					return { key, ok: true, output: "done", artifactPaths: [] };
-				},
-				async status(key) {
-					return { key, ok: true, output: "ok", artifactPaths: [] };
-				},
-			});
-			assert.equal(launchInvoked, true);
-			assert.equal(result.children[0]?.ok, true);
-			assert.deepEqual(seenBinding, { hostRoot: scope.hostRoot });
-			assert.deepEqual(seenEnv, { [WORKFLOW_SCRATCH_ROOT_ENV]: scope.hostRoot });
-		});
-
-		const handle = openWorkflowScratchScope();
-		try {
-			let seenBinding: ReturnType<typeof getActiveWorkflowScratchLaunchBinding>;
-			const result = await handle.run(async () => runWorkflowScript({
-				script: `return await runs.run("open-scope-child", { agent: "worker", task: "touch scratch" });`,
-				async launch(key) {
-					seenBinding = getActiveWorkflowScratchLaunchBinding();
-					return { key, ok: true, output: "done", artifactPaths: [] };
-				},
-				async status(key) {
-					return { key, ok: true, output: "ok", artifactPaths: [] };
-				},
-			}));
-			assert.equal(result.children[0]?.ok, true);
-			assert.deepEqual(seenBinding, { hostRoot: handle.scope.hostRoot });
-		} finally {
-			handle.dispose();
-		}
-	});
-
-	it("wires scope, Child env, and detached transport through the fork source", () => {
-		const executor = readFileSync(join(root, "src/runs/foreground/subagent-executor.ts"), "utf8");
-		const piArgs = readFileSync(join(root, "src/runs/shared/pi-args.ts"), "utf8");
-		const asyncExecution = readFileSync(join(root, "src/runs/background/async-execution.ts"), "utf8");
-		const runner = readFileSync(join(root, "src/runs/background/subagent-runner.ts"), "utf8");
-		const adapter = readFileSync(join(root, "src/runs/shared/workflow-scratch-mount-adapter.ts"), "utf8");
-
-		assert.match(executor, /openWorkflowScratchScope/);
-		assert.match(executor, /withWorkflowScratchScope/);
-		assert.match(executor, /trackWorkflowScratchLaunch/);
-		assert.match(executor, /disableWorkflowScratchCleanup/);
-		assert.match(piArgs, /workflowScratchMountAdapterPath/);
-		assert.match(piArgs, /WORKFLOW_SCRATCH_ROOT_ENV\] = ""/);
-		assert.match(asyncExecution, /workflowScratchBinding/);
-		assert.match(asyncExecution, /delete runnerEnv\[WORKFLOW_SCRATCH_ROOT_ENV\]/);
-		assert.match(runner, /installRunnerWorkflowScratchLaunchBinding/);
-		assert.match(adapter, /sandbox:session-mount-override:query/);
-		assert.doesNotMatch(adapter, /before_agent_start/);
-	});
+ it("keeps both executor paths and detached transport connected", () => {
+  const executor = readFileSync(join(root, "src/runs/foreground/subagent-executor.ts"), "utf8");
+  assert.match(executor, /runWorkflowScriptWithScratch as runWorkflowScript/);
+  const async = readFileSync(join(root, "src/runs/background/async-execution.ts"), "utf8");
+  assert.match(async, /workflowScratchBinding/);
+  assert.match(async, /delete runnerEnv\[WORKFLOW_SCRATCH_ROOT_ENV\]/);
+  assert.match(readFileSync(join(root, "src/runs/background/subagent-runner.ts"), "utf8"), /installRunnerWorkflowScratchLaunchBinding\(config.workflowScratchBinding\)/);
+ });
 });

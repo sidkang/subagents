@@ -7,11 +7,15 @@ function state(sessionId: string | null = "session-a"): SubagentState {
 	return { currentSessionId: sessionId } as SubagentState;
 }
 
-function waitResult(text: string, isError = false) {
+function waitResult(text: string, isError = false, windowElapsed = false) {
 	return {
 		content: [{ type: "text" as const, text }],
 		...(isError ? { isError: true } : {}),
-		details: { mode: "management" as const, results: [] } satisfies Details,
+		details: {
+			mode: "management" as const,
+			results: [],
+			...(windowElapsed ? { wait: { reason: "window_elapsed" as const, timedOut: true as const, activeRunIds: ["run-a"], activeProviderItems: [] } } : {}),
+		} satisfies Details,
 	};
 }
 
@@ -28,19 +32,19 @@ describe("headless background-work auto-drain", () => {
 
 	it("loops until work added while draining is also gone", async () => {
 		let checks = 0;
-		const waits: Array<{ all?: boolean; timeoutMs?: number; stopOnAttention?: boolean; failOnFailedRuns?: boolean }> = [];
+		const waits: Array<{ all?: boolean; timeoutMs?: number; stopOnAttention?: boolean; failOnFailedRuns?: boolean; failOnAttention?: boolean }> = [];
 		await drainOutstandingWork({
 			state: state(),
 			timeoutMs: 1000,
 			now: () => checks * 10,
 			hasWork: () => checks++ < 2,
 			wait: async (params, _signal, deps) => {
-				waits.push({ ...params, stopOnAttention: deps.stopOnAttention, failOnFailedRuns: deps.failOnFailedRuns });
+				waits.push({ ...params, stopOnAttention: deps.stopOnAttention, failOnFailedRuns: deps.failOnFailedRuns, failOnAttention: deps.failOnAttention });
 				return waitResult("done");
 			},
 		});
 		assert.equal(waits.length, 2);
-		assert.ok(waits.every((entry) => entry.all === true && entry.stopOnAttention === false && entry.failOnFailedRuns === true));
+		assert.ok(waits.every((entry) => entry.all === true && entry.stopOnAttention === false && entry.failOnFailedRuns === true && entry.failOnAttention === true));
 		assert.ok((waits[1]!.timeoutMs ?? 0) < (waits[0]!.timeoutMs ?? 0), "each wait must share one absolute deadline");
 	});
 
@@ -59,7 +63,7 @@ describe("headless background-work auto-drain", () => {
 		}), /provider reconcile failed/);
 	});
 
-	it("enforces one absolute timeout across repeated drains", async () => {
+	it("keeps its absolute deadline strict after a non-error wait window elapses", async () => {
 		let clock = 0;
 		await assert.rejects(() => drainOutstandingWork({
 			state: state(),
@@ -68,7 +72,7 @@ describe("headless background-work auto-drain", () => {
 			hasWork: () => true,
 			wait: async () => {
 				clock = 101;
-				return waitResult("first batch done");
+				return waitResult("Wait window elapsed; work remains active.", false, true);
 			},
 		}), /timed out after 100ms.*session 'session-a'/);
 	});

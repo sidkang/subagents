@@ -2,8 +2,10 @@ import * as fs from "node:fs";
 import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import { readAsyncRecoveryDescriptor } from "./async-resume.ts";
 import type { TokenUsage } from "../../shared/types.ts";
+import { parallelHandoffPath, resolveRetainedWorktreeCwd } from "../shared/parallel-handoff.ts";
 
 const MAX_RETAINED_CHILDREN = 10;
+const MAX_RETAINED_CHILD_CANDIDATES = 100;
 const MAX_TASK_SUMMARY_LENGTH = 120;
 
 type RetainedChildState = "complete" | "failed" | "paused" | "stopped";
@@ -25,7 +27,7 @@ export interface RetainedChild {
 }
 
 function isRetainedChildState(state: AsyncRunSummary["state"]): state is RetainedChildState {
-	return state === "complete" || state === "failed" || state === "paused" || state === "stopped";
+	return state === "complete" || state === "failed" || state === "partial" || state === "paused" || state === "stopped";
 }
 
 function isTerminalStepStatus(status: AsyncRunSummary["steps"][number]["status"]): boolean {
@@ -49,16 +51,24 @@ function retainedSessionFile(sessionFile: string | undefined): RetainedChildResu
 
 function childResumability(run: AsyncRunSummary, step: AsyncRunSummary["steps"][number]): RetainedChildResumability {
 	if (run.state === "stopped" || step.status === "stopped") return { state: "not-resumable", reason: "stopped run" };
-	if (step.runner?.type === "external-cli") return { state: "not-resumable", reason: "external CLI runner" };
+	if (step.runner?.type === "external-cli" || step.runner?.type === "external-job") return { state: "not-resumable", reason: "external runner" };
 	const session = retainedSessionFile(step.sessionFile ?? run.sessionFile);
 	if (session.state === "not-resumable") return session;
+	let recoveryDescriptor: ReturnType<typeof readAsyncRecoveryDescriptor>;
 	try {
-		const recoveryDescriptor = readAsyncRecoveryDescriptor(run.asyncDir);
+		recoveryDescriptor = readAsyncRecoveryDescriptor(run.asyncDir);
 		if (!recoveryDescriptor) return { state: "not-resumable", reason: "missing recovery descriptor" };
 		if (recoveryDescriptor.sourceRunId !== run.id) return { state: "not-resumable", reason: `recovery descriptor belongs to run ${recoveryDescriptor.sourceRunId}` };
 		if (recoveryDescriptor.agent !== step.agent) return { state: "not-resumable", reason: `recovery descriptor belongs to agent ${recoveryDescriptor.agent}` };
 	} catch (error) {
 		return { state: "not-resumable", reason: `invalid recovery descriptor: ${error instanceof Error ? error.message : String(error)}` };
+	}
+	let requiredCwd: string | undefined;
+	try {
+		requiredCwd = resolveRetainedWorktreeCwd(parallelHandoffPath(run.asyncDir), run.id, step.index) ?? recoveryDescriptor.cwd ?? run.cwd;
+		if (!requiredCwd || !fs.statSync(requiredCwd).isDirectory()) return { state: "not-resumable", reason: `required cwd is missing: ${requiredCwd ?? "unknown"}` };
+	} catch (error) {
+		return { state: "not-resumable", reason: `resume dependency unavailable: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	return session;
 }
@@ -71,7 +81,7 @@ function boundedTaskSummary(value: string | undefined): string {
 }
 
 export function listRetainedChildren(asyncDirRoot: string, sessionId: string): RetainedChild[] {
-	const children = listAsyncRuns(asyncDirRoot, { sessionId, states: ["complete", "failed", "paused", "stopped"], reconcile: false })
+	const children = listAsyncRuns(asyncDirRoot, { sessionId, states: ["complete", "failed", "paused", "stopped"], entryLimit: MAX_RETAINED_CHILD_CANDIDATES, reconcile: false })
 		.flatMap((run) => {
 			if (!run.parentWorkflowRunId || run.steps.length !== 1) return [];
 			if (!isRetainedChildState(run.state)) return [];

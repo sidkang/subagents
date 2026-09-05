@@ -5,8 +5,8 @@ import { getMarkdownTheme, type ExtensionContext } from "@earendil-works/pi-codi
 import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component, type MarkdownTheme } from "@earendil-works/pi-tui";
 import { snapshotExternalRuns, type ExternalRun } from "../api/external-runs.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
-import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../shared/formatters.ts";
-import { DIRS, type AsyncJobState, type Details, type FleetKeybindingAction, type FleetKeybindingsConfig, type ForegroundChildControl, type ForegroundResumeChild, type ForegroundResumeRun, type ForegroundRunControl, type SubagentState } from "../shared/types.ts";
+import { formatDuration, formatModelThinking, formatTokens, formatTokenUsage, shortenPath } from "../shared/formatters.ts";
+import { DIRS, type AsyncJobState, type AsyncJobStep, type Details, type FleetKeybindingAction, type FleetKeybindingsConfig, type ForegroundChildControl, type ForegroundResumeChild, type ForegroundResumeRun, type ForegroundRunControl, type SubagentState } from "../shared/types.ts";
 import { decodeUtf8Tail } from "../shared/utf8.ts";
 import { readStatus } from "../shared/utils.ts";
 import { formatAsyncRunTranscript } from "../runs/background/fleet-view.ts";
@@ -14,10 +14,12 @@ import { listAsyncRuns, type AsyncRunSummary } from "../runs/background/async-st
 import { steerAsyncRun } from "../runs/foreground/async-steering-action.ts";
 import type { SteerDeliveryMode } from "../runs/background/control-channel.ts";
 import { stopAsyncRun } from "../runs/foreground/async-stop-action.ts";
+import { resolveWorkflowForegroundSteeringTarget, steerWorkflowForegroundTarget } from "../runs/foreground/workflow-foreground-steering.ts";
 import { contextModeBadge, contextModeLabel } from "../runs/shared/context-mode.ts";
 import { FLEET_STATUS_WIDGET_KEY } from "./fleet-status.ts";
 import { readFleetTranscript, renderFleetTranscript, type FleetTranscript } from "./fleet-transcript.ts";
 import { handleHerdrInspectorAction } from "../inspectors/herdr/actions.ts";
+import type { HerdrClient } from "../inspectors/herdr/client.ts";
 import { getLivePromptAudit, type LivePromptAudit, type PromptAuditView } from "../runs/foreground/prompt-audit.ts";
 
 const REFRESH_MS = 750;
@@ -40,7 +42,7 @@ export const DEFAULT_FLEET_KEYBINDINGS: Record<FleetKeybindingAction, string[]> 
 	pageDown: ["pageDown"],
 	refresh: ["r", "R"],
 	steer: ["s"],
-	inspect: ["H"],
+	inspect: ["return", "H"],
 	stop: ["D"],
 	toggleTools: ["x", "X", "ctrl+o"],
 };
@@ -108,6 +110,7 @@ export interface FleetViewOptions {
 	fleetKeybindings?: FleetKeybindingsConfig;
 	actions?: FleetActionHandlers;
 	copyText?: (text: string) => Promise<void> | void;
+	herdrClient?: HerdrClient;
 }
 
 function belongsToCurrentSession(sessionId: string | undefined, currentSessionId: string | null): boolean {
@@ -144,6 +147,7 @@ function trackedJobSummary(job: AsyncJobState): AsyncRunSummary {
 		...(job.currentStep !== undefined ? { currentStep: job.currentStep } : {}),
 		...(job.chainStepCount !== undefined ? { chainStepCount: job.chainStepCount } : {}),
 		...(job.parallelGroups?.length ? { parallelGroups: job.parallelGroups } : {}),
+		...(job.preflight ? { preflight: job.preflight } : {}),
 		steps: (job.steps ?? job.agents?.map((agent, index) => ({ agent, index, status: job.status === "queued" ? "pending" as const : job.status })) ?? []).map((step, index) => ({
 			...step,
 			index: step.index ?? index,
@@ -193,9 +197,21 @@ export function collectFleetSnapshot(
 	const workflowParentIds = new Set([...trackedJobs.values()]
 		.filter((job) => job.mode === "workflow" && belongsToCurrentSession(job.sessionId, state.currentSessionId))
 		.map((job) => job.asyncId));
+	const workflowForegroundChildCounts = new Map<string, number>();
+	const liveWorkflowForegroundControls = new Set<ForegroundRunControl>();
+	for (const control of state.foregroundControls.values()) {
+		const activeChildCount = control.activeChildren?.size ?? 0;
+		if (!control.parentWorkflowRunId
+			|| !workflowParentIds.has(control.parentWorkflowRunId)
+			|| !belongsToCurrentSession(control.sessionId, state.currentSessionId)
+			|| activeChildCount === 0) continue;
+		liveWorkflowForegroundControls.add(control);
+		workflowForegroundChildCounts.set(control.parentWorkflowRunId, (workflowForegroundChildCounts.get(control.parentWorkflowRunId) ?? 0) + activeChildCount);
+	}
 	for (const control of [...state.foregroundControls.values()].sort((left, right) => right.updatedAt - left.updatedAt)) {
 		activeForegroundIds.add(control.runId);
-		if (control.parentWorkflowRunId && workflowParentIds.has(control.parentWorkflowRunId)) continue;
+		if (control.parentWorkflowRunId && workflowParentIds.has(control.parentWorkflowRunId)
+			&& ((workflowForegroundChildCounts.get(control.parentWorkflowRunId) ?? 0) <= 1 || !liveWorkflowForegroundControls.has(control))) continue;
 		if (control.activeChildren) {
 			for (const child of [...control.activeChildren.values()].sort((left, right) => left.index - right.index)) {
 				items.push({
@@ -339,7 +355,12 @@ function foregroundPromptAuditCount(item: Extract<FleetItem, { kind: "foreground
 	return [...item.control.activeChildren.keys()].filter((index) => getLivePromptAudit(item.control, index)).length;
 }
 
-function authoredPromptSummary(text: string): string | undefined {
+function promptAuditString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function authoredPromptSummary(text: unknown): string | undefined {
+	if (typeof text !== "string") return undefined;
 	const summary = text.replace(/\s+/g, " ").trim();
 	return summary ? truncateToWidth(summary, PROMPT_AUDIT_SUMMARY_WIDTH, "…") : undefined;
 }
@@ -350,11 +371,11 @@ function foregroundAuthoredPromptSummary(item: Extract<FleetItem, { kind: "foreg
 	return prompt ? authoredPromptSummary(prompt.authoredTask) : undefined;
 }
 
-function promptAuditText(prompt: LivePromptAudit, view: PromptAuditView): string {
+function promptAuditText(prompt: LivePromptAudit, view: PromptAuditView): string | undefined {
 	switch (view) {
-		case "authored": return prompt.authoredTask;
-		case "runtime": return prompt.runtimeAdditions;
-		case "effective": return prompt.finalEffectivePrompt;
+		case "authored": return promptAuditString(prompt.authoredTask);
+		case "runtime": return promptAuditString(prompt.runtimeAdditions);
+		case "effective": return promptAuditString(prompt.finalEffectivePrompt);
 	}
 }
 
@@ -387,7 +408,9 @@ function foregroundActiveDetail(item: Extract<FleetItem, { kind: "foreground-act
 		live.currentTool ? `Current tool: ${live.currentTool}${live.currentPath ? ` · ${shortenPath(live.currentPath)}` : ""}` : undefined,
 		live.turnCount !== undefined ? `Turns: ${live.turnCount}` : undefined,
 		live.toolCount !== undefined ? `Tools: ${live.toolCount}` : undefined,
-		live.tokens !== undefined ? `Tokens: ${formatTokens(live.tokens)}` : undefined,
+		live.tokens !== undefined
+			? `Tokens: ${formatTokenUsage({ input: live.inputTokens ?? 0, output: live.outputTokens ?? 0, total: live.tokens, ...(live.window !== undefined ? { window: live.window } : {}), ...(live.windowPeak !== undefined ? { windowPeak: live.windowPeak } : {}) }, "tokens")}`
+			: undefined,
 		promptAuditCount > 0 ? `Prompt audit: ${promptAuditCount} live · 3 views · p opens` : undefined,
 		"",
 		"Transcript",
@@ -478,10 +501,70 @@ function externalElapsedEnd(run: ExternalRun): number {
 	return terminal ? (run.endedAt ?? run.updatedAt ?? Date.now()) : Date.now();
 }
 
-function asyncDetail(item: Extract<FleetItem, { kind: "async" }>): string[] {
+function workflowStepLabel(step: AsyncJobStep, index: number): string {
+	const key = step.workflowKey ?? `step ${index + 1}`;
+	const label = step.label && step.label !== key ? ` · ${step.label}` : "";
+	const phase = step.phase ? `${step.phase}: ` : "";
+	return `${phase}${key}${label} (${step.agent})`;
+}
+
+function workflowStepActivity(step: AsyncJobStep): string | undefined {
+	if (step.currentTool) return `tool ${step.currentTool}`;
+	if (step.currentPath) return shortenPath(step.currentPath);
+	if (step.activityState === "needs_attention") return "needs attention";
+	if (step.activityState === "active_long_running") return "long-running";
+	if (step.turnCount !== undefined) return `${step.turnCount} turns`;
+	if (step.toolCount !== undefined) return `${step.toolCount} tools`;
+	return undefined;
+}
+
+function visibleWorkflowProgressSteps(steps: AsyncJobStep[], visibleLimit: number): Array<{ step: AsyncJobStep; index: number } | { hidden: number }> {
+	if (steps.length <= visibleLimit) return steps.map((step, index) => ({ step, index }));
+	const selected = new Set<number>();
+	for (const [index, step] of steps.entries()) {
+		if (step.status !== "complete" && step.status !== "completed") selected.add(index);
+		if (selected.size >= visibleLimit) break;
+	}
+	for (let index = steps.length - 1; index >= 0 && selected.size < visibleLimit; index--) selected.add(index);
+	const visible = [...selected].sort((left, right) => left - right).map((index) => ({ step: steps[index]!, index }));
+	return [{ hidden: steps.length - visible.length }, ...visible];
+}
+
+function workflowProgressLines(steps: AsyncJobStep[] | undefined): string[] {
+	if (!steps?.length) return [];
+	const lines = ["Workflow progress:"];
+	for (const row of visibleWorkflowProgressSteps(steps, 8)) {
+		if ("hidden" in row) {
+			lines.push(`  +${row.hidden} hidden workflow steps`);
+			continue;
+		}
+		const activity = workflowStepActivity(row.step);
+		const context = contextModeLabel(row.step.context);
+		const details = [row.step.status, activity, context, row.step.tokens ? formatTokenUsage(row.step.tokens) : undefined].filter(Boolean).join(" · ");
+		lines.push(`  ${row.index + 1}. ${workflowStepLabel(row.step, row.index)}${details ? ` — ${details}` : ""}`);
+	}
+	return lines;
+}
+
+function asyncDetail(item: Extract<FleetItem, { kind: "async" }>, state: SubagentState): string[] {
 	const status = readStatus(item.run.asyncDir);
 	if (status) {
-		return formatAsyncRunTranscript(status, item.run.asyncDir, { index: item.index, lines: TRANSCRIPT_LINES }).split("\n");
+		const trackedJob = state.fleetJobs?.get(item.runId) ?? state.asyncJobs.get(item.runId);
+		const lines = formatAsyncRunTranscript(status, item.run.asyncDir, {
+			index: item.index,
+			lines: TRANSCRIPT_LINES,
+			sessionRoots: uniquePaths([...(state.trustedSessionRoots ?? []), trackedJob?.sessionRoot]),
+			trustedSessionFiles: [item.step?.sessionFile ?? item.run.sessionFile].filter((value): value is string => Boolean(value)),
+			trustedSessionFileRoot: state.trustedSessionFileRoot,
+		}).split("\n");
+		if (status.mode === "workflow" && item.index === undefined) {
+			const progress = workflowProgressLines((status.steps ?? item.run.steps) as AsyncJobStep[]);
+			if (progress.length) {
+				const modeIndex = lines.findIndex((line) => line.startsWith("Mode:"));
+				lines.splice(modeIndex >= 0 ? modeIndex + 1 : 0, 0, "", ...progress);
+			}
+		}
+		return lines;
 	}
 	const outputPath = item.index !== undefined ? path.join(item.run.asyncDir, `output-${item.index}.log`) : undefined;
 	return [
@@ -527,7 +610,7 @@ function detailLines(item: FleetItem | undefined, error: string | undefined, sta
 			? foregroundRecentDetail(item, state)
 			: item.kind === "external"
 				? externalDetail(item)
-				: asyncDetail(item);
+				: asyncDetail(item, state);
 	if (error) lines.unshift(`Fleet scan warning: ${error}`, "");
 	return lines;
 }
@@ -554,7 +637,7 @@ function fleetArtifactsRoot(state: SubagentState, cwd: string): string {
 	);
 }
 
-function transcriptTarget(item: FleetItem, state: SubagentState): { path: string; trustedRoots: string[] } | undefined {
+function transcriptTarget(item: FleetItem, state: SubagentState): { path: string; trustedRoots: string[]; trustedFiles?: string[]; trustedFileRoot?: string } | undefined {
 	if (item.kind === "external") return undefined;
 	if (item.kind === "foreground-active") {
 		const artifactsRoot = fleetArtifactsRoot(state, item.control.cwd ?? state.baseCwd);
@@ -577,10 +660,12 @@ function transcriptTarget(item: FleetItem, state: SubagentState): { path: string
 		};
 	}
 	const step = item.step ?? (item.run.steps.length === 1 ? item.run.steps[0] : undefined);
-	if (!step?.transcriptPath) return undefined;
-	const transcriptPath = path.isAbsolute(step.transcriptPath)
-		? step.transcriptPath
-		: path.resolve(item.run.asyncDir, step.transcriptPath);
+	const recordedSessionFile = step?.sessionFile ?? item.run.sessionFile;
+	const recordedPath = step?.transcriptPath ?? recordedSessionFile;
+	if (!recordedPath) return undefined;
+	const transcriptPath = path.isAbsolute(recordedPath)
+		? recordedPath
+		: path.resolve(item.run.asyncDir, recordedPath);
 	const trackedJob = state.fleetJobs?.get(item.runId) ?? state.asyncJobs.get(item.runId);
 	return {
 		path: transcriptPath,
@@ -590,6 +675,7 @@ function transcriptTarget(item: FleetItem, state: SubagentState): { path: string
 			trackedJob?.cwd ? fleetArtifactsRoot(state, trackedJob.cwd) : undefined,
 			item.run.sessionFile ? getArtifactsDir(item.run.sessionFile, item.run.cwd ?? state.baseCwd, state.artifactDirPreference) : undefined,
 		]),
+		...(!step?.transcriptPath && recordedSessionFile ? { trustedFiles: [recordedSessionFile], trustedFileRoot: state.trustedSessionFileRoot } : {}),
 	};
 }
 
@@ -613,23 +699,27 @@ function itemSource(item: FleetItem): string {
 function itemStats(item: FleetItem): string[] {
 	let model: string | undefined;
 	let tokens: number | undefined;
+	let tokenUsage: AsyncJobStep["tokens"];
 	let tools: number | undefined;
 	let durationMs: number | undefined;
 	if (item.kind === "foreground-active") {
 		const live = item.activeChild ?? item.control;
 		model = formatModelThinking(live.model, live.thinking) || undefined;
 		tokens = live.tokens;
+		if (tokens !== undefined) tokenUsage = { input: live.inputTokens ?? 0, output: live.outputTokens ?? 0, total: tokens, ...(live.window !== undefined ? { window: live.window } : {}), ...(live.windowPeak !== undefined ? { windowPeak: live.windowPeak } : {}) };
 		tools = live.toolCount;
 		durationMs = Math.max(0, Date.now() - live.startedAt);
 	} else if (item.kind === "foreground-recent") {
 		model = formatModelThinking(item.child.model, item.child.thinking) || undefined;
 		tokens = item.child.tokens;
+		if (tokens !== undefined) tokenUsage = { input: 0, output: 0, total: tokens, ...(item.child.window !== undefined ? { window: item.child.window } : {}), ...(item.child.windowPeak !== undefined ? { windowPeak: item.child.windowPeak } : {}) };
 		tools = item.child.toolCount;
 	} else if (item.kind === "external") {
 		durationMs = Math.max(0, externalElapsedEnd(item.run) - item.run.startedAt);
 	} else {
 		model = formatModelThinking(item.step?.model, item.step?.thinking) || undefined;
-		tokens = item.step?.tokens?.total ?? (item.index === undefined ? item.run.totalTokens?.total : undefined);
+		tokenUsage = item.step?.tokens ?? (item.index === undefined ? item.run.totalTokens : undefined);
+		tokens = tokenUsage?.total;
 		tools = item.step?.toolCount ?? (item.index === undefined ? item.run.toolCount : undefined);
 		const terminalRun = item.state !== "queued" && item.state !== "running" && item.state !== "pending";
 		const endTime = item.run.endedAt ?? (terminalRun ? item.run.lastUpdate : undefined) ?? Date.now();
@@ -637,7 +727,7 @@ function itemStats(item: FleetItem): string[] {
 	}
 	return [
 		model,
-		tokens !== undefined ? `${formatTokens(tokens)} tok` : undefined,
+		tokenUsage ? formatTokenUsage(tokenUsage) : tokens !== undefined ? `${formatTokens(tokens)} tok` : undefined,
 		tools !== undefined ? `${tools} tool${tools === 1 ? "" : "s"}` : undefined,
 		durationMs !== undefined ? formatDuration(durationMs) : undefined,
 	].filter((value): value is string => Boolean(value));
@@ -835,6 +925,18 @@ export class SubagentFleetComponent implements Component {
 		return { item };
 	}
 
+	private selectedSteerAction(): { runId: string; asyncDir: string; index?: number } | { reason: string } {
+		const item = this.snapshot.items[this.selected];
+		if (item?.kind === "foreground-active" && item.control.parentWorkflowRunId) {
+			const parent = this.state.asyncJobs.get(item.control.parentWorkflowRunId) ?? this.state.fleetJobs?.get(item.control.parentWorkflowRunId);
+			if (!parent || !isActionableAsyncState(parent.status)) return { reason: "The parent workflow is no longer available for steering." };
+			return { runId: item.runId, asyncDir: parent.asyncDir, ...(item.index !== undefined ? { index: item.index } : {}) };
+		}
+		const target = this.selectedAsyncAction();
+		if ("reason" in target) return target;
+		return { runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}) };
+	}
+
 	private selectedHerdrInspectAction(): { runId: string; asyncDir: string; index?: number } | { reason: string } {
 		const item = this.snapshot.items[this.selected];
 		if (!item) return { reason: "No child is selected." };
@@ -847,6 +949,12 @@ export class SubagentFleetComponent implements Component {
 		const parent = this.state.asyncJobs.get(item.control.parentWorkflowRunId) ?? this.state.fleetJobs?.get(item.control.parentWorkflowRunId);
 		if (!parent || !isActionableAsyncState(parent.status)) return { reason: "The parent workflow is no longer available for Herdr inspection." };
 		return { runId: parent.asyncId, asyncDir: parent.asyncDir };
+	}
+
+	private inspectSelectedHerdr(): void {
+		const target = this.selectedHerdrInspectAction();
+		if ("reason" in target || !this.options.actions?.inspect) this.setActionNotice({ text: "reason" in target ? target.reason : "Herdr inspector controls are unavailable in this context.", isError: true });
+		else this.runAction(() => this.options.actions!.inspect!(target));
 	}
 
 	private actionLines(): string[] {
@@ -992,12 +1100,12 @@ export class SubagentFleetComponent implements Component {
 					this.setActionNotice({ text: "Steer message cannot be empty.", isError: true });
 					return;
 				}
-				const target = this.selectedAsyncAction();
+				const target = this.selectedSteerAction();
 				if ("reason" in target || !this.options.actions) {
 					this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
 					return;
 				}
-				this.runAction(() => this.options.actions!.steer({ runId: target.item.runId, asyncDir: target.item.run.asyncDir, ...(target.item.index !== undefined ? { index: target.item.index } : {}), message, mode: this.steerMode }));
+				this.runAction(() => this.options.actions!.steer({ ...target, message, mode: this.steerMode }));
 				return;
 			}
 			if (matchesKey(data, "tab") || data === "\t") {
@@ -1065,7 +1173,7 @@ export class SubagentFleetComponent implements Component {
 			return;
 		}
 		if (matchesFleetAction(data, this.keybindings, "steer")) {
-			const target = this.selectedAsyncAction();
+			const target = this.selectedSteerAction();
 			if ("reason" in target || !this.options.actions) this.setActionNotice({ text: "reason" in target ? target.reason : "Fleet controls are unavailable in this context.", isError: true });
 			else {
 				this.actionNotice = undefined;
@@ -1074,12 +1182,6 @@ export class SubagentFleetComponent implements Component {
 				this.detailScroll = 0;
 				this.tui.requestRender();
 			}
-			return;
-		}
-		if (matchesFleetAction(data, this.keybindings, "inspect")) {
-			const target = this.selectedHerdrInspectAction();
-			if ("reason" in target || !this.options.actions?.inspect) this.setActionNotice({ text: "reason" in target ? target.reason : "Herdr inspector controls are unavailable in this context.", isError: true });
-			else this.runAction(() => this.options.actions!.inspect!(target));
 			return;
 		}
 		if (matchesFleetAction(data, this.keybindings, "stop")) {
@@ -1098,6 +1200,11 @@ export class SubagentFleetComponent implements Component {
 			this.expandedTools = !this.expandedTools;
 			this.transcriptCache = undefined;
 			this.tui.requestRender();
+			return;
+		}
+		if (matchesFleetAction(data, this.keybindings, "inspect")) {
+			this.inspectSelectedHerdr();
+			return;
 		}
 	}
 
@@ -1115,8 +1222,8 @@ export class SubagentFleetComponent implements Component {
 		});
 	}
 
-	private renderedTranscript(target: { path: string; trustedRoots: string[] }, width: number): { transcript: FleetTranscript; body: string[] } {
-		const fingerprint = `${target.trustedRoots.join("\0")}|${transcriptFingerprint(target.path)}`;
+	private renderedTranscript(target: { path: string; trustedRoots: string[]; trustedFiles?: string[]; trustedFileRoot?: string }, width: number): { transcript: FleetTranscript; body: string[] } {
+		const fingerprint = `${target.trustedRoots.join("\0")}|${target.trustedFiles?.join("\0") ?? ""}|${target.trustedFileRoot ?? ""}|${transcriptFingerprint(target.path)}`;
 		if (this.transcriptCache
 			&& this.transcriptCache.path === target.path
 			&& this.transcriptCache.fingerprint === fingerprint
@@ -1124,7 +1231,11 @@ export class SubagentFleetComponent implements Component {
 			&& this.transcriptCache.expandedTools === this.expandedTools) {
 			return { transcript: this.transcriptCache.transcript, body: [...this.transcriptCache.body] };
 		}
-		const transcript = readFleetTranscript(target.path, { trustedRoots: target.trustedRoots });
+		const transcript = readFleetTranscript(target.path, {
+			trustedRoots: target.trustedRoots,
+			...(target.trustedFiles ? { trustedFiles: target.trustedFiles } : {}),
+			...(target.trustedFileRoot ? { trustedFileRoot: target.trustedFileRoot } : {}),
+		});
 		const body = transcript.events.length > 0
 			? renderFleetTranscript(transcript, width, this.theme, this.markdownTheme, { expandedTools: this.expandedTools })
 			: [];
@@ -1274,23 +1385,38 @@ export async function openSubagentFleet(ctx: ExtensionContext, state: SubagentSt
 		await copyToClipboard(text);
 	});
 	const actions = options.actions ?? {
-		steer: async (input: { runId: string; asyncDir: string; index?: number; message: string; mode: SteerDeliveryMode }) => firstToolResultText(await steerAsyncRun({
-			state,
-			runId: input.runId,
-			...(input.index !== undefined ? { index: input.index } : {}),
-			message: input.message,
-			mode: input.mode,
-			location: { asyncDir: input.asyncDir, resolvedId: input.runId } as Parameters<typeof steerAsyncRun>[0]["location"],
-		}), `Failed to steer async run ${input.runId}.`),
+		steer: async (input: { runId: string; asyncDir: string; index?: number; message: string; mode: SteerDeliveryMode }) => {
+			const status = readStatus(input.asyncDir);
+			const liveWorkflowRunId = status?.mode === "workflow" && state.workflowControllers?.has(status.runId || input.runId)
+				? status.runId || input.runId
+				: undefined;
+			if (liveWorkflowRunId) {
+				const route = state.foregroundControls.get(input.runId)?.parentWorkflowRunId === liveWorkflowRunId
+					? resolveWorkflowForegroundSteeringTarget({ state, childRunId: input.runId, asyncDirRoot: options.asyncDirRoot ?? DIRS.async })
+					: resolveWorkflowForegroundSteeringTarget({ state, workflowRunId: liveWorkflowRunId, asyncDirRoot: options.asyncDirRoot ?? DIRS.async });
+				if (!route.ok) return { text: route.message, isError: true };
+				return firstToolResultText(await steerWorkflowForegroundTarget({ target: route.target, message: input.message, mode: input.mode, ...(input.index !== undefined ? { index: input.index } : {}) }), `Failed to steer foreground run ${input.runId}.`);
+			}
+			return firstToolResultText(await steerAsyncRun({
+				state,
+				runId: input.runId,
+				...(input.index !== undefined ? { index: input.index } : {}),
+				message: input.message,
+				mode: input.mode,
+				location: { asyncDir: input.asyncDir, resolvedId: input.runId } as Parameters<typeof steerAsyncRun>[0]["location"],
+			}), `Failed to steer async run ${input.runId}.`);
+		},
 		stop: (input: { runId: string; asyncDir: string; index?: number }) => firstToolResultText(stopAsyncRun(state, input.runId, undefined, { asyncDir: input.asyncDir, resolvedId: input.runId }), `Failed to stop async run ${input.runId}.`),
 		inspect: async (input: { runId: string; asyncDir: string; index?: number }) => firstToolResultText(await handleHerdrInspectorAction("inspector.open", {
 			id: input.runId,
 			dir: input.asyncDir,
+			focus: true,
 			...(input.index !== undefined ? { index: input.index } : {}),
 		}, {
 			state,
 			sessionRoots: state.trustedSessionRoots,
 			cwd: state.baseCwd,
+			...(options.herdrClient ? { client: options.herdrClient } : {}),
 			...(state.authorityPolicy ? { authorityPolicy: state.authorityPolicy } : {}),
 			...(state.missionStoreConfig ? { missions: state.missionStoreConfig } : {}),
 		}), `Failed to open Herdr inspector for async run ${input.runId}.`),

@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { writeAtomicJson, writePrivateAtomicJson } from "../../src/shared/atomic-json.ts";
-import { closeSteerInbox, interruptRequestPath, steerRequestsDir, writeSteerAck, type SteerRequest } from "../../src/runs/background/control-channel.ts";
+import { closeSteerInbox, interruptRequestPath, steerRequestsDir, type SteerRequest } from "../../src/runs/background/control-channel.ts";
 import { steerAsyncRun } from "../../src/runs/foreground/async-steering-action.ts";
 import { createSteeringStatus, recordSteeringRequest, updateSteeringTarget } from "../../src/runs/background/steering.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
@@ -106,11 +106,11 @@ function recoveryDescriptor(runId: string): SteeringRecoveryDescriptor {
 		agent: "worker-0",
 		cwd: os.tmpdir(),
 		systemPromptMode: "replace",
+		inheritGlobalContext: false,
 		inheritProjectContext: false,
 		inheritSkills: false,
 		outputMode: "inline",
 		absoluteDeadlineAt: Date.now() + 10_000,
-		initialTurnBudget: { maxTurns: 10, graceTurns: 2 },
 		initialToolBudget: { soft: 8, hard: 12, block: ["read"] },
 		maxSubagentDepth: 2,
 		share: false,
@@ -139,6 +139,7 @@ describe("acknowledged steering action", () => {
 			assert.equal(result.isError, undefined);
 			assert.equal(result.details.steering?.state, "delivered");
 			assert.match(result.content[0]!.text, /Steering delivered/);
+			assert.match(result.content[0]!.text, /Message sent:\n```text\ncorrect course\n```/);
 		} finally {
 			removeAsyncDir(asyncDir);
 		}
@@ -308,12 +309,10 @@ describe("acknowledged steering action", () => {
 					recoveryCommitted = true;
 					assert.ok(request);
 					assert.ok(routed);
-					writeSteerAck(asyncDir, { requestId: request.id, index: 0, ts: Date.now(), state: "delivered", message: "accepted after runner pause" });
 					writeStatus(asyncDir, {
 						...routed,
 						state: "paused",
 						endedAt: Date.now(),
-						turnBudget: { maxTurns: 10, graceTurns: 2, turnCount: 7, outcome: "within-budget" },
 						toolBudget: { soft: 8, hard: 12, block: ["read"], toolCount: 9, outcome: "soft-reached" },
 						steps: [{ ...routed.steps![0]!, status: "paused", sessionFile }],
 					});
@@ -330,18 +329,16 @@ describe("acknowledged steering action", () => {
 			const result = await action;
 			assert.equal(result.isError, undefined);
 			assert.equal(result.details.steering?.state, "recovered");
+			assert.match(result.content[0]!.text, /Message sent:\n```text\ncorrect course\n```/);
 			assert.equal(result.details.steering?.replacementRunId, "replacement");
-			assert.ok(result.details.steering?.targets[0]?.lateDeliveredAt);
-			const limits = receivedLimits as { timeoutMs: number; absoluteDeadlineAt: number; turnBudget: unknown; toolBudget: unknown };
+			const limits = receivedLimits as { timeoutMs: number; absoluteDeadlineAt: number; toolBudget: unknown };
 			assert.ok(limits.timeoutMs > 0 && limits.timeoutMs <= 10_000);
 			assert.ok(limits.absoluteDeadlineAt >= Date.now());
-			assert.deepEqual({ turnBudget: limits.turnBudget, toolBudget: limits.toolBudget }, {
-				turnBudget: { maxTurns: 3, graceTurns: 2 },
+			assert.deepEqual({ toolBudget: limits.toolBudget }, {
 				toolBudget: { hard: 3, block: ["read"] },
 			});
 			const persisted = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatus;
 			assert.equal(persisted.steering?.recent[0]?.targets[0]?.state, "recovered");
-			assert.ok(persisted.steering?.recent[0]?.targets[0]?.lateDeliveredAt);
 			assert.equal(persisted.steps?.[0]?.steering?.recent[0]?.targets[0]?.state, "recovered");
 		} finally {
 			removeAsyncDir(asyncDir);

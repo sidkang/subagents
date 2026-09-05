@@ -2,12 +2,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { resultFilePath, resultPayloadPathForSessionRun, writeAsyncResultFile } from "./result-files.ts";
-import { releaseActiveRunIndex, updateActiveRunIndex } from "./active-run-index.ts";
+import { updateActiveRunIndex } from "./active-run-index.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { DIRS, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode } from "../../shared/types.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { nestedSummaryFromAsyncStatus, projectNestedEvents, resolveNestedAsyncDir, writeNestedEvent, type NestedRoute } from "../shared/nested-events.ts";
+import { assertWorkflowGraphHostSteps } from "../shared/host-step-status.ts";
 
 export type PidLiveness = "alive" | "dead" | "unknown";
 
@@ -17,12 +18,14 @@ interface StartedRunMetadata {
 	runId: string;
 	pid?: number;
 	sessionId?: string;
+	completionOwnerId?: string;
 	mode?: SubagentRunMode;
 	agents?: string[];
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	startedAt?: number;
 	sessionFile?: string;
+	sessionName?: string;
 }
 
 interface ReconcileAsyncRunOptions {
@@ -89,6 +92,7 @@ function appendJsonlBestEffort(filePath: string, payload: object): void {
 
 interface ResultChildOutcome {
 	agent?: string;
+	sessionName?: string;
 	success?: boolean;
 	error?: string;
 	sessionFile?: string;
@@ -96,10 +100,11 @@ interface ResultChildOutcome {
 	thinking?: string;
 	attemptedModels?: string[];
 	modelAttempts?: NonNullable<AsyncStatus["steps"]>[number]["modelAttempts"];
+	contextOverflow?: boolean;
 }
 
 interface ResultRepairData {
-	state: "complete" | "failed" | "paused" | "stopped" | "rejected";
+	state: "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 	results?: ResultChildOutcome[];
 }
 
@@ -115,7 +120,7 @@ function regularFileExists(filePath: string): boolean {
 function readResultRepairData(resultPath: string): ResultRepairData | undefined {
 	try {
 		const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { success?: boolean; state?: string; exitCode?: number; results?: unknown };
-		const state = data.success ? "complete" : data.state === "stopped" ? "stopped" : data.state === "rejected" ? "rejected" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
+		const state = data.success ? "complete" : data.state === "stopped" ? "stopped" : data.state === "rejected" ? "rejected" : data.state === "partial" ? "partial" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
 		const results = Array.isArray(data.results)
 			? data.results.map((entry, index) => {
 				if (!entry || typeof entry !== "object" || Array.isArray(entry)) return {};
@@ -155,13 +160,15 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 			endedAt: step.endedAt ?? now,
 			durationMs: step.startedAt !== undefined && step.durationMs === undefined ? Math.max(0, now - step.startedAt) : step.durationMs,
 			exitCode: step.exitCode ?? (state === "complete" || state === "paused" ? 0 : 1),
-			error: state === "failed" || state === "stopped" ? step.error ?? child?.error : step.error,
+			error: state === "failed" || state === "partial" || state === "stopped" ? step.error ?? child?.error : step.error,
 			stopped: state === "stopped" ? true : step.stopped,
+			sessionName: step.sessionName ?? child?.sessionName,
 			sessionFile: step.sessionFile ?? child?.sessionFile,
 			model,
 			thinking,
 			attemptedModels: child?.attemptedModels ?? step.attemptedModels,
 			modelAttempts: child?.modelAttempts ?? step.modelAttempts,
+			contextOverflow: child?.contextOverflow ?? step.contextOverflow,
 		};
 	});
 	const terminalStatus: AsyncStatus = {
@@ -190,6 +197,7 @@ function buildStartedStatus(asyncDir: string, startedRun: StartedRunMetadata, no
 	return {
 		runId: startedRun.runId || path.basename(asyncDir),
 		...(startedRun.sessionId ? { sessionId: startedRun.sessionId } : {}),
+		...(startedRun.completionOwnerId ? { completionOwnerId: startedRun.completionOwnerId } : {}),
 		mode: startedRun.mode ?? "single",
 		state: "running",
 		pid: startedRun.pid,
@@ -244,17 +252,20 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 			id: runId,
 			agent: resultAgent,
 			mode: status.mode,
+			...(status.completionOwnerId ? { completionOwnerId: status.completionOwnerId } : {}),
 			success: false,
 			state: "failed",
 			summary: message,
 			results: repairedSteps.map((step) => ({
 				agent: step.agent,
+				...(step.sessionName ? { sessionName: step.sessionName } : {}),
 				output: step.status === "complete" || step.status === "completed" ? "" : message,
 				error: step.status === "complete" || step.status === "completed" ? undefined : step.error ?? message,
 				success: step.status === "complete" || step.status === "completed",
 				model: step.model,
 				attemptedModels: step.attemptedModels,
 				modelAttempts: step.modelAttempts,
+				contextOverflow: step.contextOverflow,
 				sessionFile: step.sessionFile,
 			})),
 			exitCode: 1,
@@ -271,7 +282,7 @@ function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: st
 	const repair = buildFailedRepair(status, asyncDir, now, reason);
 	if (repair.result.sessionId) writeAsyncResultFile(resultPath, repair.result);
 	writeAtomicJson(path.join(asyncDir, "status.json"), repair.status);
-	if (repair.status.processTerminal?.state === "observed") releaseActiveRunIndex(asyncDir);
+	updateActiveRunIndex(asyncDir, repair.status.state, repair.status.toolCallId);
 	appendJsonlBestEffort(path.join(asyncDir, "events.jsonl"), {
 		type: "subagent.run.repaired_stale",
 		ts: now,
@@ -284,7 +295,7 @@ function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: st
 }
 
 function terminal(state: AsyncStatus["state"]): boolean {
-	return state === "complete" || state === "failed" || state === "paused" || state === "stopped" || state === "rejected";
+	return state === "complete" || state === "failed" || state === "partial" || state === "paused" || state === "stopped" || state === "rejected";
 }
 
 function* nestedRuns(children: NestedRunSummary[] | undefined): Generator<NestedRunSummary> {
@@ -347,6 +358,7 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;
 	if (!effectiveStatus) return { status: null, repaired: false };
+	assertWorkflowGraphHostSteps(effectiveStatus.workflowGraph, path.join(asyncDir, "status.json"), effectiveStatus.runId);
 	const statusPath = path.join(asyncDir, "status.json");
 	for (const [index, step] of (effectiveStatus.steps ?? []).entries()) {
 		const stepRecord = step as Record<string, unknown>;
@@ -365,7 +377,7 @@ export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOp
 			: undefined;
 		if (terminalStatus) {
 			writeAtomicJson(path.join(asyncDir, "status.json"), terminalStatus);
-			if (terminalStatus.processTerminal?.state === "observed") releaseActiveRunIndex(asyncDir);
+			updateActiveRunIndex(asyncDir, terminalStatus.state, terminalStatus.toolCallId);
 			return { status: terminalStatus, repaired: true, resultPath: existingResultPath, message: "Existing async result file was used to repair stale running status." };
 		}
 		if (effectiveStatus.displayDismissedAt === undefined) return { status: effectiveStatus, repaired: false, resultPath: existingResultPath };

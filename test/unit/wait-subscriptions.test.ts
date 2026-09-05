@@ -8,6 +8,7 @@ import { registerWaitTool } from "../../src/runs/background/wait-tool.ts";
 import { createWaitSubscriptionManager } from "../../src/runs/background/wait-subscriptions.ts";
 import { recordWaitCompletion } from "../../src/runs/background/wait-completions.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
+import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 import { SUBAGENT_ASYNC_COMPLETE_EVENT, type IntercomEventBus, type SubagentState } from "../../src/shared/types.ts";
 
 function writeStatus(asyncRoot: string, runId: string, state: string, extra: object = {}): void {
@@ -22,6 +23,24 @@ function writeStatus(asyncRoot: string, runId: string, state: string, extra: obj
 		lastUpdate: now,
 		steps: [{ agent: "worker", status: state }],
 		...extra,
+	}), "utf-8");
+}
+
+function writeRecoveryDescriptor(asyncRoot: string, runId: string, agent: string, sessionFile: string, cwd: string): void {
+	fs.writeFileSync(path.join(asyncRoot, runId, "recovery-descriptor.json"), JSON.stringify({
+		version: 1,
+		sourceRunId: runId,
+		agent,
+		sessionFile,
+		cwd,
+		systemPromptMode: "append",
+		outputMode: "inline",
+		inheritGlobalContext: false,
+		inheritProjectContext: false,
+		inheritSkills: false,
+		maxSubagentDepth: 0,
+		share: false,
+		runFanoutBudget: createRunFanoutBudget(runId, 64),
 	}), "utf-8");
 }
 
@@ -68,7 +87,7 @@ describe("non-blocking wait subscriptions", () => {
 			const asyncRoot = path.join(root, "runs");
 			writeStatus(asyncRoot, "run-alpha", "running", { sessionId: "session-a", pid: 999_999 });
 			let armed: { targetKind: "async" | "foreground"; runId: string; requestedId: string; timeoutMs: number } | undefined;
-			const result = await waitForSubagents({ id: "run-al", nonBlocking: true, timeoutMs: 5_000 }, undefined, {
+			const result = await waitForSubagents({ id: "run-alph", nonBlocking: true, timeoutMs: 5_000 }, undefined, {
 				state: makeState(),
 				asyncDirRoot: asyncRoot,
 				resultsDir: path.join(root, "results"),
@@ -82,13 +101,13 @@ describe("non-blocking wait subscriptions", () => {
 
 			assert.equal(result.isError, undefined);
 			assert.match(textOf(result), /Armed wait subscription wait-token/);
-			assert.deepEqual(armed, { targetKind: "async", runId: "run-alpha", requestedId: "run-al", timeoutMs: 5_000 });
+			assert.deepEqual(armed, { targetKind: "async", runId: "run-alpha", requestedId: "run-alph", timeoutMs: 5_000 });
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
-	it("rejects non-blocking subscriptions from headless tool calls", async () => {
+	it("registers bg_wait and rejects non-blocking subscriptions from headless tool calls", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-subscribe-headless-"));
 		try {
 			const state = makeState();
@@ -100,16 +119,18 @@ describe("non-blocking wait subscriptions", () => {
 				updatedAt: Date.now(),
 				children: [{ agent: "worker", index: 0, status: "detached" }],
 			}]]);
-			let tool: { execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean }> } | undefined;
+			const registered: Array<{ name: string; description: string; execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean }> }> = [];
 			registerWaitTool({
 				events: new TestBus(),
-				registerTool(value: unknown) { tool = value as typeof tool; },
+				registerTool(value: unknown) { registered.push(value as typeof registered[number]); },
 			} as never, state, true, {
 				arm() { throw new Error("headless calls must not arm subscriptions"); },
 			});
-			const result = await tool!.execute("wait", { id: "run-headless", nonBlocking: true }, undefined, undefined, { hasUI: false });
-			assert.equal(result.isError, true);
-			assert.match(textOf(result), /long-lived interactive subagent runtime/);
+			assert.deepEqual(registered.map((entry) => entry.name), ["bg_wait"]);
+			await assert.rejects(
+				registered[0]!.execute("wait", { id: "run-headless", nonBlocking: true }, undefined, undefined, { hasUI: false }),
+				/long-lived interactive subagent runtime/,
+			);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -213,6 +234,7 @@ describe("non-blocking wait subscriptions", () => {
 			fs.writeFileSync(completedSessionFile, "{}\n", "utf-8");
 			fs.writeFileSync(failedSessionFile, "{}\n", "utf-8");
 			writeStatus(asyncRoot, "run-revive", "running", { sessionId: "session-a", pid: 999_999 });
+			writeRecoveryDescriptor(asyncRoot, "run-revive", "second", failedSessionFile, root);
 			manager.arm({ targetKind: "async", runId: "run-revive", requestedId: "run-revive", timeoutMs: 30_000 });
 
 			writeStatus(asyncRoot, "run-revive", "failed", {
@@ -260,7 +282,7 @@ describe("non-blocking wait subscriptions", () => {
 
 			const message = sent[0] ?? "";
 			assert.match(message, /Reply to the supervisor request first/);
-			assert.match(message, /wait with subagent_wait/);
+			assert.match(message, /wait with bg_wait/);
 			assert.match(message, /do not resume or launch a replacement/);
 			assert.doesNotMatch(message, /Resume-first/);
 		} finally {
@@ -370,7 +392,7 @@ describe("non-blocking wait subscriptions", () => {
 		}
 	});
 
-	it("wakes when async reconciliation throws", () => {
+	it("wakes when an exact async run cannot be reconciled", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-subscribe-reconcile-error-"));
 		const asyncRoot = path.join(root, "not-a-directory");
 		const subscriptionsDir = path.join(root, "subscriptions");
@@ -385,7 +407,7 @@ describe("non-blocking wait subscriptions", () => {
 		try {
 			const registration = manager.arm({ targetKind: "async", runId: "run-error", requestedId: "run-error", timeoutMs: 30_000 });
 			manager.reconcile();
-			assert.match(sent[0] ?? "", /reconciliation failed/);
+			assert.match(sent[0] ?? "", /could not be reconciled/);
 			assert.equal(state.waitSubscriptions?.has(registration.token), false);
 			assert.equal(fs.existsSync(path.join(subscriptionsDir, `${registration.token}.json`)), false);
 		} finally {

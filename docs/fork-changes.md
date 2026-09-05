@@ -2,11 +2,11 @@
 
 > **仓库：** `sidkang/subagents`
 >
-> **Fork version:** `0.50.0+sid.2`
+> **Fork version:** `0.65.1+sid.1`
 >
-> **Upstream version:** `0.50.0`
+> **Upstream version:** `0.65.1`
 >
-> **Upstream base:** `a14687b38761ba8e2d0fb41563401d0db12ec465`
+> **Upstream base:** `83be9c3de2cde1553c0269f383efc1eb1194dc8b`
 >
 > **验证：** [`fork-validation.md`](./fork-validation.md)
 
@@ -37,7 +37,7 @@
 | `worktree: true`，effective cwd 不是 JJ repo | 保持当前 Git worktree 实现 |
 | `worktree: true`，effective cwd 是 JJ repo | 每个 stock worktree/task slot 创建一个独立 JJ workspace |
 
-JJ 是 backend 内部选择。模型和 workflow 作者继续用原有 `worktree` 参数。
+JJ 是 backend 内部选择。模型和 workflow 作者继续用原有 `worktree` 参数。上游默认 `baseRef: HEAD` 在 JJ 中表示当前 workspace 的 `@`；公开 baseRef 继续服从上游名称校验，只接受其支持的 ref 名称；JJ 分支按同名 bookmark 解析，不新增任意 revset 或 SHA 的公开入口。分配后通过上游 `beforeCreate` 回调记录全部 owned identity，再运行 setup hooks 并返回给执行器。上游 cleanup blocker 同样阻止 JJ 清理。
 
 ### 2.2 Child 拓扑
 
@@ -96,13 +96,13 @@ Guest：固定 /workflow-shared（rw）
 2. **Launch Binding** — `{ hostRoot }` 是受信任关联；env 与 detached launchConfig 只是 transport。
 3. **Mount Adapter** — 仅在 proven binding 时注入 package-private 扩展，做一次 Session Mount Override。
 
-Host root 不进模型 prompt 或 workflowScript 参数。Child 只投影：
+Host root 不进模型 prompt 或 workflowScript 参数。原生前台 Child 通过捕获 binding 的内联扩展工厂注册 mount，不修改 Parent 的环境变量。后台 runner 是独立进程，额外向其 Child 环境投影：
 
 ```text
 SUBAGENTS_WORKFLOW_SCRATCH_ROOT=<proven host root>
 ```
 
-Host 用 `AsyncLocalStorage`，不改全局 `process.env`。`buildPiArgs` 先中和该 env，再只从 active ALS 或已校验的 runner-local binding 覆盖。detached Child 的 closed binding 写入 launchConfig；runner 清 ambient env 后只安装通过校验的 `{ hostRoot }`。无效或缺失 binding fail closed。
+Host 用 `AsyncLocalStorage`，不改 Parent 的全局 `process.env`。`buildInProcessChildLaunch` 从 active ALS 或已校验的 runner-local binding 创建独立的 mount 工厂；工厂不读取 ambient env。detached Child 的 closed binding 写入 launchConfig；runner 清 ambient env 后只安装通过校验的 `{ hostRoot }`。runner-only `processEnv` 投影已验证 root，无 binding 时删除旧值。无效或缺失 binding fail closed。
 
 Mount Adapter 只注册：
 
@@ -115,7 +115,7 @@ Guest path 不用 `/tmp/...`（Guest `/tmp` 可能是 tmpfs）。Host 临时根�
 ### 3.3 生命周期
 
 - workflow body 结束后，等已追踪 launch settle，再删该精确 scratch root。
-- `async: true` 在 execute 前禁用 eager cleanup。
+- `async: true` 在 execute 前禁用 eager cleanup；实际 `spawnRunner` 边界再次禁用，覆盖隐式 async 默认值和 resume。发出 stop 请求不等于 runner 已终止。
 - 无法确认、Parent crash 或 hard kill 时保留目录，交给 OS 临时目录治理。
 - 验证与 rm 之间的外部并发文件系统变化同样是 fail-closed / best-effort，不是原子安全保证。
 - 不发明 durable ledger、token file、GC 或兼容 shim。
@@ -125,9 +125,10 @@ Guest path 不用 `/tmp/...`（Guest `/tmp` 可能是 tmpfs）。Host 临时根�
 
 | 责任 | 文件 |
 |---|---|
-| Scope 与 `runWorkflowScript` 包裹 | `src/runs/foreground/subagent-executor.ts` |
-| argv / env / Mount Adapter 注入 | `src/runs/shared/pi-args.ts` |
-| 真正 Child launch 调 `buildPiArgs` | `src/runs/foreground/execution.ts` |
+| 上游 interpreter 的 scope 与 launch tracking 包裹 | `src/runs/shared/workflow-scratch.ts` 的 `runWorkflowScriptWithScratch` |
+| 两条 workflow 执行路径 | `src/runs/foreground/subagent-executor.ts` |
+| 原生 Child hook 与 runner env 投影 | `src/runs/shared/child-launch.ts` |
+| 真正 Child session 创建 | `src/runs/shared/child-session.ts` |
 | detached binding 写入与 env scrub | `src/runs/background/async-execution.ts` |
 | runner-local binding install | `src/runs/background/subagent-runner.ts` |
 | Host Scope / Launch Binding | `src/runs/shared/workflow-scratch.ts` |
@@ -144,11 +145,11 @@ M2 只包裹现有 `launch`。上游已删除 `patchMissionObjective`；不得�
 
 ### 4.2 stale async terminal guard
 
-`src/runs/background/async-execution.ts` 里两条 detached runner close path：
+复用上游 `src/runs/background/async-execution.ts` 的 `emitProcessTerminalEvent`，不再保留第二个 fork helper：
 
 - 只吞 Pi 的 stale-extension-context error；其他 emit error 继续抛。
 - 不把旧 session 事件转给 replacement context；磁盘 proof 是权威记录。
-- 上游若提供语义等价防护，删除本 helper、调用点注释和 `test/unit/async-execution.test.ts` 对应用例，不要叠第二层。
+- 0.65.1 上游使用宽匹配并只记录其他错误；fork 保留 Pi 明确错误前缀匹配及其他错误传播。上游语义等价时删除此差异，不叠第二层。
 
 ## 5. 非目标
 

@@ -8,13 +8,13 @@ import {
 	claimRunFanoutBatch,
 	claimRunFanoutBatchWithCommit,
 	createRunFanoutBudget,
-	decodeRunFanoutBudgetDescriptor,
-	encodeRunFanoutBudgetDescriptor,
 	getRunFanoutBudgetSnapshot,
 	RunFanoutLimitError,
 	validateRunFanoutBudgetDescriptor,
 } from "../../src/runs/shared/run-fanout-budget.ts";
-import { resolveMaxSubagentSpawnsPerRun } from "../../src/shared/types.ts";
+import { resolveMaxSubagentSpawnsPerRun, type AsyncStatus } from "../../src/shared/types.ts";
+import { listAsyncRuns, summarizeAsyncStatus } from "../../src/runs/background/async-status.ts";
+import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 
 const directories: string[] = [];
 const externalDirectories: string[] = [];
@@ -47,11 +47,78 @@ describe("run fan-out budget", () => {
 		}
 	});
 
+	it("degrades status projection when persisted budget state is removed", () => {
+		const descriptor = budget(2);
+		fs.rmSync(path.join(descriptor.directory, "claims"), { recursive: true, force: true });
+		const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-fanout-status-"));
+		directories.push(asyncDir);
+		fs.writeFileSync(path.join(asyncDir, "run-fanout-budget.json"), JSON.stringify(descriptor), "utf-8");
+		const fallback = { used: 1, limit: 2, remaining: 1 };
+		const status = {
+			runId: "run-1",
+			mode: "single",
+			state: "running",
+			startedAt: 100,
+			lastUpdate: 200,
+			steps: [{ agent: "worker", status: "running", startedAt: 100 }],
+			runFanoutBudget: fallback,
+		} as AsyncStatus;
+		const summary = summarizeAsyncStatus(asyncDir, status);
+		assert.deepEqual(summary.runFanoutBudget, fallback);
+		assert.ok(summary.nestedWarnings?.some((warning) => warning.includes("Run fan-out status unavailable")));
+	});
+
+	it("keeps nested status projection when persisted budget state is removed", () => {
+		const runId = "run-fanout-nested-status";
+		const asyncRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-fanout-nested-root-"));
+		directories.push(asyncRoot);
+		const asyncDir = path.join(asyncRoot, runId);
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const route = createNestedRoute(runId);
+		directories.push(path.dirname(route.eventSink));
+		const descriptor = budget(2);
+		fs.rmSync(path.join(descriptor.directory, "claims"), { recursive: true, force: true });
+		fs.writeFileSync(path.join(asyncDir, "run-fanout-budget.json"), JSON.stringify(descriptor), "utf-8");
+		const fallback = { used: 1, limit: 2, remaining: 1 };
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+			runId,
+			mode: "single",
+			state: "running",
+			startedAt: 100,
+			lastUpdate: 200,
+			steps: [{ agent: "worker", status: "running" }],
+			runFanoutBudget: fallback,
+		}), "utf-8");
+		writeNestedEvent(route, {
+			type: "subagent.nested.started",
+			ts: 300,
+			parentRunId: runId,
+			parentStepIndex: 0,
+			child: {
+				id: "nested-child",
+				parentRunId: runId,
+				parentStepIndex: 0,
+				depth: 1,
+				path: [{ runId, stepIndex: 0 }],
+				mode: "single",
+				state: "running",
+				agent: "nested-worker",
+				startedAt: 100,
+				lastUpdate: 300,
+			},
+		});
+
+		const summary = listAsyncRuns(asyncRoot, { states: ["running"], repairScan: true })[0];
+		assert.deepEqual(summary?.runFanoutBudget, fallback);
+		assert.equal(summary?.nestedChildren?.[0]?.id, "nested-child");
+		assert.equal(summary?.steps[0]?.children?.[0]?.id, "nested-child");
+		assert.ok(summary?.nestedWarnings?.some((warning) => warning.includes("Run fan-out status unavailable")));
+	});
+
 	it("persists claims and rejects the responsible next path at the exact cap", () => {
 		const descriptor = budget(2);
 		assert.deepEqual(claimRunFanoutBatch(descriptor, ["tasks[0]", "tasks[1]"]), { used: 2, limit: 2, remaining: 0 });
-		const restored = decodeRunFanoutBudgetDescriptor(encodeRunFanoutBudgetDescriptor(descriptor));
-		assert.deepEqual(getRunFanoutBudgetSnapshot(restored!), { used: 2, limit: 2, remaining: 0 });
+		assert.deepEqual(getRunFanoutBudgetSnapshot(descriptor), { used: 2, limit: 2, remaining: 0 });
 		assert.throws(() => claimRunFanoutBatch(descriptor, ["tasks[2]"]), (error: unknown) => {
 			assert.ok(error instanceof RunFanoutLimitError);
 			assert.equal(error.rejection.path, "tasks[2]");

@@ -8,6 +8,20 @@ const theme = {
 	bold(text: string): string { return text; },
 };
 
+function withMockedDateNow<T>(now: number, fn: () => T): T {
+	const original = Date.now;
+	Date.now = () => now;
+	try {
+		return fn();
+	} finally {
+		Date.now = original;
+	}
+}
+
+function withoutRunningGlyphs(lines: string[]): string[] {
+	return lines.map((line) => line.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "•"));
+}
+
 function nested(id: string, parentRunId: string, state: NestedRunSummary["state"] = "running", extra: Partial<NestedRunSummary> = {}): NestedRunSummary {
 	return {
 		id,
@@ -39,13 +53,13 @@ function job(child: NestedRunSummary): AsyncJobState {
 
 describe("nested widget rendering", () => {
 	it("renders a bounded collapsed tree and full child rows when expanded", () => {
-		const child = nested("nested-reviewer", "root-run", "running", { currentTool: "read", model: "gpt-5.6-luna:medium", thinking: "medium" });
+		const child = nested("nested-reviewer", "root-run", "running", { sessionName: "  nested-reviewer: Review nested run  ", currentTool: "read", model: "gpt-5.6-luna:medium", thinking: "medium" });
 		const collapsed = buildWidgetLines([job(child)], theme as any, 120, false).join("\n");
-		assert.match(collapsed, /↳ └─ \[\d{2}:\d{2}:\d{2}\] . nested-reviewer · running · gpt-5.6-luna · thinking medium · read/);
+		assert.match(collapsed, /↳ └─ \[\d{2}:\d{2}:\d{2}\] . nested-reviewer: Review nested run · running · gpt-5.6-luna · thinking medium · read/);
 		assert.equal((collapsed.match(/thinking medium/g) ?? []).length, 1);
 
 		const expanded = buildWidgetLines([job(child)], theme as any, 120, true).join("\n");
-		assert.match(expanded, /↳ \[\d{2}:\d{2}:\d{2}\] . nested-reviewer · running · gpt-5.6-luna · thinking medium · read/);
+		assert.match(expanded, /↳ \[\d{2}:\d{2}:\d{2}\] . nested-reviewer: Review nested run · running · gpt-5.6-luna · thinking medium · read/);
 
 		const epoch = buildWidgetLines([job(nested("epoch", "root-run", "running", { lastUpdate: 0, startedAt: 0 }))], theme as any, 120, false).join("\n");
 		assert.match(epoch, /↳ └─ \[\d{2}:\d{2}:\d{2}\] . epoch · running/);
@@ -109,7 +123,8 @@ describe("nested widget rendering", () => {
 		state.status = "complete";
 		state.steps![0]!.status = "complete";
 		const expanded = buildWidgetLines([state], theme as any, 120, true).join("\n");
-		assert.match(expanded, /✓ Step 1\/1: owner · complete/);
+		assert.match(expanded, /✓ owner · complete/);
+		assert.doesNotMatch(expanded, /Step 1\/1: owner/);
 		assert.match(expanded, /↳ \[\d{2}:\d{2}:\d{2}\] . still-running · running/);
 	});
 
@@ -122,7 +137,7 @@ describe("nested widget rendering", () => {
 	it("timestamps every nested lifecycle state and completed steps", () => {
 		const states: NestedRunSummary["state"][] = ["queued", "running", "complete", "failed", "paused", "stopped"];
 		const root = nested("matrix-root", "root-run", "running", {
-			steps: [{ agent: "completed-step", status: "completed", endedAt: 2_000 }],
+			steps: [{ agent: "completed-step", sessionName: "  completed-step: Finalize report  ", status: "completed", endedAt: 2_000 }],
 			children: states.map((state, index) => nested(`child-${state}`, "matrix-root", state, {
 				parentStepIndex: undefined,
 				startedAt: 1_000 + index,
@@ -133,20 +148,24 @@ describe("nested widget rendering", () => {
 		for (const state of states) {
 			assert.match(expanded, new RegExp(`\\[\\d{2}:\\d{2}:\\d{2}\\] . child-${state} · ${state}`));
 		}
-		assert.match(expanded, /\[\d{2}:\d{2}:\d{2}\] . completed-step · completed/);
+		assert.match(expanded, /\[\d{2}:\d{2}:\d{2}\] . completed-step: Finalize report · completed/);
 	});
 
-	it("keeps event-time timestamps stable instead of advancing with wall time", async () => {
+	it("keeps event-time timestamps stable while nested running glyphs use the supplied frame", () => {
 		const state = job(nested("nested-reviewer", "root-run", "running", { currentTool: "read", currentToolStartedAt: 0 }));
-		const first = buildWidgetLines([state], theme as any, 120, true);
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		const second = buildWidgetLines([state], theme as any, 120, true);
-		assert.deepEqual(second, first);
+		const first = withMockedDateNow(0, () => buildWidgetLines([state], theme as any, 120, true, 0));
+		const unrelatedRender = withMockedDateNow(125, () => buildWidgetLines([state], theme as any, 120, true, 0));
+		const nextFrame = withMockedDateNow(1_000, () => buildWidgetLines([state], theme as any, 120, true, 1));
+		assert.deepEqual(unrelatedRender, first);
+		assert.notDeepEqual(nextFrame, first);
+		assert.deepEqual(withoutRunningGlyphs(nextFrame), withoutRunningGlyphs(first));
 	});
 
 	it("rerenders when only nested state changes", () => {
 		const first = job(nested("nested-reviewer", "root-run", "running"));
 		const second = job(nested("nested-reviewer", "root-run", "complete"));
+		const renamed = job(nested("nested-reviewer", "root-run", "running", { sessionName: "nested-reviewer: Review nested run" }));
 		assert.notEqual(widgetRenderKey(first), widgetRenderKey(second));
+		assert.notEqual(widgetRenderKey(first), widgetRenderKey(renamed));
 	});
 });

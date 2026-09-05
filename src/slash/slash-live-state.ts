@@ -2,6 +2,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { previewSimpleWorkflowRun } from "../workflows/scripted-workflow.ts";
+import { deriveChildSessionName } from "../shared/child-session-name.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import { type Details, type SingleResult, type Usage, SLASH_RESULT_TYPE } from "../shared/types.ts";
 
@@ -54,9 +55,11 @@ function createPlaceholderResult(
 	status: "pending" | "running",
 	index: number,
 ): SingleResult {
+	const sessionName = deriveChildSessionName({ agent, task });
 	return {
 		agent,
 		task,
+		...(sessionName ? { sessionName } : {}),
 		index,
 		exitCode: 0,
 		messages: EMPTY_MESSAGES,
@@ -64,6 +67,7 @@ function createPlaceholderResult(
 		progress: {
 			index,
 			agent,
+			...(sessionName ? { sessionName } : {}),
 			status,
 			task,
 			recentTools: [],
@@ -82,19 +86,23 @@ function buildParallelInitialResult(params: SubagentParamsLike): AgentToolResult
 		details: {
 			mode: "parallel",
 			...(params.async ? { background: true } : {}),
-			...(params.context ? { context: params.context } : {}),
+			...(params.context === "fresh" || params.context === "fork" ? { context: params.context } : {}),
 			results: tasks.map((task, index) => createPlaceholderResult(task.agent, task.task, "running", index)),
-			progress: tasks.map((task, index) => ({
-				index,
-				agent: task.agent,
-				status: "running" as const,
-				task: task.task,
-				recentTools: [],
-				recentOutput: [],
-				toolCount: 0,
-				tokens: 0,
-				durationMs: 0,
-			})),
+			progress: tasks.map((task, index) => {
+				const sessionName = deriveChildSessionName({ agent: task.agent, task: task.task });
+				return {
+					index,
+					agent: task.agent,
+					...(sessionName ? { sessionName } : {}),
+					status: "running" as const,
+					task: task.task,
+					recentTools: [],
+					recentOutput: [],
+					toolCount: 0,
+					tokens: 0,
+					durationMs: 0,
+				};
+			}),
 		},
 	};
 }
@@ -138,11 +146,12 @@ function buildChainInitialResult(params: SubagentParamsLike): AgentToolResult<De
 		details: {
 			mode: "chain",
 			...(params.async ? { background: true } : {}),
-			...(params.context ? { context: params.context } : {}),
+			...(params.context === "fresh" || params.context === "fork" ? { context: params.context } : {}),
 			results,
 			progress: results.map((result, index) => ({
 				index,
 				agent: result.agent,
+				...(result.sessionName ? { sessionName: result.sessionName } : {}),
 				status: index === 0 ? "running" as const : "pending" as const,
 				task: result.task,
 				recentTools: [],
@@ -162,16 +171,18 @@ function buildSingleInitialResult(params: SubagentParamsLike): AgentToolResult<D
 	const preview = previewSimpleWorkflowRun(params.workflowScript) ?? {};
 	const agent = params.agent ?? preview.agent ?? "subagent";
 	const task = params.task ?? preview.task ?? "";
+	const sessionName = deriveChildSessionName({ agent, task });
 	return {
 		content: [{ type: "text", text: task }],
 		details: {
 			mode: "single",
 			...(params.async ? { background: true } : {}),
-			...(params.context ? { context: params.context } : {}),
+			...(params.context === "fresh" || params.context === "fork" ? { context: params.context } : {}),
 			results: [createPlaceholderResult(agent, task, "running", 0)],
 			progress: [{
 				index: 0,
 				agent,
+				...(sessionName ? { sessionName } : {}),
 				status: "running",
 				task,
 				recentTools: [],

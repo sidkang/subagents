@@ -14,10 +14,12 @@ interface BeginForegroundChildInput {
 	thinking?: string;
 	interrupt: () => boolean;
 	detach?: () => boolean;
+	steer?: ForegroundChildControl["steer"];
 }
 
 function copyProgress(target: ForegroundChildControl, progress: AgentProgress | undefined): void {
 	if (!progress) return;
+	target.sessionName = progress.sessionName;
 	target.currentActivityState = progress.activityState;
 	target.lastActivityAt = progress.lastActivityAt;
 	target.currentTool = progress.currentTool;
@@ -27,6 +29,8 @@ function copyProgress(target: ForegroundChildControl, progress: AgentProgress | 
 	target.tokens = progress.tokens;
 	target.inputTokens = progress.inputTokens;
 	target.outputTokens = progress.outputTokens;
+	target.window = progress.window;
+	target.windowPeak = progress.windowPeak;
 	target.model = progress.model;
 	target.thinking = progress.thinking;
 	target.toolCount = progress.toolCount;
@@ -34,6 +38,7 @@ function copyProgress(target: ForegroundChildControl, progress: AgentProgress | 
 
 function syncCurrentChild(control: ForegroundRunControl, child: ForegroundChildControl): void {
 	control.currentAgent = child.agent;
+	control.sessionName = child.sessionName;
 	control.currentIndex = child.index;
 	control.description = child.description;
 	control.currentActivityState = child.currentActivityState;
@@ -45,16 +50,20 @@ function syncCurrentChild(control: ForegroundRunControl, child: ForegroundChildC
 	control.tokens = child.tokens;
 	control.inputTokens = child.inputTokens;
 	control.outputTokens = child.outputTokens;
+	control.window = child.window;
+	control.windowPeak = child.windowPeak;
 	control.model = child.model;
 	control.thinking = child.thinking;
 	control.toolCount = child.toolCount;
 	control.interrupt = child.interrupt;
 	control.detach = child.detach;
+	control.steer = child.steer;
 	control.updatedAt = child.updatedAt;
 }
 
 function clearCurrentChild(control: ForegroundRunControl): void {
 	control.currentAgent = undefined;
+	control.sessionName = undefined;
 	control.currentIndex = undefined;
 	control.currentActivityState = undefined;
 	control.lastActivityAt = undefined;
@@ -65,11 +74,14 @@ function clearCurrentChild(control: ForegroundRunControl): void {
 	control.tokens = undefined;
 	control.inputTokens = undefined;
 	control.outputTokens = undefined;
+	control.window = undefined;
+	control.windowPeak = undefined;
 	control.model = undefined;
 	control.thinking = undefined;
 	control.toolCount = undefined;
 	control.interrupt = undefined;
 	control.detach = undefined;
+	control.steer = undefined;
 }
 
 export function retainForegroundSchedulingOwner(control: ForegroundRunControl): void {
@@ -113,6 +125,7 @@ export function beginForegroundChild(control: ForegroundRunControl, input: Begin
 			return true;
 		};
 	}
+	if (input.steer) child.steer = input.steer;
 	control.activeChildren ??= new Map();
 	control.activeChildren.set(input.index, child);
 	registerLivePromptAudit(control, input.index, input.authoredTask, input.effectivePrompt, {

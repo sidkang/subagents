@@ -2,12 +2,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ForegroundResumeChild, ForegroundResumeRun, SubagentState } from "../../shared/types.ts";
 import { DIRS } from "../../shared/types.ts";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { utf8Tail } from "../../shared/utf8.ts";
+import { validateAcceptanceInput } from "../shared/acceptance.ts";
+import { validateModelResponseAliases } from "../../shared/model-response-aliases.ts";
 
 export const MAX_REMEMBERED_FOREGROUND_RUNS = 50;
 const HISTORY_VERSION = 1;
 const MAX_INLINE_OUTPUT_BYTES = 64 * 1024;
+const MAX_RESUME_CONTRACT_BYTES = 64 * 1024;
 
 interface ForegroundHistoryIndex {
 	version: 1;
@@ -27,6 +30,7 @@ function compactChild(child: ForegroundResumeChild): ForegroundResumeChild {
 	return {
 		agent: child.agent,
 		index: child.index,
+		...(child.sessionName ? { sessionName: child.sessionName } : {}),
 		...(child.context ? { context: child.context } : {}),
 		...(child.sessionFile ? { sessionFile: child.sessionFile } : {}),
 		...(child.model ? { model: child.model } : {}),
@@ -51,7 +55,9 @@ function compactChild(child: ForegroundResumeChild): ForegroundResumeChild {
 		...(child.transcriptPath ? { transcriptPath: child.transcriptPath } : {}),
 		...(child.transcriptError ? { transcriptError: child.transcriptError } : {}),
 		...(child.acceptance ? { acceptance: child.acceptance } : {}),
+		...(child.resumeContract ? { resumeContract: child.resumeContract } : {}),
 		...(child.launchContractDigest ? { launchContractDigest: child.launchContractDigest } : {}),
+		...(child.extensionBindings ? { extensionBindings: child.extensionBindings } : {}),
 		...(child.capabilityCeiling ? { capabilityCeiling: child.capabilityCeiling } : {}),
 		...(child.updatedAt !== undefined ? { updatedAt: child.updatedAt } : {}),
 	};
@@ -61,9 +67,27 @@ function isRestorableForegroundStatus(status: unknown): status is ForegroundResu
 	return status === "completed" || status === "failed" || status === "paused" || status === "stopped";
 }
 
+function isRestorableResumeContract(value: unknown): boolean {
+	if (value === undefined) return true;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	try {
+		if (Buffer.byteLength(JSON.stringify(value), "utf8") > MAX_RESUME_CONTRACT_BYTES) return false;
+		validateModelResponseAliases((value as ForegroundResumeChild["resumeContract"])?.modelResponseAliases);
+	} catch {
+		return false;
+	}
+	const contract = value as NonNullable<ForegroundResumeChild["resumeContract"]>;
+	if (Object.keys(contract).some((key) => !["modelResponseAliases", "outputSchema", "agentContract", "acceptance", "output", "outputMode"].includes(key))) return false;
+	if (contract.outputSchema !== undefined && (!contract.outputSchema || typeof contract.outputSchema !== "object" || Array.isArray(contract.outputSchema))) return false;
+	if (contract.agentContract !== undefined && (!contract.agentContract || typeof contract.agentContract !== "object" || Array.isArray(contract.agentContract) || contract.agentContract.version !== 1)) return false;
+	if (validateAcceptanceInput(contract.acceptance).length > 0) return false;
+	if (contract.output !== undefined && typeof contract.output !== "string" && typeof contract.output !== "boolean") return false;
+	return contract.outputMode === undefined || contract.outputMode === "inline" || contract.outputMode === "file-only";
+}
+
 function compactRun(run: ForegroundResumeRun): ForegroundResumeRun | undefined {
 	if (!run.sessionId) return undefined;
-	if (run.children.length === 0 || !run.children.every((child) => isRestorableForegroundStatus(child.status))) return undefined;
+	if (run.children.length === 0 || !run.children.every((child) => isRestorableForegroundStatus(child.status) && isRestorableResumeContract(child.resumeContract))) return undefined;
 	return {
 		runId: run.runId,
 		mode: run.mode,
@@ -101,6 +125,7 @@ function isRestorableRun(value: unknown): value is ForegroundResumeRun {
 		&& run.children.every((child) => Boolean(child && typeof child === "object" && !Array.isArray(child)
 			&& typeof (child as Partial<ForegroundResumeChild>).agent === "string"
 			&& typeof (child as Partial<ForegroundResumeChild>).index === "number"
+			&& isRestorableResumeContract((child as Partial<ForegroundResumeChild>).resumeContract)
 			&& isRestorableForegroundStatus((child as Partial<ForegroundResumeChild>).status)));
 }
 
@@ -118,7 +143,7 @@ export function persistForegroundRunHistory(state: SubagentState, options: { res
 		if (compact) merged.set(compact.runId, compact);
 	}
 	const runs = sortAndBound([...merged.values()], limit);
-	writeAtomicJson(historyPath(resultsDir), { version: HISTORY_VERSION, runs });
+	writePrivateAtomicJson(historyPath(resultsDir), { version: HISTORY_VERSION, runs });
 }
 
 export function restoreForegroundRunHistory(state: SubagentState, options: { resultsDir?: string; sessionId?: string | null; limit?: number } = {}): number {

@@ -32,7 +32,7 @@ Subagents + JJ + Sandbox 研究中提炼，但不复制已经失效的 delivery 
 - 同一 workflow 的 leaf Child 共享同一 scratch root；不同 workflow 彼此隔离；
 - Sandbox Guest 固定通过 `/workflow-shared` 访问它，同时保留自己的 `/workspace`；
 - Host path authority 来自 active workflow scope 或已验证的 detached launch binding，不能来自
-  ambient `process.env`；
+  ambient `process.env`；前台 Child 通过独立内联 mount 工厂传递，不修改 Parent 环境；后台 runner 才投影环境变量；
 - workflow body 结束后必须等待 tracked launches settle，再清理该精确 root；
 - async/detached Child 仍可能使用 scratch 时不得 eager cleanup；
 - scratch 不自动合并 patch，不进入 JJ capture，也不承担 durable artifact、WAL 或 recovery ledger。
@@ -57,10 +57,7 @@ npm ci
 
 ```bash
 npm run typecheck
-node --experimental-strip-types --test test/unit/jj-worktree-backend.test.ts
-node --experimental-strip-types --test test/unit/workflow-scratch.test.ts
-node --experimental-strip-types --test test/unit/async-execution.test.ts
-node --experimental-strip-types --test test/unit/delegation-api.test.ts
+node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/jj-worktree-backend.test.ts test/unit/jj-worktree-launch-options.test.ts test/unit/workflow-scratch.test.ts test/unit/async-execution.test.ts test/unit/delegation-api.test.ts
 ```
 
 再运行完整 package suites：
@@ -68,7 +65,6 @@ node --experimental-strip-types --test test/unit/delegation-api.test.ts
 ```bash
 npm run test:unit
 npm run test:integration
-npm run test:e2e
 ```
 
 等价的总入口是：
@@ -77,19 +73,26 @@ npm run test:e2e
 npm run test:all
 ```
 
-JJ 聚焦测试要求 `jj` 在 `PATH` 中。真实 Sandbox + JJ 场景还要求对应的 Sandbox/Pi
-运行环境；缺少该环境时，不能把 unit-only 结果表述为完整 Host/Guest E2E。
+JJ 聚焦测试要求 `jj` 在 `PATH` 中。上游 0.65 已删除旧 CLI E2E；原生 Pi smoke 使用真实安装模块，不调用模型，也不使用测试 shim：
+
+```bash
+PI_SUBAGENTS_SMOKE_PI_MODULE=/absolute/path/to/pi-coding-agent/dist/index.js npm run test:smoke:fork
+```
+
+此 smoke 验证真实 AgentSession 的启动/输入/退出、JJ A/B → C、独立 patch、mount query、环境隔离和清理。它验证 Sandbox 协议，不启动 Guest。真实 Sandbox + JJ 场景仍要求对应环境；不能把此 smoke 或 unit 结果表述为完整 Host/Guest E2E。
 
 ## 3. 测试责任地图
 
 | 合同 | 主要入口 |
 | --- | --- |
 | JJ backend 选择、D topology、capture、身份验证与保守 cleanup | `test/unit/jj-worktree-backend.test.ts` |
+| baseRef、owned identity journal、上游 cleanup blocker | `test/unit/jj-worktree-launch-options.test.ts` |
 | Workflow Scratch scope、binding、Mount Adapter 与 cleanup | `test/unit/workflow-scratch.test.ts` |
 | stale async terminal context 只吞明确错误 | `test/unit/async-execution.test.ts` |
 | delegation `sessionFile` 投影 | `test/unit/delegation-api.test.ts` |
-| foreground/background 生命周期、状态与真实执行接线 | `test/integration/single-execution.test.ts`, `test/integration/async-execution.test.ts` |
-| 实际 Pi child session 行为 | `test/e2e/real-session-subagent.test.ts` |
+| foreground/background 生命周期、状态与真实执行接线 | `test/integration/single-execution.part-*.test.ts`, `test/integration/async-execution.part-*.test.ts` |
+| 公共 workflow 的 JJ bookmark/default HEAD、隐式 async abort 后保留 scratch | `test/integration/workflow-scratch.test.ts` |
+| 实际 Pi native child session 行为（无模型调用） | `test/smoke/native-fork.ts` |
 
 新增 fork-only 行为时，应扩展拥有该合同的最窄测试文件；不要把所有验证塞进一个不可定位的
 全栈脚本。

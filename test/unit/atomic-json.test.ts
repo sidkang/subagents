@@ -10,6 +10,7 @@ class FakeFs {
 	failMkdirCodes: string[] = [];
 	failRenameCodes: string[] = [];
 	writeOptions = new Map<string, unknown>();
+	failCleanup = false;
 
 	mkdirSync(dirPath: string): void {
 		this.madeDirs.push(dirPath);
@@ -41,6 +42,7 @@ class FakeFs {
 	}
 
 	rmSync(filePath: string): void {
+		if (this.failCleanup) throw new Error("cleanup failed");
 		this.files.delete(filePath);
 	}
 }
@@ -148,6 +150,30 @@ describe("writeAtomicJson", () => {
 		assert.equal(fakeFs.renameCalls, 1);
 		assert.deepEqual(waits, []);
 		assert.equal(fakeFs.files.size, 0);
+	});
+
+	it("does not let cleanup failures mask a write failure", () => {
+		const fakeFs = new FakeFs();
+		fakeFs.failRenameCodes = ["ENOSPC"];
+		fakeFs.failCleanup = true;
+		const writeAtomicJson = createWriter(fakeFs, []);
+		assert.throws(() => writeAtomicJson(path.join("/tmp", "status.json"), { state: "running" }), /ENOSPC/);
+	});
+
+	it("can ignore cleanup failures after the target is atomically published", () => {
+		const fakeFs = new FakeFs();
+		fakeFs.failCleanup = true;
+		const writeAtomicJson = createAtomicJsonWriter({
+			fs: fakeFs as any,
+			now: () => 12345,
+			pid: 678,
+			random: () => 0.5,
+			ignoreCleanupErrorAfterSuccess: true,
+		});
+		const targetPath = path.join("/tmp", "runner-startup-proceed.json");
+
+		assert.doesNotThrow(() => writeAtomicJson(targetPath, { action: "proceed", token: "runner" }));
+		assert.equal(fakeFs.files.get(targetPath), JSON.stringify({ action: "proceed", token: "runner" }, null, 2));
 	});
 
 	it("cleans up the temp file after retryable failures are exhausted", () => {

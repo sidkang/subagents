@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_AGENT_NAMES } from "../agents/agents.ts";
+import { getPiSpawnCommand } from "../runs/shared/pi-spawn.ts";
 import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
 import { getAgentDir } from "../shared/utils.ts";
 
@@ -334,13 +335,13 @@ function resolveProbeStatus(text: string, timedOut: boolean): ProbeStatus {
 
 async function probeModel(
 	pi: Pick<ExtensionAPI, "exec"> | { exec?: ExtensionAPI["exec"] },
-	ctx: Pick<ExtensionContext, "cwd">,
 	fullId: string,
 ): Promise<{ status: ProbeStatus; message?: string }> {
 	if (typeof pi.exec !== "function") {
 		return { status: "skipped", message: "pi.exec is unavailable in this runtime." };
 	}
-	const result = await pi.exec("pi", ["-p", "--model", fullId, "--no-tools", 'Reply with exactly "OK".'], {
+	const spawnSpec = getPiSpawnCommand(["-p", "--model", fullId, "--no-tools", 'Reply with exactly "OK".']);
+	const result = await pi.exec(spawnSpec.command, spawnSpec.args, {
 		cwd: os.tmpdir(),
 		timeout: 45_000,
 	} as Record<string, unknown>);
@@ -399,7 +400,7 @@ function filterDominatedModels(models: ProviderModelCatalogModel[]): ProviderMod
 	return models.filter((candidate, index) => !models.some((other, otherIndex) => otherIndex !== index && dominatesModel(other, candidate)));
 }
 
-function buildProfileFile(kind: ProfileKind, models: { cheap: string; medium: string; strong: string }): SubagentProfileFile {
+function buildProfileFile(models: { cheap: string; medium: string; strong: string }): SubagentProfileFile {
 	return {
 		subagents: {
 			agentOverrides: {
@@ -542,7 +543,7 @@ export async function refreshProviderModelCatalog(
 		const fullId = `${modelRecord.provider}/${modelRecord.id}`;
 		const probe = options.probe === false
 			? { status: "skipped" as const, message: "Live probing disabled." }
-			: await probeModel(pi, ctx, fullId);
+			: await probeModel(pi, fullId);
 		observedModels.push({ rawModel, modelRecord, fullId, probe });
 	}
 	const classificationContext = buildClassificationContext(observedModels.map(({ modelRecord }) => ({
@@ -622,8 +623,8 @@ export async function generateProfilesForProvider(
 	const dir = ensureSubagentProfilesDir();
 	const quotaPath = path.join(dir, `${normalizedProvider}.quota.json`);
 	const qualityPath = path.join(dir, `${normalizedProvider}.quality.json`);
-	writeJsonFile(quotaPath, buildProfileFile("quota", quotaModels));
-	writeJsonFile(qualityPath, buildProfileFile("quality", qualityModels));
+	writeJsonFile(quotaPath, buildProfileFile(quotaModels));
+	writeJsonFile(qualityPath, buildProfileFile(qualityModels));
 	const selectedModels = new Set([...Object.values(quotaModels), ...Object.values(qualityModels)]);
 	const selectedHeuristicFallbackCount = profileModels.filter((model) => selectedModels.has(model.fullId) && modelUsesHeuristicClassification(model)).length;
 	return { quotaPath, qualityPath, catalogPath, quotaModels, qualityModels, heuristicFallbackCount, selectedHeuristicFallbackCount };
@@ -647,7 +648,7 @@ export async function checkSubagentProfile(
 		const probeModelId = modelInfo ? `${modelInfo.fullId}${thinkingSuffix}` : entry.model;
 		let probe = probeCache.get(probeModelId);
 		if (!probe) {
-			probe = await probeModel(pi, ctx, probeModelId);
+			probe = await probeModel(pi, probeModelId);
 			probeCache.set(probeModelId, probe);
 		}
 		results.push({

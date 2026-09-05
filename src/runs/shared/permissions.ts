@@ -5,14 +5,16 @@ export type PermissionDecision = "allow" | "ask" | "deny";
 export type PermissionRules = Record<string, PermissionDecision>;
 export interface PermissionConfig { rules?: PermissionRules }
 
-export const PERMISSION_POLICY_ENV = "PI_SUBAGENT_PERMISSION_POLICY";
-export const PERMISSION_AUDIT_PATH_ENV = "PI_SUBAGENT_PERMISSION_AUDIT_PATH";
-const INTERNAL_TOOLS = new Set(["contact_supervisor", "intercom", "subagent_wait", "structured_output"]);
+const INTERNAL_TOOLS = new Set(["contact_supervisor", "intercom", "bg_wait", "structured_output"]);
 const DECISIONS = new Set<PermissionDecision>(["allow", "ask", "deny"]);
 const MAX_POLICY_BYTES = 16 * 1024;
 const MAX_PREVIEW_BYTES = 2048;
 const SECRET_KEY = /(?:authorization|cookie|credential|password|secret|token|api[-_]?key)/i;
 const SECRET_VALUE = /\b(?:Bearer\s+\S+|(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,})\b/gi;
+
+export function redactSecretValues(value: string): string {
+	return value.replace(SECRET_VALUE, "[redacted]");
+}
 
 export function validatePermissionRules(value: unknown, label: string): PermissionRules | undefined {
 	if (value === undefined) return undefined;
@@ -48,17 +50,6 @@ export function permissionDecision(rules: PermissionRules | undefined, toolName:
 	return rules?.[toolName] ?? "allow";
 }
 
-export function encodePermissionRules(rules: PermissionRules | undefined): string | undefined {
-	if (!rules || Object.keys(rules).length === 0) return undefined;
-	const encoded = JSON.stringify(rules);
-	if (Buffer.byteLength(encoded, "utf-8") > MAX_POLICY_BYTES) throw new Error("Resolved permission policy is too large.");
-	return encoded;
-}
-
-export function decodePermissionRules(encoded: string | undefined): PermissionRules | undefined {
-	if (!encoded?.trim()) return undefined;
-	return validatePermissionRules(JSON.parse(encoded), PERMISSION_POLICY_ENV);
-}
 
 function redact(value: unknown, key = "", depth = 0): unknown {
 	if (SECRET_KEY.test(key)) return "[redacted]";
@@ -66,7 +57,7 @@ function redact(value: unknown, key = "", depth = 0): unknown {
 	if (Array.isArray(value)) return value.slice(0, 10).map((item) => redact(item, "", depth + 1));
 	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value as Record<string, unknown>).slice(0, 20).map(([entryKey, entryValue]) => [entryKey, redact(entryValue, entryKey, depth + 1)]));
 	if (typeof value === "string") {
-		const redacted = value.replace(SECRET_VALUE, "[redacted]");
+		const redacted = redactSecretValues(value);
 		return redacted.length > 500 ? `${redacted.slice(0, 500)}…` : redacted;
 	}
 	return value;

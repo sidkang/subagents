@@ -10,9 +10,11 @@ import { persistForegroundRunHistory, restoreForegroundRunHistory } from "../../
 import { FLEET_STATUS_WIDGET_KEY } from "../../src/tui/fleet-status.ts";
 import { registerLivePromptAudit, rewritePromptWithGuidance } from "../../src/runs/foreground/prompt-audit.ts";
 import { getArtifactPaths, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
+import type { HerdrClient } from "../../src/inspectors/herdr/client.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/providers/faux";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 
 function clearExternalRuns(): void {
 	delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_RUN_REGISTRY_KEY)];
@@ -55,11 +57,12 @@ function writeAsyncRun(root: string, input: {
 	if (input.output !== undefined) fs.writeFileSync(path.join(asyncDir, "output-0.log"), input.output, "utf-8");
 	const transcriptPath = input.transcript ? path.join(asyncDir, "transcript-0.jsonl") : undefined;
 	if (transcriptPath && input.transcript) fs.writeFileSync(transcriptPath, `${input.transcript.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf-8");
+	const state = input.state ?? "running";
 	fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
 		runId: input.id,
 		sessionId: input.sessionId ?? "session-current",
 		mode: input.mode ?? (agents.length > 1 ? "parallel" : "single"),
-		state: input.state ?? "running",
+		state,
 		startedAt: 100,
 		lastUpdate: input.lastUpdate ?? 200,
 		currentStep: 0,
@@ -74,6 +77,7 @@ function writeAsyncRun(root: string, input: {
 		})),
 		...(input.output !== undefined ? { outputFile: "output-0.log" } : {}),
 	}, null, 2));
+	updateActiveRunIndex(asyncDir, state);
 	return asyncDir;
 }
 
@@ -305,6 +309,37 @@ describe("native subagent fleet", () => {
 		}
 	});
 
+	it("does not crash Fleet render when live prompt audit stores a non-string authored task", () => {
+		const state = stateForTest();
+		const control = {
+			runId: "bad-prompt-run",
+			sessionId: "session-current",
+			mode: "single" as const,
+			startedAt: 10,
+			updatedAt: 20,
+			activeChildren: new Map([[0, { index: 0, agent: "worker", startedAt: 10, updatedAt: 20 }]]),
+		};
+		state.foregroundControls.set(control.runId, control);
+		registerLivePromptAudit(control, 0, { nested: "task payload" } as unknown as string, "effective prompt");
+		const component = new SubagentFleetComponent(
+			{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+			theme as never,
+			state,
+			() => {},
+			{ refreshMs: 60_000, markdownTheme },
+		);
+		try {
+			assert.doesNotThrow(() => component.render(100));
+			const rendered = component.render(100).join("\n");
+			assert.doesNotMatch(rendered, /nested|task payload/);
+			component.handleInput("p");
+			assert.doesNotThrow(() => component.render(100));
+			assert.match(component.render(100).join("\n"), /Selected prompt unavailable/);
+		} finally {
+			component.dispose();
+		}
+	});
+
 	it("shows live prompt summaries and opens Prompt Audit with the authored prompt visible", async () => {
 		const sentinel = "PROMPT_AUDIT_SENTINEL_1021";
 		const secondSentinel = "PROMPT_AUDIT_SECOND_CHILD";
@@ -482,29 +517,64 @@ describe("native subagent fleet", () => {
 	});
 
 	it("shows a scripted workflow as one fleet parent instead of unrelated children", () => {
-		const state = stateForTest();
-		state.fleetJobs = new Map([["workflow-1", {
-			asyncId: "workflow-1",
-			asyncDir: path.join(os.tmpdir(), "workflow-1"),
-			sessionId: "session-current",
-			status: "running",
-			mode: "workflow",
-			agents: ["scan", "review"],
-			steps: [
-				{ agent: "scan", workflowKey: "scan", status: "completed", index: 0 },
-				{ agent: "review", workflowKey: "review", status: "running", index: 1 },
-			],
-			workflow: { trace: [], emits: ["reviewing"], console: [] },
-			startedAt: 10,
-			updatedAt: 20,
-		}]]);
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-workflow-parent-"));
+		try {
+			const state = stateForTest();
+			const asyncDir = path.join(root, "workflow-1");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "workflow-1",
+				sessionId: "session-current",
+				mode: "workflow",
+				state: "running",
+				startedAt: 10,
+				lastUpdate: 20,
+				steps: [
+					{ agent: "scan", workflowKey: "scan", phase: "Plan", label: "Find seams", status: "completed", index: 0 },
+					{ agent: "review", workflowKey: "review", phase: "Review", status: "running", index: 1, currentTool: "grep" },
+				],
+			}, null, 2));
+			state.fleetJobs = new Map([["workflow-1", {
+				asyncId: "workflow-1",
+				asyncDir,
+				sessionId: "session-current",
+				status: "running",
+				mode: "workflow",
+				agents: ["scan", "review"],
+				steps: [
+					{ agent: "scan", workflowKey: "scan", status: "completed", index: 0 },
+					{ agent: "review", workflowKey: "review", status: "running", index: 1 },
+				],
+				workflow: { trace: [], emits: ["reviewing"], console: [] },
+				startedAt: 10,
+				updatedAt: 20,
+			}]]);
 
-		const snapshot = collectFleetSnapshot(state);
-		assert.deepEqual(snapshot.items.map((item) => item.key), ["async:workflow-1"]);
-		assert.equal(snapshot.items[0]?.agent, "workflow");
+			const snapshot = collectFleetSnapshot(state);
+			assert.deepEqual(snapshot.items.map((item) => item.key), ["async:workflow-1"]);
+			assert.equal(snapshot.items[0]?.agent, "workflow");
+
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{ initialKey: "async:workflow-1", refreshMs: 60_000 },
+			);
+			try {
+				const lines = component.render(120).join("\n");
+				assert.match(lines, /Workflow progress:/);
+				assert.match(lines, /Plan: scan · Find seams \(scan\) — completed/);
+				assert.match(lines, /Review: review \(review\) — running · tool grep/);
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
-	it("hides workflow-owned foreground duplicates and opens the workflow parent inspector", async () => {
+	it("shows selectable workflow children only when multiple are live", async () => {
 		const state = stateForTest();
 		state.asyncJobs.set("workflow-1", {
 			asyncId: "workflow-1",
@@ -528,14 +598,42 @@ describe("native subagent fleet", () => {
 			runId: "child-1",
 			parentWorkflowRunId: "workflow-1",
 			workflowKey: "review",
+			workflowSteeringDir: "/tmp/workflow-1/control/workflow-foreground/child-1",
+			sessionId: "session-current",
 			mode: "single",
 			startedAt: 10,
 			updatedAt: 20,
 			activeChildren: new Map([[0, { index: 0, agent: "reviewer", startedAt: 10, updatedAt: 20 }]]),
 		});
+		assert.deepEqual(collectFleetSnapshot(state).items.map((item) => item.key), ["async:unrelated", "async:workflow-1"]);
+		state.foregroundControls.get("child-1")!.activeChildren!.set(1, { index: 1, agent: "writer", startedAt: 11, updatedAt: 21 });
+		assert.deepEqual(collectFleetSnapshot(state).items.map((item) => item.key), [
+			"foreground-active:child-1:0",
+			"foreground-active:child-1:1",
+			"async:unrelated",
+			"async:workflow-1",
+		]);
+		state.foregroundControls.get("child-1")!.activeChildren!.delete(1);
+		state.foregroundControls.set("child-2", {
+			runId: "child-2",
+			parentWorkflowRunId: "workflow-1",
+			workflowKey: "verify",
+			workflowSteeringDir: "/tmp/workflow-1/control/workflow-foreground/child-2",
+			sessionId: "session-current",
+			mode: "single",
+			startedAt: 11,
+			updatedAt: 21,
+			activeChildren: new Map([[0, { index: 0, agent: "verifier", startedAt: 11, updatedAt: 21 }]]),
+		});
 		const snapshot = collectFleetSnapshot(state);
-		assert.deepEqual(snapshot.items.map((item) => item.key), ["async:unrelated", "async:workflow-1"]);
-		const calls: Array<{ runId: string; asyncDir: string; index?: number }> = [];
+		assert.deepEqual(snapshot.items.map((item) => item.key), [
+			"foreground-active:child-2:0",
+			"foreground-active:child-1:0",
+			"async:unrelated",
+			"async:workflow-1",
+		]);
+		const steerCalls: Array<{ runId: string; asyncDir: string; index?: number; message: string; mode: string }> = [];
+		const inspectCalls: Array<{ runId: string; asyncDir: string; index?: number }> = [];
 		const component = new SubagentFleetComponent(
 			{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
 			theme as never,
@@ -545,17 +643,22 @@ describe("native subagent fleet", () => {
 				initialKey: "foreground-active:child-1:0",
 				refreshMs: 60_000,
 				actions: {
-					async steer() { return { text: "unused" }; },
+					async steer(input) { steerCalls.push(input); return { text: "Steering queued." }; },
 					stop() { return { text: "unused" }; },
-					async inspect(input) { calls.push(input); return { text: "Inspector opened." }; },
+					async inspect(input) { inspectCalls.push(input); return { text: "Inspector opened." }; },
 				},
 			},
 		);
 		try {
 			assert.ok(component.render(100).some((line) => line.includes("workflow")));
+			component.handleInput("s");
+			for (const char of "check the failure") component.handleInput(char);
+			component.handleInput("\r");
+			await new Promise((resolve) => setImmediate(resolve));
+			assert.deepEqual(steerCalls, [{ runId: "child-1", asyncDir: "/tmp/workflow-1", index: 0, message: "check the failure", mode: "steer" }]);
 			component.handleInput("H");
 			await new Promise((resolve) => setImmediate(resolve));
-			assert.deepEqual(calls, [{ runId: "workflow-1", asyncDir: "/tmp/workflow-1" }]);
+			assert.deepEqual(inspectCalls, [{ runId: "workflow-1", asyncDir: "/tmp/workflow-1" }]);
 		} finally {
 			component.dispose();
 		}
@@ -626,6 +729,7 @@ describe("native subagent fleet", () => {
 			writeAsyncRun(root, { id: "older", lastUpdate: 200 });
 			const state = stateForTest();
 			let closed = false;
+			let inspectCalls = 0;
 			const component = new SubagentFleetComponent(
 				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
 				theme as never,
@@ -636,7 +740,7 @@ describe("native subagent fleet", () => {
 					resultsDir: path.join(root, "results"),
 					refreshMs: 60_000,
 					fleetKeybindings: {
-						selectDown: ["n"],
+						selectDown: ["return"],
 						selectUp: ["p"],
 						steer: ["m"],
 						close: ["z"],
@@ -644,6 +748,7 @@ describe("native subagent fleet", () => {
 					actions: {
 						async steer() { return { text: "unused" }; },
 						stop() { return { text: "unused" }; },
+						async inspect() { inspectCalls++; return { text: "unexpected" }; },
 					},
 				},
 			);
@@ -652,8 +757,9 @@ describe("native subagent fleet", () => {
 				assert.match(selectedLine(), /newer/);
 				component.handleInput("j");
 				assert.match(selectedLine(), /newer/, "default j should not move when selectDown is overridden");
-				component.handleInput("\x1b[110;1u");
-				assert.match(selectedLine(), /older/, "custom selectDown should accept Kitty CSI-u input");
+				component.handleInput("\r");
+				assert.match(selectedLine(), /older/, "custom Enter binding should move instead of opening Herdr");
+				assert.equal(inspectCalls, 0);
 				component.handleInput("p");
 				assert.match(selectedLine(), /newer/);
 				component.handleInput("m");
@@ -689,7 +795,7 @@ describe("native subagent fleet", () => {
 				cwd,
 				sessionId: "session-current",
 				updatedAt: 200,
-				children: [{ agent: "worker", index: 0, status: "completed", finalOutput: "do not persist this when an artifact exists", savedOutputPath: outputPath }],
+				children: [{ agent: "worker", index: 0, status: "completed", finalOutput: "do not persist this when an artifact exists", savedOutputPath: outputPath, resumeContract: { outputSchema: { type: "object" }, agentContract: { version: 1 }, acceptance: false, output: false, outputMode: "inline" }, extensionBindings: { "shepherd.dispatch/1": { role: "coder" } } }],
 			});
 			state.foregroundRuns!.set("other-session", {
 				runId: "other-session",
@@ -700,11 +806,15 @@ describe("native subagent fleet", () => {
 				children: [{ agent: "outsider", index: 0, status: "completed", savedOutputPath: outputPath }],
 			});
 			persistForegroundRunHistory(state, { resultsDir });
+			const historyFile = path.join(resultsDir, "foreground-history.json");
+			if (process.platform !== "win32") assert.equal(fs.statSync(historyFile).mode & 0o777, 0o600);
 
 			const restored = stateForTest();
 			restored.baseCwd = cwd;
 			restored.artifactDirPreference = "project";
 			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 1);
+			assert.deepEqual(restored.foregroundRuns?.get("restored")?.children[0]?.resumeContract, { outputSchema: { type: "object" }, agentContract: { version: 1 }, acceptance: false, output: false, outputMode: "inline" });
+			assert.deepEqual(restored.foregroundRuns?.get("restored")?.children[0]?.extensionBindings, { "shepherd.dispatch/1": { role: "coder" } });
 			const snapshot = collectFleetSnapshot(restored);
 			assert.deepEqual(snapshot.items.map((item) => item.key), ["foreground-recent:restored:0"]);
 
@@ -772,6 +882,45 @@ describe("native subagent fleet", () => {
 			persistForegroundRunHistory(state, { resultsDir });
 			const persisted = JSON.parse(fs.readFileSync(path.join(resultsDir, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string }> };
 			assert.deepEqual(persisted.runs.map((run) => run.runId), ["terminal"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not restore or persist oversized foreground resume contracts", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-foreground-contract-bound-"));
+		try {
+			const resultsDir = path.join(root, "results");
+			fs.mkdirSync(resultsDir, { recursive: true });
+			const oversizedContract = { outputSchema: { type: "object", description: "x".repeat(65 * 1024) } };
+			fs.writeFileSync(path.join(resultsDir, "foreground-history.json"), JSON.stringify({
+				version: 1,
+				runs: [{
+					runId: "oversized",
+					mode: "single",
+					cwd: root,
+					sessionId: "session-current",
+					updatedAt: 200,
+					children: [{ agent: "worker", index: 0, status: "completed", resumeContract: oversizedContract }],
+				}],
+			}), "utf-8");
+
+			const restored = stateForTest();
+			assert.equal(restoreForegroundRunHistory(restored, { resultsDir }), 0);
+			assert.equal(restored.foregroundRuns?.has("oversized"), false);
+
+			const state = stateForTest();
+			state.foregroundRuns!.set("oversized", {
+				runId: "oversized",
+				mode: "single",
+				cwd: root,
+				sessionId: "session-current",
+				updatedAt: 200,
+				children: [{ agent: "worker", index: 0, status: "completed", resumeContract: oversizedContract }],
+			});
+			persistForegroundRunHistory(state, { resultsDir });
+			const persisted = JSON.parse(fs.readFileSync(path.join(resultsDir, "foreground-history.json"), "utf-8")) as { runs: Array<{ runId: string }> };
+			assert.deepEqual(persisted.runs, []);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -868,6 +1017,71 @@ describe("native subagent fleet", () => {
 				assert.ok(renderRequests >= 2);
 				component.handleInput("\x1b");
 				assert.equal(closed, true);
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("passes current-session trusted roots to async session transcript fallback", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-session-fallback-"));
+		try {
+			const asyncDir = writeAsyncRun(root, { id: "async-session-fallback" });
+			const sessionFile = path.join(asyncDir, "worker.jsonl");
+			fs.writeFileSync(sessionFile, `${JSON.stringify({ role: "assistant", content: "TRUSTED SESSION FALLBACK" })}\n`, "utf-8");
+			const state = stateForTest();
+			state.trustedSessionRoots = [asyncDir];
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000 },
+			);
+			try {
+				const rendered = component.render(100).join("\n");
+				assert.match(rendered, /TRUSTED SESSION FALLBACK/);
+				assert.doesNotMatch(rendered, /without a trusted root|Session read failed/);
+			} finally {
+				component.dispose();
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("previews an exact runtime-recorded workflow session under the Pi sessions base", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-recorded-session-"));
+		try {
+			const asyncDir = writeAsyncRun(root, { id: "async-recorded-session" });
+			const sessionsBase = path.join(root, "sessions");
+			const projectDir = path.join(sessionsBase, "project");
+			fs.mkdirSync(projectDir, { recursive: true });
+			const sessionFile = path.join(projectDir, "workflow-child.jsonl");
+			fs.writeFileSync(sessionFile, `${JSON.stringify({ role: "assistant", content: "RECORDED WORKFLOW SESSION" })}\n`, "utf-8");
+			const statusPath = path.join(asyncDir, "status.json");
+			const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { sessionFile?: string; steps?: Array<{ sessionFile?: string; transcriptPath?: string }> };
+			status.sessionFile = sessionFile;
+			status.steps![0]!.sessionFile = sessionFile;
+			delete status.steps![0]!.transcriptPath;
+			fs.writeFileSync(statusPath, JSON.stringify(status, null, 2), "utf-8");
+
+			const state = stateForTest();
+			state.trustedSessionRoots = [];
+			state.trustedSessionFileRoot = sessionsBase;
+			const component = new SubagentFleetComponent(
+				{ terminal: { rows: 32, columns: 100 }, requestRender() {} } as never,
+				theme as never,
+				state,
+				() => {},
+				{ asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000 },
+			);
+			try {
+				const rendered = component.render(100).join("\n");
+				assert.match(rendered, /RECORDED WORKFLOW SESSION/);
+				assert.doesNotMatch(rendered, /without a trusted root|Session read failed/);
 			} finally {
 				component.dispose();
 			}
@@ -1193,6 +1407,57 @@ describe("native subagent fleet", () => {
 		}
 	});
 
+	it("focuses the Herdr pane the operator opens with the inspect key", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fleet-inspect-focus-"));
+		try {
+			const asyncDir = writeAsyncRun(root, { id: "run-focus", agents: ["worker"] });
+			const state = stateForTest();
+			state.asyncJobs.set("run-focus", {
+				asyncId: "run-focus",
+				asyncDir,
+				status: "running",
+				mode: "single",
+				agents: ["worker"],
+				startedAt: 100,
+				updatedAt: 200,
+			});
+			const calls: string[][] = [];
+			const herdrClient: HerdrClient = {
+				run: async <T>(args: string[]) => {
+					calls.push(args);
+					if (args[0] === "--version") return { ok: true, data: "herdr 0.7.5" as T };
+					if (args[0] === "pane" && args[1] === "split") return { ok: true, data: { pane: { pane_id: "w1:p9" } } as T };
+					return { ok: true, data: {} as T };
+				},
+			};
+			const ctx = {
+				hasUI: true,
+				ui: {
+					setWidget() {},
+					async custom(factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result: undefined) => void) => SubagentFleetComponent) {
+						const component = factory({ terminal: { rows: 32, columns: 100 }, requestRender() {} }, theme, undefined, () => {});
+						try {
+							component.render(100);
+							component.handleInput("H");
+							for (let attempt = 0; attempt < 500 && !calls.some((args) => args[0] === "pane" && args[1] === "split"); attempt++) {
+								await new Promise((resolve) => setImmediate(resolve));
+							}
+						} finally {
+							component.dispose();
+						}
+					},
+				},
+			};
+
+			await openSubagentFleet(ctx as never, state, { asyncDirRoot: root, resultsDir: path.join(root, "results"), refreshMs: 60_000, herdrClient });
+			const split = calls.find((args) => args[0] === "pane" && args[1] === "split");
+			assert.ok(split, `no pane split call: ${JSON.stringify(calls)}`);
+			assert.deepEqual(split.slice(-1), ["--focus"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("suppresses the status widget for the full inspector lifecycle", async () => {
 		const state = stateForTest();
 		let hidden = 0;
@@ -1343,9 +1608,15 @@ describe("native subagent fleet", () => {
 				},
 			);
 			try {
-				component.handleInput("H");
+				component.handleInput("\r");
 				await new Promise((resolve) => setImmediate(resolve));
 				assert.deepEqual(calls, [{ runId: "async-herdr", asyncDir, index: 0 }]);
+				component.handleInput("H");
+				await new Promise((resolve) => setImmediate(resolve));
+				assert.deepEqual(calls, [
+					{ runId: "async-herdr", asyncDir, index: 0 },
+					{ runId: "async-herdr", asyncDir, index: 0 },
+				]);
 				assert.ok(component.render(100).some((line) => line.includes("Inspector opened.")));
 			} finally {
 				component.dispose();
@@ -1361,6 +1632,7 @@ describe("native subagent fleet", () => {
 			const asyncDir = writeAsyncRun(root, { id: "async-stop" });
 			const state = stateForTest();
 			const calls: Array<{ runId: string; asyncDir: string; index?: number }> = [];
+			let inspectCalls = 0;
 			const component = new SubagentFleetComponent(
 				{ terminal: { rows: 28, columns: 100 }, requestRender() {} } as never,
 				theme as never,
@@ -1370,6 +1642,7 @@ describe("native subagent fleet", () => {
 					asyncDirRoot: root,
 					resultsDir: path.join(root, "results"),
 					refreshMs: 60_000,
+					fleetKeybindings: { stop: ["return"] },
 					actions: {
 						async steer() {
 							return { text: "unused" };
@@ -1378,15 +1651,17 @@ describe("native subagent fleet", () => {
 							calls.push(input);
 							return { text: "Stop requested." };
 						},
+						async inspect() { inspectCalls++; return { text: "unexpected" }; },
 					},
 				},
 			);
 			try {
-				component.handleInput("D");
+				component.handleInput("\r");
 				assert.ok(component.render(100).some((line) => line.includes("Confirm stop for async run async-stop")));
+				assert.equal(inspectCalls, 0);
 				component.handleInput("n");
 				assert.deepEqual(calls, []);
-				component.handleInput("D");
+				component.handleInput("\r");
 				component.handleInput("y");
 				await new Promise((resolve) => setImmediate(resolve));
 				assert.deepEqual(calls, [{ runId: "async-stop", asyncDir, index: 0 }]);

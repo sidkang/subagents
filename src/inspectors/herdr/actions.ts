@@ -12,6 +12,7 @@ import { readStatus } from "../../shared/utils.ts";
 import { resolveSubagentRunId } from "../../runs/background/run-id-resolver.ts";
 import { resolveNodeExecutable } from "../../shared/node-executable.ts";
 import { createHerdrClient, detectHerdr, type HerdrClient, type HerdrErrorCode, type HerdrResult } from "./client.ts";
+import { encodeSessionRoots } from "./session-roots-codec.ts";
 import { formatShellCommand } from "./shell-command.ts";
 
 export const HERDR_INSPECTOR_ACTIONS = ["inspector.open", "inspector.status", "inspector.close"] as const;
@@ -88,7 +89,7 @@ function extractPaneId(value: unknown): string | undefined {
 }
 
 function inspectorCommand(input: { runnerPath: string; asyncDir: string; runId: string; index?: number; missionPath?: string; allowSteer: boolean; allowStop: boolean; sessionRoots: string[] }): string {
-	const args = [input.runnerPath, "--async-dir", input.asyncDir, "--run-id", input.runId, "--allow-steer", String(input.allowSteer), "--allow-stop", String(input.allowStop), "--session-roots", JSON.stringify(input.sessionRoots)];
+	const args = [input.runnerPath, "--async-dir", input.asyncDir, "--run-id", input.runId, "--allow-steer", String(input.allowSteer), "--allow-stop", String(input.allowStop), "--session-roots", encodeSessionRoots(input.sessionRoots)];
 	if (input.index !== undefined) args.push("--index", String(input.index));
 	if (input.missionPath) args.push("--mission-path", input.missionPath);
 	return formatShellCommand(resolveNodeExecutable(), args);
@@ -193,7 +194,7 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 		if (live.ok) return result(`Herdr inspector pane ${existing.paneId} is already open for async run ${target.runId}.${params.focus ? " Herdr cannot refocus an arbitrary raw pane id; select it in the Herdr UI." : ""}`);
 	}
 	const splitArgs = ["pane", "split", "--current", "--direction", "right", "--cwd", status.cwd ?? deps.cwd];
-	if (params.focus !== false) splitArgs.push("--focus");
+	splitArgs.push(params.focus === true ? "--focus" : "--no-focus");
 	const split = await client.run(splitArgs, { timeoutMs: 15_000, signal: deps.signal });
 	if (split.ok === false) return result(formatHerdrError(split.error), true);
 	const paneId = extractPaneId(split.data);
@@ -225,7 +226,7 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 		...(mission ? { missionId: mission.id, missionPath: mission.path } : {}),
 		paneId,
 		openedAt: now,
-		...(params.focus !== false ? { lastFocusedAt: now } : {}),
+		...(params.focus === true ? { lastFocusedAt: now } : {}),
 		herdrVersion: detected.data.versionText,
 		command,
 	};

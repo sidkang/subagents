@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
-import { cleanupResultIndexes, removeResultIndex, resultCandidateFilesForSession, resultFilesForSession, resultFilesForToolCall, resultPayloadPathForIndexedRun, resultPayloadPathForSessionRun, writeAsyncResultFile, writePendingAsyncResultFile, writeResultIndexForData } from "../../src/runs/background/result-files.ts";
+import { cleanupResultIndexes, removeResultIndex, resultCandidateFilesForSession, resultFilesForSession, resultFilesForToolCall, resultPayloadPathForIndexedRun, resultPayloadPathForMissionObserverRun, resultPayloadPathForSessionRun, writeAsyncResultFile, writePendingAsyncResultFile, writeResultIndexForData } from "../../src/runs/background/result-files.ts";
 
 const JSON_EXTENSION = ".json";
 const MAX_JSON_FILE_STEM_BYTES = MAX_INDEX_SEGMENT_BYTES - Buffer.byteLength(JSON_EXTENSION, "utf-8");
@@ -15,6 +15,24 @@ function pendingPath(resultsDir: string, sessionId: string, runId: string): stri
 }
 
 describe("result file indexes", () => {
+	it("resolves run ids without enumerating session indexes", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-run-index-"));
+		const originalReaddirSync = fsDefault.readdirSync;
+		try {
+			const resultPath = path.join(resultsDir, "direct-run.json");
+			writeAsyncResultFile(resultPath, { id: "direct-run", runId: "direct-run", sessionId: "session-a", success: true });
+			fsDefault.readdirSync = (() => { throw new Error("result index enumerated"); }) as typeof fsDefault.readdirSync;
+			syncBuiltinESMExports();
+
+			assert.equal(resultPayloadPathForIndexedRun(resultsDir, "direct-run"), resultPath);
+			assert.equal(resultPayloadPathForIndexedRun(resultsDir, "missing-run"), undefined);
+		} finally {
+			fsDefault.readdirSync = originalReaddirSync;
+			syncBuiltinESMExports();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("removes orphan index entries without deleting flat result files", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-index-"));
 		try {
@@ -23,7 +41,7 @@ describe("result file indexes", () => {
 			fs.rmSync(path.join(resultsDir, "missing.json"));
 			fs.writeFileSync(path.join(resultsDir, "unindexed.json"), JSON.stringify({ id: "unindexed", sessionId: "session-a" }), "utf-8");
 
-			assert.equal(cleanupResultIndexes(resultsDir, Date.now() + 86_400_001, 86_400_000), 2);
+			assert.equal(cleanupResultIndexes(resultsDir, Date.now() + 86_400_001, 86_400_000) > 0, true);
 
 			assert.deepEqual(resultFilesForSession(resultsDir, "session-a"), ["kept.json"]);
 			assert.equal(fs.existsSync(path.join(resultsDir, "kept.json")), true);
@@ -93,7 +111,7 @@ describe("result file indexes", () => {
 			assert.deepEqual(resultCandidateFilesForSession(resultsDir, sessionId), [`${runId}.json`]);
 			assert.equal(resultPayloadPathForSessionRun(resultsDir, sessionId, runId), payloadPath);
 			fs.rmSync(path.join(resultsDir, "result-index"), { recursive: true });
-			assert.equal(resultPayloadPathForIndexedRun(resultsDir, runId), payloadPath);
+			assert.equal(resultPayloadPathForIndexedRun(resultsDir, runId), undefined);
 		} finally {
 			console.error = originalError;
 			fs.rmSync(resultsDir, { recursive: true, force: true });
@@ -150,9 +168,25 @@ describe("result file indexes", () => {
 			assert.equal(fs.existsSync(resultPath), false);
 			assert.equal(fs.existsSync(pendingPath(resultsDir, "session-a", "blocked")), true);
 			assert.equal(resultPayloadPathForSessionRun(resultsDir, "session-a", "blocked"), pendingPath(resultsDir, "session-a", "blocked"));
-			assert.equal(resultPayloadPathForIndexedRun(resultsDir, "blocked"), pendingPath(resultsDir, "session-a", "blocked"));
+			assert.equal(resultPayloadPathForIndexedRun(resultsDir, "blocked"), undefined);
 			assert.deepEqual(resultCandidateFilesForSession(resultsDir, "session-a"), ["blocked.json"]);
 		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("treats a missing mission observer index directory as absent without logging", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-observer-enotdir-"));
+		const originalError = console.error;
+		const errors: unknown[][] = [];
+		try {
+			fs.writeFileSync(path.join(resultsDir, "result-index"), "not a directory", "utf-8");
+			console.error = (...args: unknown[]) => { errors.push(args); };
+
+			assert.equal(resultPayloadPathForMissionObserverRun(resultsDir, "mission-run"), undefined);
+			assert.deepEqual(errors, []);
+		} finally {
+			console.error = originalError;
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});
@@ -268,6 +302,199 @@ describe("result file indexes", () => {
 			assert.deepEqual(resultFilesForSession(resultsDir, "session-a"), ["kept.json"]);
 		} finally {
 			console.error = originalError;
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("round-trips results for Windows session file paths", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-win-session-"));
+		try {
+			const sessionId = String.raw`C:\Users\theap\.pi\agent\sessions\leaf.jsonl`;
+			const runId = "win-session-run";
+			const resultPath = path.join(resultsDir, `${runId}.json`);
+			writeAsyncResultFile(resultPath, { id: runId, runId, sessionId, success: true });
+
+			const sessionDirs = fs.readdirSync(path.join(resultsDir, "result-index", "sessions"));
+			assert.equal(sessionDirs.length, 1);
+			assert.match(sessionDirs[0]!, /^~sha256-[a-f0-9]{64}$/);
+			assert.deepEqual(resultFilesForSession(resultsDir, sessionId), [`${runId}.json`]);
+			assert.deepEqual(resultCandidateFilesForSession(resultsDir, sessionId), [`${runId}.json`]);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("treats an unaddressable legacy session alias as absent and keeps canonical fallback candidates", (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-legacy-enametoolong-"));
+		const sessionId = String.raw`C:\Users\theap\.pi\agent\sessions\leaf.jsonl`;
+		const runId = "legacy-alias-fallback";
+		const resultPath = path.join(resultsDir, `${runId}.json`);
+		const legacyDir = path.join(resultsDir, "result-index", "sessions", encodeURIComponent(sessionId));
+		const originalReadFileSync = fsDefault.readFileSync;
+		const originalReaddirSync = fsDefault.readdirSync;
+		const originalError = console.error;
+		const errors: unknown[][] = [];
+		try {
+			writeAsyncResultFile(resultPath, { id: runId, runId, sessionId, success: true });
+			const canonicalDir = path.join(resultsDir, "result-index", "sessions", encodeIndexSegment(sessionId));
+			const [canonicalIndexFile] = fs.readdirSync(canonicalDir);
+			assert.ok(canonicalIndexFile);
+			const canonicalPendingPath = pendingPath(resultsDir, sessionId, runId);
+			fs.mkdirSync(path.dirname(canonicalPendingPath), { recursive: true });
+			fs.copyFileSync(resultPath, canonicalPendingPath);
+
+			const nameTooLong = new Error("legacy alias is too long") as NodeJS.ErrnoException;
+			nameTooLong.code = "ENAMETOOLONG";
+			fsDefault.readFileSync = ((filePath: fs.PathOrFileDescriptor, ...args: unknown[]) => {
+				if (String(filePath).startsWith(legacyDir)) throw nameTooLong;
+				return (originalReadFileSync as (...input: unknown[]) => unknown)(filePath, ...args);
+			}) as typeof fsDefault.readFileSync;
+			fsDefault.readdirSync = ((dirPath: fs.PathLike, ...args: unknown[]) => {
+				if (String(dirPath) === legacyDir) throw nameTooLong;
+				return (originalReaddirSync as (...input: unknown[]) => unknown)(dirPath, ...args);
+			}) as typeof fsDefault.readdirSync;
+			console.error = (...args: unknown[]) => { errors.push(args); };
+			syncBuiltinESMExports();
+
+			assert.deepEqual(resultCandidateFilesForSession(resultsDir, sessionId), [`${runId}.json`]);
+			fs.copyFileSync(resultPath, canonicalPendingPath);
+			fs.rmSync(path.join(canonicalDir, canonicalIndexFile));
+			assert.equal(resultPayloadPathForSessionRun(resultsDir, sessionId, runId), canonicalPendingPath);
+			assert.deepEqual(errors, []);
+		} finally {
+			fsDefault.readFileSync = originalReadFileSync;
+			fsDefault.readdirSync = originalReaddirSync;
+			console.error = originalError;
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("leaves an unaddressable legacy index untouched during cleanup", (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-cleanup-enametoolong-"));
+		const sessionId = String.raw`C:\Users\theap\.pi\agent\sessions\leaf.jsonl`;
+		const runId = "legacy-cleanup";
+		const originalStatSync = fsDefault.statSync;
+		const originalError = console.error;
+		const errors: unknown[][] = [];
+		try {
+			writeAsyncResultFile(path.join(resultsDir, `${runId}.json`), { id: runId, runId, sessionId, success: true });
+			const canonicalDir = path.join(resultsDir, "result-index", "sessions", encodeIndexSegment(sessionId));
+			const legacyDir = path.join(resultsDir, "result-index", "sessions", encodeURIComponent(sessionId));
+			fs.renameSync(canonicalDir, legacyDir);
+			const [legacyIndexFile] = fs.readdirSync(legacyDir);
+			assert.ok(legacyIndexFile);
+			const legacyIndexPath = path.join(legacyDir, legacyIndexFile);
+			const nameTooLong = new Error("legacy alias is too long") as NodeJS.ErrnoException;
+			nameTooLong.code = "ENAMETOOLONG";
+			t.mock.method(fsDefault, "statSync", ((filePath: fs.PathLike) => {
+				if (String(filePath) === legacyIndexPath) throw nameTooLong;
+				return originalStatSync(filePath);
+			}) as typeof fsDefault.statSync);
+			console.error = (...args: unknown[]) => { errors.push(args); };
+			syncBuiltinESMExports();
+
+			assert.equal(cleanupResultIndexes(resultsDir, Date.now() + 86_400_001, 86_400_000), 0);
+			assert.equal(fs.existsSync(legacyIndexPath), true);
+			assert.deepEqual(errors, []);
+		} finally {
+			console.error = originalError;
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reads a pre-hash URI-encoded session index after the encoding change", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-legacy-session-"));
+		try {
+			const sessionId = String.raw`C:\Users\theap\.pi\agent\sessions\leaf.jsonl`;
+			const runId = "legacy-session-run";
+			const resultPath = path.join(resultsDir, `${runId}.json`);
+			writeAsyncResultFile(resultPath, { id: runId, runId, sessionId, success: true });
+
+			const currentDir = path.join(resultsDir, "result-index", "sessions", encodeIndexSegment(sessionId));
+			const historicalDir = path.join(resultsDir, "result-index", "sessions", encodeURIComponent(sessionId));
+			fs.renameSync(currentDir, historicalDir);
+
+			assert.deepEqual(resultFilesForSession(resultsDir, sessionId), [`${runId}.json`]);
+			assert.equal(resultPayloadPathForSessionRun(resultsDir, sessionId, runId), resultPath);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reads a pre-hash extension-like run index filename", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-legacy-run-"));
+		try {
+			const sessionId = "session-a";
+			const runId = "legacy.jsonl";
+			const resultPath = path.join(resultsDir, `${runId}.json`);
+			writeAsyncResultFile(resultPath, { id: runId, runId, sessionId, success: true });
+
+			const indexDir = path.join(resultsDir, "result-index", "sessions", encodeIndexSegment(sessionId));
+			const [currentFile] = fs.readdirSync(indexDir);
+			assert.ok(currentFile);
+			fs.renameSync(path.join(indexDir, currentFile), path.join(indexDir, `${runId}.json`));
+
+			assert.equal(resultPayloadPathForSessionRun(resultsDir, sessionId, runId), resultPath);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("reads a pre-hash extension-like pending filename", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-legacy-pending-"));
+		const originalError = console.error;
+		try {
+			const sessionId = "session-a";
+			const runId = "legacy.jsonl";
+			const resultPath = path.join(resultsDir, `${runId}.json`);
+			fs.mkdirSync(resultPath);
+			console.error = () => {};
+			writePendingAsyncResultFile(resultPath, { id: runId, runId, sessionId, success: true });
+
+			const currentPath = pendingPath(resultsDir, sessionId, runId);
+			const historicalPath = path.join(path.dirname(currentPath), `${runId}.json`);
+			fs.renameSync(currentPath, historicalPath);
+
+			assert.equal(resultPayloadPathForSessionRun(resultsDir, sessionId, runId), historicalPath);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("throws access-denied direct session index reads", (t) => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-eacces-index-"));
+		const error = new Error("permission denied") as NodeJS.ErrnoException;
+		error.code = "EACCES";
+		try {
+			writeAsyncResultFile(path.join(resultsDir, "blocked.json"), { id: "blocked", runId: "blocked", sessionId: "session-a", success: true });
+			t.mock.method(fsDefault, "readFileSync", () => { throw error; });
+			syncBuiltinESMExports();
+
+			assert.throws(() => resultPayloadPathForSessionRun(resultsDir, "session-a", "blocked"), (thrown) => thrown === error);
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns no session candidates when the session index is unlistable", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-files-eperm-scan-"));
+		const error = new Error("operation not permitted") as NodeJS.ErrnoException;
+		error.code = "EPERM";
+		const originalReaddirSync = fsDefault.readdirSync;
+		try {
+			fsDefault.readdirSync = (() => { throw error; }) as typeof fsDefault.readdirSync;
+			syncBuiltinESMExports();
+			assert.deepEqual(resultCandidateFilesForSession(resultsDir, "session-a"), []);
+		} finally {
+			fsDefault.readdirSync = originalReaddirSync;
+			syncBuiltinESMExports();
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
 	});

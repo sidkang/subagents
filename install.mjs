@@ -91,7 +91,7 @@ if (fs.existsSync(EXTENSION_DIR)) {
 console.log(`
 The extension is now available in pi. Tools added:
   • subagent - Delegate tasks to agents and inspect run status
-  • subagent_wait - Block until background subagent runs finish (delivers their results)
+  • bg_wait - Wait for background/provider/detached work without native completion notifications
 
 Documentation: ${EXTENSION_DIR}/README.md
 `);

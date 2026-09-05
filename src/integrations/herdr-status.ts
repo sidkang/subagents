@@ -3,10 +3,15 @@ import {
 	SUBAGENT_ASYNC_STARTED_EVENT,
 	SUBAGENT_CONTROL_EVENT,
 } from "../shared/types.ts";
+import { previewDisplayText, sanitizeDisplayText } from "../shared/display-text.ts";
 
 const DEFAULT_SOURCE = "pi-subagents:herdr";
 const DEFAULT_TTL_MS = 120_000;
 const DEFAULT_REFRESH_MS = 45_000;
+const MAX_TASK_LABEL_CHARS = 80;
+const MAX_TITLE_TASK_CHARS = 42;
+const MAX_WORKFLOW_LABEL_NODES = 128;
+const MAX_WORKFLOW_LABEL_DEPTH = 8;
 
 let metadataReportSeq = Date.now() * 1000;
 
@@ -24,6 +29,8 @@ export interface HerdrStatusRun {
 	id: string;
 	agent?: string;
 	agents?: string[];
+	/** Explicit launch/workflow label only; raw prompts never enter pane metadata. */
+	taskLabel?: string;
 	needsAttention?: boolean;
 	attentionLabel?: string;
 }
@@ -33,6 +40,8 @@ export interface HerdrStatusBridgeOptions {
 	env?: Record<string, string | undefined>;
 	/** Current authoritative active-run projection, used before TTL refresh. */
 	getRuns?: () => Iterable<HerdrStatusRun>;
+	/** Current project panes opened by this Pi session. Views are excluded. */
+	getProjectPaneCount?: () => number;
 	runHerdr: (args: readonly string[]) => void | Promise<void>;
 	ttlMs?: number;
 	refreshMs?: number;
@@ -50,6 +59,7 @@ export interface HerdrStatusBridge {
 	 * state. Also re-syncs runs that survived a reload/resume.
 	 */
 	sessionStarted(input: { hasUI: boolean; runs: Iterable<HerdrStatusRun> }): void;
+	syncRuns(): void;
 	agentStarted(): void;
 	flush(): Promise<void>;
 	dispose(): void;
@@ -59,12 +69,42 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function boundedTaskLabel(value: unknown, maxChars = MAX_TASK_LABEL_CHARS): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const normalized = sanitizeDisplayText(value).trim();
+	if (!normalized) return undefined;
+	return previewDisplayText(normalized, maxChars);
+}
+
+function workflowTaskLabel(data: Record<string, unknown>): string | undefined {
+	const explicit = boundedTaskLabel(data.taskLabel);
+	if (explicit) return explicit;
+	if (!isRecord(data.workflowGraph) || !Array.isArray(data.workflowGraph.nodes)) return undefined;
+	const currentNodeId = typeof data.workflowGraph.currentNodeId === "string" ? data.workflowGraph.currentNodeId : undefined;
+	const nodes: Record<string, unknown>[] = [];
+	const collect = (values: unknown[], depth: number): void => {
+		if (depth > MAX_WORKFLOW_LABEL_DEPTH || nodes.length >= MAX_WORKFLOW_LABEL_NODES) return;
+		for (const value of values) {
+			if (nodes.length >= MAX_WORKFLOW_LABEL_NODES) return;
+			if (!isRecord(value)) continue;
+			nodes.push(value);
+			if (Array.isArray(value.children)) collect(value.children, depth + 1);
+		}
+	};
+	collect(data.workflowGraph.nodes, 0);
+	const current = currentNodeId ? nodes.find((node) => node.id === currentNodeId) : undefined;
+	const active = current ?? nodes.find((node) => node.status === "running") ?? nodes.find((node) => node.status === "pending");
+	return boundedTaskLabel(active?.label);
+}
+
 function startedRun(data: unknown): HerdrStatusRun | undefined {
 	if (!isRecord(data) || typeof data.id !== "string" || !data.id) return undefined;
+	const taskLabel = workflowTaskLabel(data);
 	return {
 		id: data.id,
 		...(typeof data.agent === "string" ? { agent: data.agent } : {}),
 		...(Array.isArray(data.agents) && data.agents.every((agent) => typeof agent === "string") ? { agents: data.agents as string[] } : {}),
+		...(taskLabel ? { taskLabel } : {}),
 	};
 }
 
@@ -109,12 +149,31 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 	let drainPromise = Promise.resolve();
 	let refreshTimer: ReturnType<typeof setInterval> | undefined;
 
-	const label = (): string => {
-		const agents = [...new Set([...runs.values()].flatMap((run) => run.agents?.length ? run.agents : run.agent ? [run.agent] : []))];
+	const activeAgentNames = (): string[] => [...new Set([...runs.values()].flatMap((run) => run.agents?.length ? run.agents : run.agent ? [run.agent] : []))];
+	const activeSubagentCount = (): number => [...runs.values()].reduce((total, run) => total + Math.max(1, run.agents?.length ?? (run.agent ? 1 : 0)), 0);
+	const activeTaskLabel = (): string | undefined => [...runs.values()].reverse().find((run) => run.taskLabel)?.taskLabel;
+
+	const label = (includeAttention = false): string => {
+		const agents = activeAgentNames();
+		const activeCount = activeSubagentCount();
 		const who = agents.length > 0
 			? ` (${agents.slice(0, 3).join(", ")}${agents.length > 3 ? ", …" : ""})`
 			: "";
-		return `⏳ ${runs.size} subagent${runs.size === 1 ? "" : "s"}${who}`;
+		const panes = Math.max(0, options.getProjectPaneCount?.() ?? 0);
+		const paneText = panes > 0 ? ` · ${panes} pane${panes === 1 ? "" : "s"}` : "";
+		const task = activeTaskLabel();
+		const taskText = task ? ` · ${task}` : "";
+		const attention = includeAttention && attentionLabels.size > 0 ? " ⚠" : "";
+		return `⏳ ${activeCount} subagent${activeCount === 1 ? "" : "s"}${who}${paneText}${taskText}${attention}`;
+	};
+
+	const titleSuffix = (): string | undefined => {
+		if (runs.size === 0) return undefined;
+		const agentNames = activeAgentNames();
+		const activeCount = activeSubagentCount();
+		const task = boundedTaskLabel(activeTaskLabel(), MAX_TITLE_TASK_CHARS);
+		const target = task ?? (activeCount === 1 && agentNames.length === 1 ? agentNames[0]! : String(activeCount));
+		return `⏳${target}${attentionLabels.size > 0 ? "⚠" : ""}`;
 	};
 
 	const enqueue = (args: readonly string[]): void => {
@@ -150,11 +209,13 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 				"--applies-to-source", "herdr:pi",
 				"--clear-state-labels",
 				"--clear-token", "summary",
+				"--clear-token", "title-suffix",
 				"--seq", seq,
 			]);
 			return;
 		}
-		const text = label();
+		const text = label(true);
+		const suffix = titleSuffix();
 		published = true;
 		enqueue([
 			"pane", "report-metadata", paneId,
@@ -165,6 +226,7 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 			"--state-label", `done=${text}`,
 			"--state-label", `working=${text}`,
 			"--token", `summary=${text}`,
+			...(suffix ? ["--token", `title-suffix=${suffix}`] : []),
 			"--ttl-ms", String(ttlMs),
 			"--seq", seq,
 		]);
@@ -221,6 +283,7 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 	const clearAttention = (): void => {
 		attentionLabels.clear();
 		syncBlocked();
+		publish();
 	};
 
 	const raiseAttention = (runId: string, labelText: string): void => {
@@ -228,6 +291,7 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 		acknowledgedAttention.delete(runId);
 		attentionLabels.set(runId, labelText);
 		syncBlocked();
+		publish();
 	};
 
 	const replaceRuns = (nextRuns: Iterable<HerdrStatusRun>): void => {
@@ -237,7 +301,9 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 		for (const run of nextRuns) {
 			if (!run || typeof run.id !== "string" || !run.id) continue;
 			activeIds.add(run.id);
-			runs.set(run.id, { ...run });
+			const taskLabel = boundedTaskLabel(run.taskLabel);
+			const { taskLabel: _rawTaskLabel, ...sanitizedRun } = run;
+			runs.set(run.id, { ...sanitizedRun, ...(taskLabel ? { taskLabel } : {}) });
 			if (!run.needsAttention) {
 				acknowledgedAttention.delete(run.id);
 			} else if (!acknowledgedAttention.has(run.id)) {
@@ -311,6 +377,10 @@ export function registerHerdrStatusBridge(options: HerdrStatusBridgeOptions): He
 			if (!enabled || disposed || hasUI !== true) return;
 			rootSession = true;
 			replaceRuns(restoredRuns);
+		},
+		syncRuns() {
+			if (!enabled || !rootSession || disposed) return;
+			refresh();
 		},
 		async flush() {
 			while (draining || pendingReport) await drainPromise;

@@ -18,7 +18,7 @@ subagent({ action: "list" })
 subagent({ action: "children.list" })
 ```
 
-Lists up to the last 10 retained workflow children from this parent session with explicit `resumable` or `not resumable` rows. Resume only rows reported `resumable`. Send a simple follow-up or implementation challenge with `subagent({ action: "resume", id: "<run-id>", message: "..." })`. Continue one inside a workflow with `runs.run(key, { resume: "<run-id>", task: "follow-up" })`; the revived child keeps its stored agent, model, and tool contract. If no resumable child is listed, start a same-role fallback challenge and label it as fallback. `steer` with `mode: "follow_up"` only queues text for the next `resume` when the child has already completed.
+Lists up to the last 10 retained workflow children from this parent session with explicit `resumable` or `not resumable` rows. Resume only rows reported `resumable`. Send a simple follow-up or implementation challenge with `subagent({ action: "resume", id: "<run-id>", message: "..." })`. Continue one inside a workflow with `runs.run(key, { resume: "<run-id>", task: "follow-up" })`; each workflow key identifies one result lane, so use a new stable workflow key for every distinct retained resume pass. Same-key calls are reused only when launch parameters are identical, and incompatible parameters are rejected. The revived child keeps its stored agent, model, and tool contract. If no resumable child is listed, start a same-role fallback challenge and label it as fallback. `steer` with `mode: "follow_up"` only queues text for the next `resume` when the child has already completed.
 
 ### Refinement overlays
 
@@ -41,7 +41,7 @@ subagent({
     description: "Project-specific implementation helper",
     systemPrompt: "Your system prompt here.",
     systemPromptMode: "replace",
-    model: "openai-codex/gpt-5.4",
+    model: "provider/model-id",
     tools: "read,grep,find,ls,bash"
   }
 })
@@ -85,7 +85,7 @@ subagent({ action: "reset", agent: "reviewer" })
 Use management actions when the system needs to create or edit subagents on
 demand without dropping into raw file editing.
 
-Management actions create or update user/project agent files. `config.name` is the local frontmatter name; optional `config.package` registers and looks up the runtime name as `{package}.{name}`. Use the dotted runtime name for `get`, `update`, `delete`, slash commands, and scripted workflow steps. For small builtin changes such as a model swap, prefer `subagents.agentOverrides` in settings. Durable `.chain.md` definitions are legacy records, not a current authoring target; use `workflowScript` or `/prompt-workflow` for repeatable orchestration.
+Management actions create or update user/project agent files. `config.name` is the local frontmatter name; optional `config.package` registers and looks up the runtime name as `{package}.{name}`. Use the dotted runtime name for `get`, `update`, `delete`, slash commands, and scripted workflow steps. For small agent changes such as a model swap, prefer `subagents.agentOverrides` in settings. Durable `.chain.md` definitions are legacy records, not a current authoring target; use `workflowScript` or `/prompt-workflow` for repeatable orchestration.
 
 ## Creating and Editing Agents by File
 
@@ -97,11 +97,12 @@ name: my-agent
 package: code-analysis
 description: What this agent does
 aliases: developer, coder
-model: openai-codex/gpt-5.4
+model: provider/model-id
 thinking: high
 tools: read, grep, find, ls, bash
 systemPromptMode: replace
 inheritProjectContext: true
+inheritGlobalContext: false
 inheritSkills: false
 skills: safe-bash, review-checklist
 skillPath: ./skills, ../shared-skills
@@ -125,7 +126,6 @@ That is only a starting point. Omit `package` for the traditional unqualified ru
 - `acceptanceRole`
 - `async` — single-agent default for background launch (`true`/`false`); explicit tool-call `async` wins
 - `timeoutMs` — single-agent default run-level max runtime in ms; foreground calls use a 30-minute package default only when neither the call nor agent provides one (tool alias `maxRuntimeMs` is also accepted)
-- `turnBudget` — single-agent default `{ maxTurns, graceTurns? }` JSON object
 
 `aliases` is an optional comma-separated or block-list set of alternate names for selecting an agent. Aliases resolve to the canonical `name` for execution, status, persistence, and config. Exact canonical names take precedence over aliases, and alias collisions between distinct canonical agents fail as ambiguous. Management create/update accepts a comma-separated string, string array, or `false`/empty string to clear aliases.
 

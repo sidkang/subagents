@@ -1,34 +1,627 @@
 # Changelog
 
+## [0.65.1+sid.1]
+
+### Fork changes
+- Merge upstream `v0.65.1` (`83be9c3de2cde1553c0269f383efc1eb1194dc8b`) while retaining per-Child JJ workspace isolation and conservative cleanup.
+- Port Workflow Scratch to native child sessions using per-session mount factories. Detached runners receive validated private bindings; parent process environment is not changed.
+- Preserve JJ identities in current handoff records and honor cleanup blockers and explicit JJ base revisions.
+- Keep the delegation `sessionFile` projection. Reuse upstream terminal-event handling with the fork's narrow stale-error filter and propagation of unrelated subscriber errors.
+- Replace obsolete CLI-launch scratch tests with native launch and workflow fan-in tests.
+
 ## [Unreleased]
 
-### Added
-- Add `PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS` so a host embedding the extension can bound how long a contended filesystem retry blocks its thread. Unset by default. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1143.
-- Add a fork-owned per-Child JJ worktree backend: `worktree:true` in a JJ repository creates independently captured and conservatively cleaned JJ workspaces, while Git fallback and `worktree:false` behavior stay unchanged.
-- Add Workflow Scratch: one package-created Host temporary cooperative directory per top-level native `workflowScript`, shared by that workflow's leaf Children via a private Mount Adapter at Guest `/workflow-shared` without replacing `/workspace`, with Launch Binding transport for detached runners and conservative scope cleanup.
-- Project an actual Child `sessionFile` on the public structural delegation terminal response.
+## [0.65.1] - 2026-09-04
 
-### Fixed
-- Skip fallback models that are unavailable in the active registry, so shared agent configs still run where their primary model is available. Thanks to [@JPFrancoia](https://github.com/JPFrancoia) for #1147.
-- Sweep expired wait subscriptions armed by another session, so a record left behind by a session that never returns stops accumulating in the subscriptions directory. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1142.
-- Keep `mcp:<server>` direct tools available when pi-mcp-adapter cache identity includes a request-header command. Thanks to [@xz-dev](https://github.com/xz-dev) for #1141.
-- Fork-only: ignore a stale Pi extension context while emitting the advisory async process-terminal event. The durable terminal proof is already persisted; unrelated event-emission errors still surface. Keep the source annotation until upstream supplies an equivalent guard.
-- Fall back from an implicit `defaultContext: fork` to `fresh` when the parent session file or current leaf is not available yet, instead of failing the first launch. Explicit `context: "fork"` remains fail-fast. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #1137.
-- Preserve a child's file-only report when its output path also names the workflow summary output.
-- Keep concurrent async result promotion from deleting a newer payload or another promoter's published result. Thanks to [@albertgwo](https://github.com/albertgwo) for #1130.
-- Bound opaque tool-call IDs used by async active-run and result indexes, preventing provider-generated IDs longer than the filesystem component limit from aborting background launches with `ENAMETOOLONG`. Optional active-run aliases now fail open without losing the authoritative run marker. Thanks to [@hlstwizard](https://github.com/hlstwizard) for #1131.
-- Bound async result session and run path segments so long identities do not make `subagent_wait` fail with `ENAMETOOLONG`. Thanks to [@zhouatie](https://github.com/zhouatie) for #1135.
-- Preserve workflow child task output when neither the workflow nor child configures an output file (#1136).
+### Highlights
+- Background sessions stay alive until their work and result delivery finish.
+- Background runs work on Pi 0.85.0 without missing-package errors.
+- Custom-provider models and proxy connections work more reliably in background runs.
+- Parallel children keep separate session logs, even with a shared log directory.
+- Worktree cleanup preserves changes until a complete, usable patch has been saved.
 
 ### Changed
-- Keep `worktree: true` workflow children on the single-child path while preserving managed patch handoffs, and remove unused foreground chain/parallel execution and durable chain management surfaces.
-- Document scripted chaining as the supported workflow API, with migration examples for removed top-level chain/task inputs.
+- Clarify that switching execution modes after a failed run requires your approval (#1879).
+
+### Fixed
+- Accept configured model aliases returned by gateways without changing the requested model. Thanks to [@drudko-ias](https://github.com/drudko-ias) for #1897.
+- Hide the empty, unlimited async capacity summary in Fleet. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1892.
+- Fix missing-server import errors in Pi 0.85.0 background runs, including runs that load extensions.
+- Remove repeated metadata and reply instructions from supervisor request cards. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1893.
+- Stop foreground runs before contacting a provider when required tools are missing. Respect workflow async defaults and show each failure once. Thanks to [@youssefsiam38](https://github.com/youssefsiam38) for #1891.
+- Keep pi-web parent sessions alive while subagent work or completion delivery remains active. Thanks to [@vcing](https://github.com/vcing) for #1857.
+- Avoid unnecessary startup delays and preserve active locks when process IDs are reused. Thanks to [@ducaoya](https://github.com/ducaoya) for #1878.
+- Make extension-provided models available before starting child sessions, including on Pi versions without native provider queues. Thanks to [@kevinkirkup](https://github.com/kevinkirkup) for #1885.
+- Handle long or unusual workflow IDs without creating invalid file paths. Thanks to [@jstillwa](https://github.com/jstillwa) for #1875.
+- Avoid startup import errors when optional Pi packages are not installed beside the extension. Thanks to [@VladimirGVP](https://github.com/VladimirGVP) for #1860.
+- Use custom provider streams for task classification only when they match the selected model's API. Thanks to [@pwguler](https://github.com/pwguler) for #1874.
+- Give concurrent children separate session files under an explicit `sessionDir`. Thanks to [@dat9uy](https://github.com/dat9uy) for #1859 and #1858.
+- Honor proxy environment variables in detached background runs. Thanks to [@jasonrale](https://github.com/jasonrale) for #1867 and #1866.
+- Allow previously unavailable models to run once they reappear in the model registry. Thanks to [@x1prog](https://github.com/x1prog) for #1862.
+- Resolve Pi package imports correctly in detached runs, including subpath imports. Thanks to [@plopezlpz](https://github.com/plopezlpz) for #1871 and [@pwguler](https://github.com/pwguler) for #1880.
+- Initialize the theme before child extensions access `ctx.ui.theme`. Thanks to [@danielmarbach](https://github.com/danielmarbach) for #1865.
+- Save complete worktree patches, including binary changes, regardless of Git display settings. Validate them before removing worktrees. Thanks to [@jeanduplessis](https://github.com/jeanduplessis) for #1868.
+- Accept `acceptance: false` alongside `gate`, treating it as omitted.
+
+## [0.65.0] - 2026-09-04
+
+### Highlights
+- Subagents now run through native Pi sessions instead of spawning separate `pi` processes, making delegation simpler and less fragile.
+- Workflow status is easier to scan with compact lane summaries and clearer supervisor messages.
+- Model selection fails clearly when configured models are unavailable, instead of silently using a provider default.
+- Managed worktrees are safer and more flexible, with validated `baseRef` support and per-project nesting.
+- Background children can use provider-extension models reliably, including dynamically registered models such as router providers.
+
+### Added
+- Include sanitized model, provider, reason, and expiry details when no usable subagent model candidates remain. Thanks [@AlexKucera](https://github.com/AlexKucera) for #1841.
+- Allow managed worktrees to start from a validated `baseRef` instead of always using `HEAD`. Thanks [@jaudiger](https://github.com/jaudiger) for #1842.
+
+### Changed
+- Run subagents as native Pi `AgentSession`s instead of spawned `pi` CLI processes (#1844). Foreground children run in the parent process, and background children run in the detached runner.
+- Foreground children no longer load ambient extensions. Use background children for agents that need MCP tools or provider-extension models. Background children require Pi from the installed `@earendil-works/pi-coding-agent` package, not a standalone `pi` binary.
+- Rename package subpath `pi-subagents/pi-args` to `pi-subagents/child-tool-plan`; `PI_SUBAGENT_PI_BINARY` now applies only to Herdr project panes and the profile model probe.
+- Replace collapsed async workflow role summaries with a compact lane view while keeping full details available when expanded (#1827).
+- Add `contact_supervisor` to the bundled reviewer and scout tool allowlists without adding mutation tools (#1846).
+
+### Fixed
+- Drop only malformed persisted model-exclusion entries and rewrite the cleaned cache.
+- Stop live workflow children when a run-level stop targets an in-memory async workflow controller.
+- Fail closed when a fallback-only model configuration resolves no launch candidates. Thanks [@AdenosineTP](https://github.com/AdenosineTP) for #1853.
+- Resolve native child models after child extensions register provider models. Thanks [@mystery4f](https://github.com/mystery4f) for #1855.
+- Ignore stale authentication-related model exclusions after Pi's `auth.json` is refreshed, while preserving quota, rate-limit, overload, and model-unavailable exclusions. Thanks [@wesleyfei1](https://github.com/wesleyfei1) for #1835.
+- Show native supervisor requests and outbound replies as bounded TUI cards in parent sessions (#1845).
+- Suppress stale async supervisor-request notices after the native request has already been answered (#1838). Thanks [@VladimirGVP](https://github.com/VladimirGVP).
+- Flush async workflow result assembly after session replacement when every child is already terminal, without permitting stale-context launches (#1833). Thanks [@redcomet168](https://github.com/redcomet168).
+- Accept calendar/platform `claude --version` output during Claude Code adapter preflight while retaining required launch-flag validation. Thanks [@drouhard](https://github.com/drouhard).
+- Show passive local command availability for external CLI agents in capability listings without replacing launch preflight (#1829). Thanks [@drouhard](https://github.com/drouhard).
+- Nest native managed worktrees under per-project directories while preserving unsafe-location checks (#1831). Thanks [@moofone](https://github.com/moofone).
+
+## [0.64.0] - 2026-09-02
+
+### Highlights
+- Watchdog can now warn or block child launches before they start, based on role and model rules.
+- Watchdog reviews are easier to guide with safe diff access, reusable `WATCHDOG.md` instructions, and configurable child review cadence.
+- Watchdog findings are easier to see in parent results, completion notices, acceptance evidence, and Fleet.
+- Workflow status and async results are less noisy and more accurate.
+
+### Added
+- Add watchdog launch rules under `subagents.watchdog.rules`, with per-role model allow and deny globs that warn or block before a child starts.
+- Give watchdog reviewers a read-only `watchdog_diff` tool for session-start diffs, untracked paths, path narrowing, and stat summaries.
+- Run child watchdog reviews on a configurable cadence with `children.cadence` and `children.overrides.<agent>.cadence`.
+- Show child watchdog warnings in parent results, acceptance evidence, completion notices, and Fleet `wd:<n>` chips.
+- Load watchdog reviewer instructions from project and agent `WATCHDOG.md` files.
+
+### Changed
+- Reject unsupported watchdog settings that never took effect: `delivery`, `showDuringRun`, `syncBacklog`, `lateWarningPolicy`, `compactAtPercent`, `reviewRetryDelayMs`, `maxReviewFailures`, `asyncCompletion`, and `guidance.systemPromptPath`.
+- Remove watchdog auto-follow. Pi 0.84+ already continues after displayed boundary warnings, and repeated identical warnings now stop after `subagents.watchdog.stalemateRepeats`. The `autoFollow` settings block is now unknown.
+
+### Fixed
+- Keep advisory preflight checks out of runtime workflow rows and queued checklist counts (#1821). Thanks [@stekman08](https://github.com/stekman08).
+- Preserve effective thinking in completed async step results. Thanks to [@Nickonomic](https://github.com/Nickonomic) for #1823.
+- Forward workflow child control overrides through new and retained launches, and suppress idle needs-attention notices before the first assistant turn (#1817). Thanks [@rrocxela](https://github.com/rrocxela).
+
+## [0.63.0] - 2026-09-01
+
+### Highlights
+- Workflow progress is easier to scan in status, Fleet, and live widgets.
+- Additional agent folders can now be configured without copying definitions into one directory.
+- Worktrunk users get managed worktrees automatically, with native Git available as the fallback.
+- Fleet can jump straight into the selected child run's Herdr inspector.
+- Async runs clean up and report edge cases more reliably.
+
+### Added
+- Show workflow progress as stacked checklist summaries in status, Fleet, and live widget views (#1806).
+- Add configurable extra agent scan directories with one-segment wildcard expansion. Thanks to [@mystery4f](https://github.com/mystery4f) for #1801.
+- Make Worktrunk a first-class managed worktree provider, selected automatically when available with native Git as the fallback (#1800).
+- Let Fleet open the selected async child in its child-specific Herdr inspector. Thanks to [@stekman08](https://github.com/stekman08) for #1790.
+
+### Changed
+- Show workflow checklist phases first in collapsed views, while keeping child details available when expanded (#1810).
+
+### Fixed
+- Keep isolated test runs from writing agent definitions into an inherited `PI_CODING_AGENT_DIR`. Thanks to [@mapleluvr](https://github.com/mapleluvr) for #1809.
+- Prevent nested tool-availability diagnostics from failing an otherwise valid parent result. Thanks to [@robertvangor](https://github.com/robertvangor) for #1802.
+- Free async capacity correctly after workflows finish, even when saved step status is stale. Thanks to [@boggylp](https://github.com/boggylp) for #1804.
+- Make `subagents.agentOverrides.<name>` replace matching custom-agent frontmatter fields, consistently with builtin agents. Thanks to [@expoli](https://github.com/expoli) for #1796.
+- Strip the trailing Pi turn-timing footer from child output. Thanks to [@fkhawajagh](https://github.com/fkhawajagh) for #1792.
+- Keep inferred acceptance reports out of reviewer and read-only child prompts. Thanks to [@expoli](https://github.com/expoli) for #1797.
+- Preserve coordinated read-only intent when direct async children resume, and show captured structured output in completion and status evidence. Thanks to [@fkhawajagh](https://github.com/fkhawajagh) for #1788.
+- Keep macOS subagent tasks out of argv by delivering them through temporary files. Thanks to [@josephkallas](https://github.com/josephkallas) for #1793.
+
+## [0.62.0] - 2026-08-31
+
+### Highlights
+- Child agents can report completion evidence more cleanly and stay away from tools they should not use.
+- Session-only schedules keep personal scheduled work tied to the session that created it.
+- Async forked runs now start and resume in the working directory you requested.
+- Windows child launches are more reliable, with clearer errors when Pi cannot find a valid CLI.
+- External CLI and read-only recovery paths are sturdier when workers disappear or prompts include unusual line separators.
+
+### Added
+- Let native children with `outputSchema` include required acceptance evidence in the same `structured_output` call with `acceptance.report: "on"`; `acceptance.report: "off"` keeps fenced acceptance reports. Thanks [@mapleluvr](https://github.com/mapleluvr) for #1770.
+- Add per-agent `excludeTools` deny-lists that compose with Pi's ambient or explicit child tool selection. Thanks [@expoli](https://github.com/expoli) for #1776.
+- Add session-only durable schedules that only run in the session that created them. Thanks [@yangfeng20](https://github.com/yangfeng20) for #1777.
+
+### Fixed
+- Keep async forked runs in the requested child `cwd` when they start or resume. Thanks [@stekman08](https://github.com/stekman08) for #1785.
+- Accept JSON-encoded acceptance objects from model tool calls, while still failing clearly for malformed strings. Thanks [@mapleluvr](https://github.com/mapleluvr) for #1781.
+- Keep steer and follow-up receipt statuses separate from their redacted message previews (#1773).
+- Create async lifecycle sidecars before external CLI workers begin worktree changes, so disappeared runners are reported as failed runs. Thanks [@fkhawajagh](https://github.com/fkhawajagh) for #1764.
+- Preserve explicit read-only intent when escaped line separators surround no-edit wording. Thanks [@fkhawajagh](https://github.com/fkhawajagh) for #1765.
+- Launch child Pi processes through the resolved CLI JavaScript on Windows, and run JavaScript `PI_SUBAGENT_PI_BINARY` overrides with Node. Thanks [@caohuipeng](https://github.com/caohuipeng) for #1768.
+- Resolve the installed Pi CLI on Windows wrapper hosts from the forwarded package root, and report a clear error when no verified CLI can be found. Thanks [@lux032](https://github.com/lux032) for #1780.
+
+## [0.61.0] - 2026-08-31
+
+### Highlights
+- Subagent runs use less context and repeat less status text, so everyday delegation is cheaper and easier to scan.
+- Status, Fleet, widgets, RPC, and background-work views refresh with less duplicated work.
+- Async recovery is more reliable when active status files, child reports, or provider fallback attempts go wrong.
+- Workflow permissions are clearer with named workflow resources and `bg_wait` as the primary background wait tool.
+- Model listings now show effective models for discovered and runtime-registered agents.
+
+### Added
+- Add extension-owned named workflow resources so permission and policy extensions can distinguish trusted workflow resources from raw scripts. Thanks [@mathiasloh](https://github.com/mathiasloh) for #1751.
+- Add workflow-only `globalConcurrencyLimit` and `maxSubagentSpawnsPerRun` overrides for top-level `workflowScript` calls. Thanks [@RapierCraft](https://github.com/RapierCraft) for #1760.
+- Remove the deprecated compatibility wait alias; use `bg_wait` instead (#1729).
+
+### Changed
+- Show effective model mappings for discovered and runtime-registered subagents through management and `/subagents-models`. Thanks [@RapierCraft](https://github.com/RapierCraft) for #1732.
+- Trim default subagent prompt guidelines to five parent-facing entries while keeping advanced workflow details in the packaged guide. Thanks [@Ran-Xing](https://github.com/Ran-Xing) for #1746.
+- Reduce repeated heartbeat status updates during delegated runs while keeping foreground progress and complete terminal responses (#1739).
+- Clarify that `fallbackModels` handles provider/model timeouts but not run-level `timeoutMs` / `maxRuntimeMs` expiry. Thanks [@kaplan-shaked](https://github.com/kaplan-shaked) for #1745.
+- Pass requested session and timestamp context to background-work providers so they can avoid listing unrelated sessions while preserving strict validation (#1737).
+- Avoid repeated external-run display normalization during Fleet refresh while still validating externally replaced or mutated records (#1736).
+- Clarify that `oracle` and top-reasoning models are escalation tools, not routine defaults.
+- Serve broad RPC status requests from restored in-memory state when safe, while preserving targeted status and transcript behavior (#1735).
+
+### Fixed
+- Isolate corrupt active async status files during restoration so valid runs remain available and corrupt run artifacts are preserved. Thanks [@zhexulong](https://github.com/zhexulong) for #1756.
+- Reduce async widget update churn during running workflows by repainting animation ticks without reinstalling the widget and coalescing close status refreshes (#1726).
+- Avoid repeated staged workflow projection during widget rendering. Thanks [@kkkhs](https://github.com/kkkhs) for #1730.
+- Preserve durable file-only child reports and continue read-only workflow review after malformed acceptance metadata (#1724).
+- Preserve model origins across fallback and fork preparation, so eligible fallbacks work for unavailable configured primaries while invalid explicit models still fail closed. Thanks [@xz-dev](https://github.com/xz-dev) for #1747.
+- Stop hidden 125ms spinner redraws while keeping progress refreshes and one-second animation frames (#1747).
+
+## [0.60.0] - 2026-08-30
+
+### Highlights
+- Agent selection is easier with compact capability lists and structured capability details.
+- Async status views are calmer and show workflow progress with clearer grouping and labels.
+- Subagent guidance is clearer about when to work directly and when to orchestrate delegated planning, implementation, and review.
+- Windows and macOS runs avoid more distracting console flashes, delayed failures, and startup hangs.
+- Recovery paths preserve better diagnostics when child runs time out, fail early, or cannot provide requested output.
+
+### Added
+- Add `action: "list", capabilities: true` for compact prompt-free agent capability discovery. Thanks to [@peedrr](https://github.com/peedrr) for #1717.
+- Add structured `details.agentCapabilities` records so callers can select agents without parsing prose rows (#1720).
+
+### Changed
+- Show `runs.lanes(...)` workflows with active-stage focus and planned-stage progress in async status widgets (#1699).
+- Align foreground subagent result labels with async widget labels and disambiguate duplicate rows (#1697).
+- Render parallel subagent workflow groups as readable cards with nested agent rows (#1696).
+- Remove repeated one-child async widget status labels and compact progress echoes (#1695).
+- Tighten packaged subagent and Council Mode guidance for one-child launches, composed `workflowScript` runs, generic review validation, and private policy boundaries.
+- Clarify portable model-tier guidance for parent, worker, scout, reviewer, and critique subagents without requiring a specific provider.
+- Trim duplicated orchestration recipes from the packaged skill while keeping detailed policy and execution references in one place.
+- Clarify when the parent should work directly versus orchestrate delegated subagent work, including who owns decisions and publication (#1722).
+- Clarify `workflowScript` portability and `runs.host(...)` working-directory limits, including outer workflow `cwd` and trusted `cd ... && command` patterns (#1679).
+
+### Fixed
+- Treat malformed persisted async status states as partial, bound persisted workflow stage text, and fail closed when an explicit child-output path cannot be inspected before a run.
+- Surface recovery diagnostics for dirty timed-out children that miss requested reports, while keeping them fail-closed (#1713).
+- Keep retained-session resume runners from flashing console windows on Windows while preserving Unix background detachment. Thanks to [@Zethu5](https://github.com/Zethu5) for #1711.
+- Hide mutation-evidence Git subprocess windows on Windows to prevent visible console flashes or terminal tabs. Thanks to [@dnnkeeper](https://github.com/dnnkeeper) for #1706.
+- Deliver immediate async workflow terminal failures on macOS without requiring a later status refresh (#1700).
+- Skip untracked-file enumeration for watchdog signatures when the Git root is the user home or has no tracked files, avoiding startup and turn hangs in accidental large home repositories. Thanks to [@AluxesLAS](https://github.com/AluxesLAS) for #1693.
+- Reuse a fork-family prompt cache key for OpenAI-style forked subagent requests so sibling fork children keep cache affinity without pooling fresh children. Thanks to [@Shinkicast](https://github.com/Shinkicast) for #1682.
+- Show workflow child `[fresh]` and `[fork]` context labels in Fleet status rows alongside model and thinking badges.
+- Match pi-mcp-adapter direct-tool names when configured MCP server names contain hyphens. Thanks to [@unrelentingfox](https://github.com/unrelentingfox) for #1685.
+- Animate running FleetView glyphs from the wall clock and repaint unchanged running entries. Thanks to [@Pudgey](https://github.com/Pudgey) for #1688.
+
+## [0.59.0] - 2026-08-28
+
+### Highlights
+- Run host commands from workflow scripts with safer saved output and clearer command results.
+- Build sequential parallel workflows with `runs.lanes(...)`, launch preflight labels, and better retained-resume behavior.
+- See cleaner async status, child labels, and worktree handoff details without extra setup.
+- Recover more reliably from stale contexts, provider aborts, missing outputs, malformed MCP metadata, and Windows file locks.
+- Control live workflow children from more places, including non-TUI and RPC hosts.
+
+### Added
+- Add `runs.host(...)` command steps to `workflowScript`, with required timeouts, saved output, and status and receipt evidence (#1648).
+- Add CI and gate monitor rows that record monitor kind, terminal verdict, freshness, and report pointers in workflow status and receipts.
+- Persist workflow lane metadata in child status, receipts, and existing worktree handoff manifests, including display-only worktree paths and branches.
+- Add `runs.lanes(...)` for parallel sequential workflow stages with per-lane results and retained-resume support (#1633).
+- Add display-only `preflight` lane metadata for workflowScript launches, with coverage warnings and planned-lane rendering in launch, status, and live-card views.
+- Add a plan-only `worktree.cleanup` management action that records a cleanup plan without removing worktrees or branches.
+- Give every subagent child session a human-readable display name, and include it in result, progress, status, workflow, nested, and intercom payloads. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1615.
+- Add `/subagents-steer <run-id> [--child <child-id>] <message>` so non-TUI sessions and RPC hosts can steer live async runs. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1608.
+- Add explicit `allowNestedSubagents` agent authorization for nested fanout without replacing inherited tools or extensions. Thanks to [@tutu359](https://github.com/tutu359) for #1587.
+- Accept a child id on `/subagents-stop <run-id> <child-id>` so one child of a multi-child async run can be stopped without stopping the whole run. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1603.
+
+### Changed
+- Reduce noisy launch, status, output, settings, and worktree cleanup messages without changing behavior.
+- Include a direct resumable child id in missing workflow receipt guidance when retained status proves it is safe.
+- Clarify `workflowScript` contracts for retained resume keys and durable child output paths.
+- Record merge or supersession evidence in existing worktree handoff manifests and show cleanup eligibility without removing anything.
+- Show optional lane and work-item context in async status rows, including phase, gate, next action, output, run reference, and stale or blocked state.
+- Show workflow child labels and phases in async status progress while preserving stable workflow keys.
+- Remove assistant turn budgets, including hard termination, wrap-up prompt injection, and launch configuration.
+- Split internal launch, status, settlement, evidence, and direct-MCP planning code into smaller modules without changing public behavior.
+
+### Fixed
+- Match detached workflow completion by exact child identity, keep host gate rows in snapshots, and report missing host verdicts as inconclusive.
+- Replace explicit `runs.host(...)` output files atomically inside their verified directory, and retry transient Windows destination locks.
+- Reject malformed MCP direct-tool server and metadata-cache fields when JSON is loaded.
+- Preserve live composite child tool-call ids for `cursor-native`, so Cursor MCP results keep matching pending execs. Thanks to [@moofone](https://github.com/moofone) for #1677 and #1678.
+- Ignore stale cached UI contexts during background status refresh and session lifecycle cleanup (#1670).
+- Compact workflow preflight status in default TUI and status views while keeping full details available when expanded (#1668).
+- Give `runs.lanes(...)` stage-0 retained-resume validation actionable `runs.run(...)` guidance instead of a generic error (#1657).
+- Remove the remaining `lane:` prefix from operator-facing async status rows in the TUI (#1658).
+- Allow scheduled project roots shared through a registered Git worktree's `.pi` symlink while rejecting unrelated or unproven Git-layout escapes. Thanks to [@sususu98](https://github.com/sususu98) for #1656.
+- Include delegated child usage in subagent tool results and `/subagent-cost`, including completed async workflow children and parent compaction usage with persisted workflow-receipt recovery when needed (#1662, #1666). Thanks to [@Geraldo-Morais](https://github.com/Geraldo-Morais) for #1662 and [@jf88888](https://github.com/jf88888) for #1666.
+- Avoid false preflight mismatch warnings for generated `runs.lanes(...)` stage keys (#1649).
+- Accept long host tool-call ids in workflow child summaries, matching the existing 4,096-byte session id bound. Thanks to [@SudoKillMe](https://github.com/SudoKillMe) for #1653.
+- Keep an async `workflowScript` continuation live while an awaited child coordinates with its supervisor, so later sequential steps still run (#1634).
+- Stop stale extension and slash-command contexts from escaping during reload or session replacement.
+- Include saved workflow child output paths and inline previews in completion notices (#1629).
+- Format million-scale context limits as `1M` instead of `1000k` in live status displays.
+- Restore active workflow children under their workflow parent in Fleet Status after reload, while keeping unmatched shell rows visible.
+- Prefer loaded workspace context over repeated internal workflow keys in async TUI lane rows (#1619).
+- Accept path-like Pi session ids up to 4,096 characters when snapshotting background work. Thanks to [@dvishoot](https://github.com/dvishoot) for #1616.
+- Accept bare leaf model ids reported by provider drivers when verifying provider-qualified launch candidates. Thanks to [@lallenlowe](https://github.com/lallenlowe) for #1609.
+- Resume compaction-induced child aborts once when retained state is safe, and report the exact recovery blocker otherwise.
+- Report aborted or signalled no-output child runs with their terminal stop, stderr, or process signal before missing-output handoff diagnostics.
+- Apply `globalConcurrencyLimit` to `workflowScript` children launched through `runs.run` and `runs.all`, not only legacy multi-child runners. Thanks to [@mateominato](https://github.com/mateominato) for #1600.
+- Ignore nested `.pi` and `sync-backups` directories during agent discovery so stale backup definitions cannot become executable agents. Thanks to [@arlishansenn](https://github.com/arlishansenn) for #1596.
+- Let projects layer agent overrides by the active parent model provider without duplicating agent definitions. Thanks to [@arichiardi](https://github.com/arichiardi) for #1597.
+- Let operators configure the default `subagent_wait` window and report window expiry as non-error active work while preserving strict headless draining. Thanks to [@Shujakuinkuraudo](https://github.com/Shujakuinkuraudo) for #1591.
+- Degrade run status to the stored fan-out budget snapshot when persisted state is unavailable, instead of failing the entire run list. Thanks to [@qsgy-edge](https://github.com/qsgy-edge) for #1595.
+- Enforce MCP server `includeTools` and `excludeTools` policies for child direct-tool grants, including adapter-compatible glob matching. Thanks to [@Shujakuinkuraudo](https://github.com/Shujakuinkuraudo) for #1590.
+- Prevent Fleet prompt audit rendering from crashing on malformed non-string task payloads. Thanks to [@bengidev](https://github.com/bengidev) for #1586.
+- Resume a retained child session once after a provider or transport abort follows useful progress, without restarting the task or involving the parent model.
+- Retry unused fallback models after a provider reports a plain-text `500` or `internal server error`. Thanks to [@rafafortes](https://github.com/rafafortes) for #1642.
+- Mark missing required child handoffs with useful mutation evidence as partial needs-attention results.
+
+## [0.58.0] - 2026-08-27
+
+### Highlights
+- Launch MCP tools from more places, including runtime-registered servers, Pi package manifests, and Agent Plugin configs.
+- Keep agent context smaller by default, with an explicit `inheritGlobalContext` opt-in when a child needs the operator's global context.
+- Make detached and recovered workflow results more reliable, with clearer terminal handoffs and recovery actions.
+- Show better launch and status diagnostics for workspace, authority, context-window, and missing-directory problems.
+- Keep fast OpenAI-Codex launches compatible with priority service tier without losing provider request fields.
+
+### Added
+- Support direct MCP tool launches from runtime-registered servers.
+- Add `inheritGlobalContext` agent configuration so children can opt into the operator's global context file separately from repository context. Thanks to [@hknatm](https://github.com/hknatm) for #1560.
+- Add process-local event registration so independent Pi extensions can register runtime agents through the installed owner. Thanks to [@fmoda3](https://github.com/fmoda3) for #1533.
+- Add advisory launch preflight diagnostics for likely workspace scope and authority mismatches.
+- Document per-run thinking suffixes in model-facing subagent guidance. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1565.
+- Document unsupported native child options for external CLI agents in the subagent tool help, packaged guide, and packaged skill.
+
+### Changed
+- Agents now omit the operator's global context file by default, including existing agents with `inheritProjectContext: true`; set `inheritGlobalContext: true` to preserve the previous behavior. Thanks to [@hknatm](https://github.com/hknatm) for #1560.
+
+### Fixed
+- Fail explicitly requested models closed when a cached model exclusion is active, instead of silently selecting a fallback. Thanks to [@harpsychord](https://github.com/harpsychord) for #1556.
+- Preserve fast-mode provider request root fields when adding OpenAI's priority service tier. Thanks to [@nothingrotf](https://github.com/nothingrotf) for #1570.
+- Classify workflow budget and timeout stops as partial terminal outcomes while preserving settled child evidence. Thanks to [@yceachan](https://github.com/yceachan) for #1530.
+- Publish a deterministic terminal handoff with settled child evidence and keyed recovery actions when detached workflow lanes settle. Thanks to [@yceachan](https://github.com/yceachan) for #1530.
+- Resolve direct MCP tool selections from Pi package manifests and Agent Plugin configs. Thanks to [@fmoda3](https://github.com/fmoda3) for #1541.
+- Fail closed with a launch diagnostic when configured runtime-style MCP direct-tool selectors cannot be resolved.
+- Sync Herdr status after restoring active async jobs, so recovered work appears without waiting for another lifecycle event. Thanks to [@vicocamacho](https://github.com/vicocamacho) for #1553.
+- Show task intent and context-window use in compact in-progress async status rows.
+- Report deterministic settlement diagnostics when background children fail before required output handoff.
+- Auto-resume workflow children once after setup-phase aborts that produce zero usage, preserving the retained transcript instead of rerunning the whole task.
+- Finalize detached foreground worktree handoffs after terminal child completion, preserving captured changes before cleanup. Thanks to [@jpriverar](https://github.com/jpriverar) for #1562.
+- Fail native child launches before spawn when the requested local working directory is missing or not a directory, with the requested and resolved paths in the error.
+- Map report paths requested in workflow child tasks to the actual saved child output when workflow output routing overrides them.
+- Stop same-session workflows recovered after extension reload through the durable control channel.
+- Let agents declare extension mutation tools so real non-Git or untracked edits satisfy the implementation completion guard. Thanks to [@AlphaGodzilla](https://github.com/AlphaGodzilla) for #1532.
+- Deliver async results from an explicitly replaced predecessor session without accepting unrelated session results. Thanks to [@DresvyanskiyDenis](https://github.com/DresvyanskiyDenis) for #1531.
+- Avoid attributing assistant-issued workflow stops to the user.
+
+## [0.57.0] - 2026-08-26
+
+### Highlights
+- Run Codex, Claude Code, and Cursor Agent subagents with packaged read-only and writing profiles.
+- Validate workflow scripts before launch, and reuse workflow code from files with `workflowScriptPath`.
+- Resume, inspect, and recover workflow children more reliably after errors, compaction, or session reloads.
+- See clearer Fleet and status output, including task labels and live context-window usage.
+- Recover from more async, scheduling, discovery, model fallback, and Windows edge cases without losing useful run history.
+
+### Added
+- Add read-only and workspace-writing profiles for `codex-exec`, `claude-code`, and `cursor-agent`, with bounded result capture and opt-in smoke checks.
+- Add external one-shot runner support for bounded parser hooks and logs, environment allowlists, cached launch preflight, parser progress, and process cleanup.
+- Add compact external CLI capability and receipt metadata for adapter identity, artifacts, handoff mode, supervisor support, and resumability.
+- Add configured pruned fork sessions with budgeted transcript-overflow summaries, stable recovery refs, and private recovery sidecars.
+- Add offline `workflowScript` syntax and structural validation through the public subagent tool. Thanks to [@elecnix](https://github.com/elecnix) for #1462.
+- Add `workflowScriptPath` so workflows can be loaded from files for execution, validation, and schedules. Thanks to [@elecnix](https://github.com/elecnix) for #1464.
+- Add bounded workflow-child summaries to workflow results, status, receipts, and completion replay. Thanks to [@rochecompaan](https://github.com/rochecompaan) for #1453.
+- Add live context-window usage to status and Fleet views, separate from cumulative token spend. Thanks to [@nazzeDe](https://github.com/nazzeDe) for #1444.
+- Add active workflow task labels to compact status surfaces and Herdr pane metadata. Thanks to [@phoenixdam](https://github.com/phoenixdam) for #1459.
+- Add `modelExclusions.defaultTtlMs` for controlling how long model exclusions stay active, with launch diagnostics for skipped candidates. Thanks to [@mithyer](https://github.com/mithyer) for #1439 and #1438.
+- Add a package-internal one-use permit for one exact native child in a foreground `workflowScript`. Thanks to [@maroffo](https://github.com/maroffo) for #1494.
+
+### Fixed
+- Preserve agent frontmatter output defaults for prompt-template delegated leaves. Thanks to [@ashlineldridge](https://github.com/ashlineldridge) for #1521.
+- Preserve structured-output and related bounded child contract fields when foreground workflow children resume. Thanks to [@Livan-pro](https://github.com/Livan-pro) for #1460.
+- Preserve typed errors, partial output, transcript metadata, and artifact metadata when foreground workflow children resume. See #1513.
+- Keep inline workflow children resumable from their foreground runs without mistaking a missing async directory for lost state. Thanks to [@lancegui](https://github.com/lancegui) for #1442.
+- Make workflow validation and return serialization failures easier to recover from with no-child-launch diagnostics, portable rewrite guidance, workflow ids, and completed-child output references (#1432, #1434).
+- Clarify terminal keyed workflow-resume failures when `workflow-receipt.json` is unavailable, including direct child-run recovery from status and event logs (#1512).
+- Preserve bounded async child failure context after compaction, including missing file-only output, instead of leaving failed run summaries empty. See #1495.
+- Ignore stale child-settled events from retrying compaction attempts, so resumed children are not aborted before their replacement attempt can finish. See #1504.
+- Make async runs visible to exact status lookup as soon as launch succeeds, and deliver one completion when a runner dies before its normal status write. Thanks to [@rafafortes](https://github.com/rafafortes) for #1471 and [@VincentHanxiaoDu](https://github.com/VincentHanxiaoDu) for #1480.
+- Record explicit completed, failed, timed-out, stopped, and interrupted outcomes in run history. Thanks to [@rafafortes](https://github.com/rafafortes) for #1474.
+- Repair bounded dead async run candidates before retention classifies them, so stale run directories can be reclaimed without deleting ambiguous worktrees or branches. Thanks to [@rafafortes](https://github.com/rafafortes) for #1477.
+- Exclude completed one-shot schedules from the pending schedule limit without deleting their durable history. Thanks to [@rafafortes](https://github.com/rafafortes) for #1478.
+- Reclaim failed async capacity slots after a configurable abandoned timeout when the runner PID is gone, while keeping clear diagnostics for unknown process state. Thanks to [@rafafortes](https://github.com/rafafortes) for #1472.
+- Preserve parent model inheritance for workflow children when workflow setup reads session data before launch, and avoid carrying a stale live-session model into scheduled owners. Thanks to [@alexei-led](https://github.com/alexei-led) for #1489 and #1490.
+- Retry fallback models for transient provider connection failures. Thanks to [@genkikadomatsu](https://github.com/genkikadomatsu) for #1508.
+- Resolve the `advisor` builtin alias through the bundled `oracle` definition in model listings. Thanks to [@smileBeda](https://github.com/smileBeda) for #1502.
+- Follow symlinked directories during agent discovery without revisiting recursive links. Thanks to [@robsdudeson](https://github.com/robsdudeson) for #1505 and #1510.
+- Explain unknown-agent failures with the effective cwd and discovery inputs. Thanks to [@genkikadomatsu](https://github.com/genkikadomatsu) for #1511.
+- Resolve package subagents from bare HTTP(S) Git URLs stored in Pi settings. Thanks to [@trancikk](https://github.com/trancikk) for #1452.
+- Preview runtime-recorded workflow child sessions in Fleet and inspect without trusting sibling transcripts. Thanks to [@JHa13y](https://github.com/JHa13y) for #1441.
+- Distinguish same-agent parallel children in Fleet with their explicit task labels. Thanks to [@ljie-PI](https://github.com/ljie-PI) for #1487.
+- Preserve the local user identity and temporary-directory environment needed by authenticated Claude Code adapter runs.
+- Report child processes that exit during tool execution as mid-tool failures instead of cold starts, even when earlier assistant text exists. Thanks to [@cyzlmh](https://github.com/cyzlmh) for #1437.
+- Keep unaddressable legacy result aliases and overlong public result filenames from blocking canonical hashed or pending fallbacks. Thanks to [@LeonardBode](https://github.com/LeonardBode) for #1440.
+- Bypass repository fsmonitor hooks when collecting mutation evidence. Thanks to [@jpriverar](https://github.com/jpriverar) for #1497.
+- Avoid the fatal Node `ReadFileUtf8` retention path. Thanks to [@pgoodjohn](https://github.com/pgoodjohn) for #1501.
+- Base64-encode Herdr inspector session roots so `inspector.open` handles Windows PowerShell argument parsing correctly. Thanks to [@stavg91](https://github.com/stavg91) for #1499.
+- Keep async runner terminal event delivery from crashing the session when the captured extension context is stale after a session replacement or reload. Thanks to [@AdrianAcala](https://github.com/AdrianAcala) for #1485.
+- Reject non-string workflow-child summary identifiers when reading receipt metadata.
+
+## [0.56.0] - 2026-08-23
+
+### Highlights
+- Run allowlisted OpenAI-Codex subagents with opt-in `fast` mode when you want priority service tier.
+- Pass bounded extension metadata into native child launches without leaking that authority to external runners.
+- Workflow scripts are easier to read when child results are stringified or returned.
+- Completion guards now use safer tracked-file evidence, including large dirty files and interrupted runs.
+- Model verification is less fragile for provider-qualified and variant-tagged model ids.
+
+### Added
+- Add opt-in `fast: true` launches for allowlisted native OpenAI-Codex subagents, using OpenAI's priority service tier.
+- Add bounded namespaced extension bindings to child launch contracts. Thanks to [@FL03](https://github.com/FL03) for #1410.
+
+### Fixed
+- Render workflow child results as useful text when scripts stringify `runs.all` or awaited `runs.run` result objects.
+- Keep checked acceptance compatible with strict workflow child `outputSchema` results. Thanks to [@rtbe](https://github.com/rtbe) for #1406.
+- Use bounded tracked-file mutation evidence for implementation completion guards, including files that were already dirty when the child started. Thanks to [@rtbe](https://github.com/rtbe) for #1407.
+- Bind fast mode into launch contract provenance and keep large tracked-file mutation evidence precise.
+- Add timeout recovery summaries with changed tracked files, active child state, and session/artifact paths. Thanks to [@rtbe](https://github.com/rtbe) for #1409.
+- Fail closed when reviewer runs are interrupted or detached workflow children settle without persisted top-level continuation proof. Thanks to [@rtbe](https://github.com/rtbe) for #1408.
+- Stop flagging awaited `.then()` workflow chains as unawaited when a handler returns another child launch.
+- Preserve variant-tagged model ids during verification and fallback exclusion parsing. Thanks to [@rafafortes](https://github.com/rafafortes) for #1420.
+
+## [0.55.0] - 2026-08-23
+
+### Highlights
+- Stop a single stuck child in an async workflow without stopping the whole run.
+- Continue finished external jobs, like `gpt-pro` from [Surf](https://github.com/nicobailon/surf-cli/), with follow-up requests through `resume`.
+- Cap child thinking with `subagents.maxThinking` and set a preferred default provider for bare model ids.
+- Scripted workflow outputs now land in the run's managed artifact directory instead of the repository root.
+- Child launches fail fast with clear reasons when requested models or write tools are unavailable.
+
+### Added
+- Add `subagents.maxThinking` to enforce a thinking ceiling across native subagent launches. Thanks to [@alex-real14](https://github.com/alex-real14) for #1397.
+- Add `subagents.defaultProvider` and per-agent `defaultProvider` overrides so bare subagent model ids can prefer a configured provider. Thanks to [@swingtempo](https://github.com/swingtempo) for #1393.
+- Add external-job follow-ups through `subagent({ action: "resume" })` for completed provider jobs that expose `followUp(input)`, with duplicate request dedupe, durable parent-job lineage (#1381), and clearer errors when a follow-up cannot start.
+- Add child-scoped stop support and child stop observer events for async/workflow runs. Malformed child stop requests are rejected instead of widening to a run-level stop. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1367.
+- Create one passive Orca observer tab per top-level subagent call, with shared chain/parallel progress and project-local observer manifests. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #1360.
+- Count Herdr project panes in inline status and report compact Herdr pane title suffixes for active subagent work.
+- Let `agentOverrides` set or clear default `output` paths and `defaultReads`, while preserving explicit custom-agent frontmatter and preventing settings-derived values from being serialized into custom definitions. Thanks to [@mevatron](https://github.com/mevatron) for #1349.
+- Surface copyable `provider/id` model selectors from `{ action: "models" }` and point invalid model warnings at that discovery path. Thanks to [@lixinglong27](https://github.com/lixinglong27) for #1365.
+- Add bundled skill guidance for lightweight task profiles before subagent fanout. Thanks to [@srcKod](https://github.com/srcKod) for #1395.
+- Add delegated review guidance that separates evidence requirements from severity labels so first-pass reviews do not default to `blockers only`.
+
+### Fixed
+- Route relative `workflowScript` output paths through managed artifacts instead of creating report files in the repository root.
+- Keep the async widget spinner and elapsed timer moving while the parent is idle by routing animation ticks through the live widget rebuild path. Thanks to [@0xFlo](https://github.com/0xFlo) for #1390.
+- Slow async widget animation rerenders to 1 Hz so quiet running jobs do not repaint the full TUI at the liveness tick rate. Thanks to [@0xFlo](https://github.com/0xFlo) for #1376.
+- Fail a Pi child launch when the child reports a different provider/model than the resolved requested model. Thanks to [@zzzubair](https://github.com/zzzubair) for #1377.
+- Render detached workflow supervisor handoffs as paused/waiting and include workflow and child run ids in completion notifications.
+- Report implementation runs blocked by missing child tools as blocked mutation effects instead of no-edit completion guard failures.
+- Fail child launch attempts when the runtime lacks requested core write tools or an implementation worker has only read-only launch tools, including workflow children that inherit a read-only capability ceiling.
+- Let read-only reviewer acceptance rely on the parent-side staged-file check instead of requiring child-reported `noStagedFiles` evidence.
+- Run public single-child launches directly instead of wrapping them in a workflow, so async external-job agents do not show a completed workflow before the real provider job finishes.
+- Start omitted-`async` public external-runner single-child launches in the supported background mode, so package agents such as `gpt-pro` from [Surf](https://github.com/nicobailon/surf-cli/) do not fail as foreground requests.
+- Let workflow scripts await omitted-`async` external-runner children by launching them in the background internally and returning their terminal result.
+- Report helpful workflow errors when `runs.all(...)` results are read as keyed objects instead of ordered arrays. Thanks to [@ravshansbox](https://github.com/ravshansbox) for #1351.
+- Clarify that Council Mode can include installed external-runner advisors such as `gpt-pro` from [Surf](https://github.com/nicobailon/surf-cli/) when the `surf-cli` Pi extension has registered `surf-oracle`, with text JSON reports instead of `outputSchema`.
+
+## [0.54.0] - 2026-08-21
+
+### Highlights
+- Subagent model selection is more precise with per-agent restrictions and an `inherit` shortcut for the current parent model.
+- Package agents are easier to discover because list and detail output now shows where they come from and whether their external provider is ready.
+- Workflow runs are less fragile: tool-result backfill, context-overflow handling, resumed children, and permission asks now behave more predictably.
+- Child launches are lighter and safer because subagent processes avoid loading the parent extension graph and avoid unnecessary permission bridge setup.
+- Council Mode is easier to use from natural language and no longer requires invented advisor role labels.
+
+### Added
+- Add per-agent model restrictions and a current-parent `inherit` allow-list alias. Thanks to [@hieudmg](https://github.com/hieudmg) for #1328.
+
+### Changed
+- Show package names, versions, and external-job provider status in subagent list and detail output so package agents such as Surf's `gpt-pro` are easier to find and use.
+- Make scripted workflow helper support and stale-session recovery easier to see in `doctor` and the workflow guide (#1344).
+- Keep structured single-child execution receipts quieter by removing an internal conversion log from public workflow output.
+- Route natural-language requests for advisor councils, plan critique, cross-exam, or multiple model perspectives to the Council Mode protocol.
+- Simplify Council Mode advisor selection so model-based profiles provide the perspective and the question supplies the decision frame.
+
+### Fixed
+- Layer custom-agent user and project overrides without dropping user-only fields, while preserving project precedence. Thanks to [@jagaliano](https://github.com/jagaliano) for #1348.
+- Avoid child tool-call hangs by loading the external permission-system bridge only for explicit native permission rules and by failing stalled ask decisions closed. Thanks to [@moekyo](https://github.com/moekyo) for #1339.
+- Keep foreground workflow children from timing out after a tool result is backfilled without a separate execution-end event. Thanks to [@moekyo](https://github.com/moekyo) for #1339.
+- Mark completed foreground workflow children as resumable in keyed receipts when their persisted session file is available (#1335).
+- Avoid loading the parent extension graph in subagent child processes. Thanks to [@ccharname](https://github.com/ccharname) for #1330.
+- Stop model fallback on context-overflow failures and surface `contextOverflow`. Thanks to [@srcKod](https://github.com/srcKod) for #1323.
+- Stop empty slow result scans from spamming the session transcript. Thanks to [@afrodao2394](https://github.com/afrodao2394) for #1329.
+- Surface logical tool failures so subagent tool results backfill correctly. Thanks to [@abdwhb-png](https://github.com/abdwhb-png) for #1332 and [@moekyo](https://github.com/moekyo) for #1331.
+
+## [0.53.0] - 2026-08-20
+
+### Highlights
+- New `/council` mode helps with material decisions by running a small, bounded group of advisors and ending with a parent-written decision memo.
+- Pi extensions can now register runtime agents without writing user or project config.
+- Async workflows are easier to resume because completed children now have durable keyed receipts.
+- Model fallback is less noisy and less wasteful when a model fails or the prompt is too large.
+- Extension RPC hosts can safely inspect status, launch async work, steer children, and manage schedules.
+
+### Added
+- Carry full model registry metadata, including tiered pricing, into normalized model information. Thanks to [@srcKod](https://github.com/srcKod) for #1317.
+- Add runtime agent registration for Pi extensions, with name and alias collision checks. Thanks to [@fmoda3](https://github.com/fmoda3) for #1310.
+- Skip recently failed fallback models for a TTL-backed window during model selection. Thanks to [@srcKod](https://github.com/srcKod) for #1318.
+- Add a schedule-only `manage` method to extension RPC for list/show/history/pause/resume/run/delete, while rejecting unrelated management actions. Thanks to [@aboubakrine](https://github.com/aboubakrine) for #1319.
+- Let agent definitions and `agentOverrides` set a default `outputMode`, while
+  call-level output mode stays higher priority. Thanks to [@bbbRye007](https://github.com/bbbRye007) for #1305.
+- Add `context: "profile"` for workflow children that should use the selected
+  agent profile's declared context instead of the global default (#1303).
+- Add durable keyed async workflow receipts and resume-by-key selectors for
+  retained workflow children (#1302).
+- Add the `resultScanLogging` config to control result scan logging. Thanks to [@apoapostolov](https://github.com/apoapostolov) for #1293.
+- Add `/council` and `council-mode` for bounded advisor councils. Use it for material decisions that need multiple perspectives: the parent picks 2–3 advisors, collects independent reports, optionally runs one cross-exam pass, and writes the final decision memo. The package also documents model-based `council-*` profile examples (#1295).
+
+### Changed
+- Show bounded workflow progress in Fleet detail views while keeping workflow
+  parents as the only actionable async items (#1304).
+- Make `/council` easier to supervise with structured advisor contracts,
+  aggregate pass receipts, and visible pass checkpoints (#1301).
+- Reuse validated workflow launch fingerprints during `runs.all` batch setup, reducing focused fingerprint bookkeeping time by 48.7% (#1287).
+- Speed up recent terminal run history reads when the marker history is large and the requested limit is small.
+- Reduce repeated serialization while applying async status snapshot byte caps (#1288).
+
+### Fixed
+- Add tolerant `subagent_wait({ stopOnAttention: false })` blocking waits and scale idle attention defaults for higher-thinking children. Thanks to [@elecnix](https://github.com/elecnix) for #1315 and #1316.
+- Add a separate classifier for model context-overflow errors. Thanks to [@srcKod](https://github.com/srcKod) for #1312.
+- Normalize child result metadata before workflow return persistence (#1307).
+- Quote only confidently identified leading Windows executable paths in acceptance verification commands. Thanks to [@srcKod](https://github.com/srcKod) for #1294.
+- Keep forked subagent sessions out of top-level `pi -c` discovery by storing them under the parent session root. Thanks to [@xz-dev](https://github.com/xz-dev) for #1297.
+- Preserve `/council` advisor context defaults during fallback and cross-exam runs (#1298).
+
+## [0.52.1] - 2026-08-20
+
+### Highlights
+- Model setup errors now point to the right alternate provider when there is one clear match.
+- Surf's optional `gpt-pro` package agent has a smoother path to run ChatGPT Pro web jobs through the external-job bridge when the user is logged in.
+- External-job providers can add metadata or extra operations without breaking provider discovery.
+- The packaged skill now includes a concise guide for coordinating multiple tasks, worktrees, and repositories.
+- Pi extension worktrees now have clearer guidance to avoid duplicate auto-loaded tools and shortcuts.
+
+### Fixed
+- Suggest the unique alternate provider model when an explicit qualified subagent model is unavailable, without resolving across providers. Thanks to [@lallenlowe](https://github.com/lallenlowe) for #1280.
+- Accept extra fields on registered external-job providers, such as `kind`, `wakeChannels`, or additional operations. This keeps integrations such as Surf's `gpt-pro` package agent from breaking provider discovery as they add browser-backed job metadata, while job payload validation stays strict.
+
+### Changed
+- Add a pi-subagents reference for coordinating multiple tasks, worktrees, and repositories, including guidance for keeping Pi extension worktrees outside auto-discovered extension directories.
+
+## [0.52.0] - 2026-08-19
+
+### Highlights
+- Async workflows are much harder to break mid-flight: a transient status-file lock, a stalled child, or a paused supervisor hand-off no longer fails or loses an otherwise healthy run.
+- Hosts can now inspect a running or completed async child on demand — task, recent transcript, and final output — without spending a model turn, and that output stays available after delivery.
+- macOS and FreeBSD sandboxes stop warning about setuid `/bin/ps`, and Windows stops flashing console windows during busy runs.
+- Gateway and proxy models work better: children can inherit the parent's session model, and Hugging Face-style `owner/name` model ids resolve correctly.
+
+### Added
+- Add `/subagents-inspect-rpc`, a host-facing bridge command that answers on-demand async child inspection requests with a correlated, bounded `PI_SUBAGENT_INSPECT_JSON:` widget payload (task, transcript window, final output), so RPC hosts can inspect children without a model turn while the live status feed stays small. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #1254.
+
+### Changed
+- Guide oracle plan and design advice through a short same-session consultation when a material tradeoff remains, while keeping the parent as final decision-maker (#1245).
+- Improve bundled role and parent prompts for source-first discovery in noisy codebases (#1247).
+- Make Surf's `gpt-pro` agent an optional package integration instead of a pi-subagents builtin. If you disabled the old builtin workaround, remove `agentOverrides.gpt-pro.disabled` before using Surf's package agent. Thanks to [@binhex](https://github.com/binhex) for #1256.
+
+### Fixed
+- Stop spawning setuid `/bin/ps` for process start identity on macOS and FreeBSD. Sandboxes such as nono no longer report `forbidden-exec-sugid` from session leases, retention locks, external-job claims, or mission state. Those platforms stay fail-closed without pid-reuse detection. Thanks to [@jdumas](https://github.com/jdumas) for #1273.
+- Stop a transient lock on `status.json` (seen on Windows) from failing an already-completed workflow child and aborting its still-running siblings. Status updates after launch now degrade to a `subagent.workflow.status_write_failed` event instead of failing the run, and a throwing `onTrace` host callback can no longer reject a child promise. Follow-up to #1143. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1272.
+- Keep a still-paused workflow result when reconcile republishes updated child output during paused delivery, so a same-state revision is not overwritten or deleted as the old payload.
+- Persist async terminal `status.json` before publishing the result file, so observers cannot see a completed result while the run still looks `running`.
+- Stop Windows opening a console window for each helper process (Git, `gh`, PowerShell, `npm root -g`) spawned during a run, which made a busy run disruptive to work alongside. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1274.
+- Keep completed inspect RPC output available from the durable completion replay after result delivery consumes its one-shot payload, including per-child inline result tails (#1254).
+- After a workflow child detaches for supervisor coordination, clear attention once the reply is delivered, keep `subagent_wait` blocked until the child exits, and reconcile the paused workflow when that child completes — even after the paused payload was already delivered. A timed-out workflow can also resume from its persisted child session when the workflow dir has no recovery descriptor. Thanks to [@skystar567](https://github.com/skystar567) for #1263.
+- Wake the idle parent when an async workflow child needs attention, and persist that control event on the enclosing workflow. Status already showed the stall; the parent notice did not. Thanks to [@Yibo-Zhang](https://github.com/Yibo-Zhang) for #1266.
+- Resolve Hugging Face-style `owner/name` model ids against the registry instead of treating every slash as `provider/id`. Fully qualified `huggingface/owner/name` still wins, and a first path segment that matches a registered provider still means `provider/id`. Thanks to [@mr-brobot](https://github.com/mr-brobot) for #1264.
+- Keep public structured single-child calls synchronous when `asyncByDefault:false` and `async` is omitted. Thanks to [@Nofuture123](https://github.com/Nofuture123) for #1257.
+- Trust the running parent session model when no model is configured, so gateway and proxy parent models can launch children outside the host registry. Thanks to [@Nofuture123](https://github.com/Nofuture123) for #1258.
+- Isolate colliding inherited workflow child output defaults while preserving explicit output collision checks. Thanks to [@Reverier-Xu](https://github.com/Reverier-Xu) for #1253.
+- Show a scheduled run's completion and name the schedule that produced it, so scheduled work no longer finishes silently in a session that cannot attribute it. Thanks to [@albertgwo](https://github.com/albertgwo) for #1246.
+- Show resume-first guidance for failed async runs only when a matching recovery descriptor exists, so missing recovery data no longer points users to a resume command that cannot work. Thanks to [@graadient](https://github.com/graadient) for #1241.
+- Keep bundled agent discovery stable across hot package updates, so long-running sessions do not parse newer bundled agent files with older loaded code. Thanks to [@graadient](https://github.com/graadient) for #1242.
+- Resolve relative extension paths against the defining agent file, so portable agent definitions load child extensions from the declared location. Thanks to [@tayiorbeii](https://github.com/tayiorbeii) for #1249.
+
+## [0.51.0] - 2026-08-18
+
+### Highlights
+- Workflow orchestration is easier to control with stable-key steering, clearer fanout guidance, and a supported external-job runner path.
+- Async runs are harder to lose when storage is full, file access is temporarily denied, identifiers are too long, or multiple Pi windows share one session.
+- macOS reloads and idle sessions do less fragile filesystem watching, which avoids reload hangs without adding always-on work.
+- Herdr and Fleet are less disruptive: panes stay in the background by default, trusted transcripts open cleanly, and live workflow children steer through the right route.
+- The workflow API is cleaner: scripted workflows are the supported path, and removed legacy chain surfaces now have direct migration guidance.
+
+### Added
+- Add stable-key `runs.steer` to `workflowScript`, with routing for foreground and async children, structured receipts, trace entries, and checks for unawaited calls (#1186).
+- Add `runner.type: external-job`, the exported provider bridge, the Surf GPT Pro `gpt-pro` profile, and docs for external advisor data boundaries (#1189).
+- Add `defaultSubagentContext: "fork"` for launches that do not set an explicit context (#1161).
+- Allow `defaultSubagentContext: "fresh"` to override agent fork defaults for launches that do not set an explicit context.
+- Add `PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS` so hosts can cap filesystem retry waits. Unset by default. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1143.
+
+### Changed
+- Document rolling `workflowScript` fanout with `runs.run`, `Promise.race`, `runs.steer`, and `Promise.all` (#1187).
+- Document scripted chaining as the supported workflow API, with migration examples for removed top-level chain and task inputs.
+- Clarify `workflowScript` fanout guidance: use awaited `runs.all` for ordinary parallel work, and use stored `runs.run` promises only for fully observed advanced rolling fanout (#1229, #1230).
+- Clarify that async workflows do not have inline `live-card` projection (#1229, #1230).
+- Describe `async:false` as a blocking parent wait, not a UI or foreground-only mode.
+- Clarify that subagent reviews and gates should stay async unless the parent must block until completion.
 - Document that a host's session lifetime owns completion wakes, and how to key an idle check on live run state rather than parent activity. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1144.
+- Register the default `subagent` tool prompt as split metadata with a short description, `promptSnippet`, and `promptGuidelines`, while keeping explicit `full`, `compact`, and `custom` description modes.
+- Keep `worktree: true` workflow children on the single-child path while preserving managed patch handoffs.
+
+### Removed
+- Remove unused foreground chain and parallel execution and durable chain management surfaces.
 - Remove legacy subagent tool compatibility fields for append-step control, schedule aliases, async recovery metadata, and string mission goals.
 - Remove chain approval checkpoint steps and the `approve-checkpoint` / `reject-checkpoint` controls.
-- Identify this fork snapshot as `pi-subagents@0.50.0+sid.2` on upstream `0.50.0` / `a14687b38761ba8e2d0fb41563401d0db12ec465`.
-- Clarify that subagent reviews and gates should stay async unless foreground behavior is the actual requirement.
 - Remove `prompts.render` from `workflowScript`; pass explicit task text to `runs.run` or use `/prompt-workflow` for reusable prompt templates.
+
+### Fixed
+- Avoid Darwin reload hangs by disabling idle native filesystem watchers and using demand-gated delivery for live results, supervisor messages, controls, and steering. Thanks to [@youlikemodernart](https://github.com/youlikemodernart) for #1220.
+- Bound async result session, run, active-run, and result-index path segments so long provider IDs do not break launches or waits with `ENAMETOOLONG`. Thanks to [@hlstwizard](https://github.com/hlstwizard) for #1131 and [@zhouatie](https://github.com/zhouatie) for #1135.
+- Hash result-index session segments that look like Windows paths or file names, keep reading previous URI-encoded keys, and treat `EPERM` and `EACCES` as empty scans. Thanks to [@apoapostolov](https://github.com/apoapostolov) for #1211.
+- Sanitize foreground workflow output path segments derived from provider run IDs, so Windows launches do not fail when tool-call IDs contain path-invalid characters. Thanks to [@maxime-louward-shift](https://github.com/maxime-louward-shift) for #1235.
+- Keep async status and result persistence retrying after temporary `ENOSPC`, quota, or file-descriptor exhaustion errors. Thanks to [@ahmadaccino](https://github.com/ahmadaccino) for #1227.
+- Route async completion notifications and cleanup only to the parent Pi process that launched the run, so concurrent windows sharing one session file cannot consume each other's results. Thanks to [@wangjianming](https://github.com/wangjianming) for #1225.
+- Keep extension reload cleanup scoped to the replaced session runtime, so concurrent Pi sessions in one process do not remove each other's subscriptions or parent-session identity. Thanks to [@ryanbbrown](https://github.com/ryanbbrown) for #1222.
+- Stop failing child runs when an explicit allowlist names `contact_supervisor` without the legacy `intercom` companion. A lone `intercom` entry still requires a real external provider. Thanks to [@MingTeer](https://github.com/MingTeer) for #1207.
+- Add explicit `isolation: "none"` for schema-driven workflows without Git worktree setup, while keeping strict `isolation: "worktree"` behavior. Thanks to [@tlsneo](https://github.com/tlsneo) for #1203.
+- Fail closed when an existing external-job `status.json` is unreadable or malformed, including an invalid `steps` shape.
+- Skip malformed agent definitions during discovery so valid agents still list and launch, while showing configuration errors in management diagnostics (#1200).
+- Resolve `/subagents-generate-profiles` provider probes through the shared Pi executable resolver so configured and Windows-specific Pi commands work. Thanks to [@Wumpf](https://github.com/Wumpf) for #1199.
+- Resolve the workflowScript parser from pi-subagents instead of the caller's working directory, so workflows start in projects that do not install Acorn. Thanks to [@xz-dev](https://github.com/xz-dev) for #1214, following up #1190.
+- Keep workflowScript child-launch tracking working on Bun-built Pi without a hard dependency on V8 promise hooks. Thanks to [@rochecompaan](https://github.com/rochecompaan) for #1158 and [@rholak](https://github.com/rholak) for the version-window diagnosis.
+- Treat provider subscription usage-limit errors as retryable model failures so `fallbackModels` can continue to the next configured model. Thanks to [@dwizzle204](https://github.com/dwizzle204) for #1215.
+- Skip fallback models that are unavailable in the active registry, so shared agent configs still run where their primary model is available. Thanks to [@JPFrancoia](https://github.com/JPFrancoia) for #1147.
+- Preserve workflow async session roots for Herdr inspectors so workflow runs open with the same trusted session-root context as standalone runs. Thanks to [@hank-warren](https://github.com/hank-warren) for #1219.
+- Keep Herdr project and inspector panes in the background by default, and move focus only when callers set `focus: true`. The FleetView inspect key still focuses the pane it opens. Thanks to [@boggylp](https://github.com/boggylp) for #1226.
+- Show FleetView transcript fallbacks for trusted session roots instead of warning about an untrusted session file. Thanks to [@aliceisjustplaying](https://github.com/aliceisjustplaying) for #1154.
+- Route Fleet inspector steering for live in-process workflow children through their foreground routes instead of the detached async queue. Thanks to [@ViktorBarzin](https://github.com/ViktorBarzin) for #1218 and #1216.
+- Serialize same-worktree Orca progress-tab creation so numbered tabs appear left to right in sequence. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #1196.
+- Bound repeated async-state queries to active, exact-id, and recent-terminal indexes instead of scanning the full async history (#1162).
+- Move retention directory discovery to a read-only worker so full scans do not block the extension event loop (#1188).
+- Reclaim proven-safe async run and orphan result state after 30 days in bounded, locked cleanup passes with rename-first tombstones (#1163).
+- Sweep expired wait subscriptions armed by another session, so stale records stop accumulating in the subscriptions directory. Thanks to [@MarcusNeufeldt](https://github.com/MarcusNeufeldt) for #1142.
+- Restore and list schedules after their project directory is deleted, and skip orphan schedule directories without letting create reuse stale state. Thanks to [@ELA718](https://github.com/ELA718) for #1171 and [@colinb4987](https://github.com/colinb4987) for #1167.
+- Fall back from an implicit `defaultContext: fork` to `fresh` when the parent session file or current leaf is not available yet. Explicit `context: "fork"` remains fail-fast. Thanks to [@hyein-cbio](https://github.com/hyein-cbio) for #1137.
+- Keep retained workflow children resumable when their managed worktree cwd is preserved in the handoff manifest (#1172).
+- Preserve workflow child task output when neither the workflow nor child configures an output file (#1136).
+- Preserve a child's file-only report when its output path also names the workflow summary output.
+- Keep concurrent async result promotion from deleting a newer payload or another promoter's published result. Thanks to [@albertgwo](https://github.com/albertgwo) for #1130.
+- Keep `mcp:<server>` direct tools available when pi-mcp-adapter cache identity includes a request-header command. Thanks to [@xz-dev](https://github.com/xz-dev) for #1141.
+- Isolate test async state from the user temp root and write each missing-mission sync diagnostic only once (#1164, #1165).
+- Keep structured delegation integration coverage active when the test process inherits a subagent-child environment marker.
 
 ## [0.50.0] - 2026-08-15
 

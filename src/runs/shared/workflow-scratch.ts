@@ -25,13 +25,14 @@
  * Fork sync: this fork owns Workflow Scratch Scope, Launch Binding, and the
  * private Child Mount Adapter. Remove this module only when upstream provides
  * the same scoped authority, detached transport, and conservative cleanup.
- * Recheck foreground, async runner, and buildPiArgs wiring on every upstream sync.
+ * Recheck workflow interpretation, native child launch, and detached runner wiring on every upstream sync.
  */
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runWorkflowScript, type RunWorkflowScriptOptions, type WorkflowScriptResult } from "../../workflows/scripted-workflow.ts";
 
 /** Host-only env field that projects a proven Launch Binding into one Child spawn. */
 export const WORKFLOW_SCRATCH_ROOT_ENV = "SUBAGENTS_WORKFLOW_SCRATCH_ROOT" as const;
@@ -221,7 +222,7 @@ export function getActiveWorkflowScratchLaunchEnv(): Record<string, string> | un
 	return binding ? { [WORKFLOW_SCRATCH_ROOT_ENV]: binding.hostRoot } : undefined;
 }
 
-/** Whether buildPiArgs must inject the private Child Mount Adapter. */
+/** Whether native child launch has a binding for the private Mount Adapter. */
 export function shouldInjectWorkflowScratchMountAdapter(): boolean {
 	return getActiveWorkflowScratchLaunchBinding() !== undefined;
 }
@@ -264,6 +265,25 @@ export async function withWorkflowScratchScope<T>(
 			closeWorkflowScratchScope(scope);
 		}
 	});
+}
+
+/** Wrap the upstream workflow interpreter without changing its public parameters. */
+export function runWorkflowScriptWithScratch(options: RunWorkflowScriptOptions): Promise<WorkflowScriptResult> {
+	return withWorkflowScratchScope(async () => runWorkflowScript({
+		...options,
+		launch: async (...args) => {
+			const settle = trackWorkflowScratchLaunch();
+			// A detached launch can outlive the interpreter, even if launch later fails.
+			if (args[1].async === true) disableWorkflowScratchCleanup();
+			try {
+				const result = await options.launch(...args);
+				if (result.detached || result.results?.some((child) => child.detached)) disableWorkflowScratchCleanup();
+				return result;
+			} finally {
+				settle();
+			}
+		},
+	}));
 }
 
 /**

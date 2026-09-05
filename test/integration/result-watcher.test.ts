@@ -1,22 +1,28 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
+import fsDefault, * as fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { buildCompletionKey } from "../../src/runs/background/completion-dedupe.ts";
 import { createResultWatcher as createRawResultWatcher } from "../../src/runs/background/result-watcher.ts";
+import { createResultDeliveryOwnership } from "../../src/runs/background/result-delivery-ownership.ts";
 import { writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
+import { encodeIndexSegment, MAX_INDEX_SEGMENT_BYTES } from "../../src/runs/background/index-segment.ts";
 import { createScheduledRunManager, scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
 import { prepareMissionLaunch, writeMissionAsyncBinding } from "../../src/missions/lifecycle.ts";
 import { readMission, updateMission } from "../../src/missions/store.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import type { SubagentState } from "../../src/shared/types.ts";
 
+const COMPLETION_OWNER_ID = "completion-owner-default";
+
 function createState(): SubagentState {
 	return {
 		baseCwd: "/repo",
 		currentSessionId: null,
+		completionOwnerId: COMPLETION_OWNER_ID,
 		asyncJobs: new Map(),
 		foregroundControls: new Map(),
 		lastForegroundControlId: null,
@@ -40,11 +46,11 @@ function createResultWatcher(
 	completionTtlMs: Parameters<typeof createRawResultWatcher>[3],
 	deps: Parameters<typeof createRawResultWatcher>[4] = {},
 ): ReturnType<typeof createRawResultWatcher> {
-	return createRawResultWatcher(pi, state, resultsDir, completionTtlMs, { coalesceDelayMs: 0, ...deps });
+	return createRawResultWatcher(pi, state, resultsDir, completionTtlMs, { platform: "linux", coalesceDelayMs: 0, ...deps });
 }
 
 function writeIndexedResult(filePath: string, data: Record<string, unknown>): void {
-	writeAsyncResultFile(filePath, data);
+	writeAsyncResultFile(filePath, { completionOwnerId: COMPLETION_OWNER_ID, ...data });
 }
 
 function pendingResultPath(resultsDir: string, sessionId: string, runId: string): string {
@@ -61,6 +67,70 @@ async function waitForPredicate(predicate: () => boolean, timeoutMs = 2_500): Pr
 }
 
 describe("result watcher", () => {
+	it("does not create Darwin native watchers or idle timers", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-idle-"));
+		try {
+			let watchCalls = 0;
+			const intervals: number[] = [];
+			const state = createState();
+			state.currentSessionId = "session-1";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				platform: "darwin",
+				hasDeliveryDemand: () => false,
+				fs: { ...fs, watch: (() => { watchCalls += 1; throw new Error("Darwin must not use fs.watch."); }) as typeof fs.watch },
+				timers: {
+					setTimeout,
+					clearTimeout,
+					setInterval: ((_handler: () => void, delay?: number) => { intervals.push(delay ?? 0); return { unref() {} } as NodeJS.Timeout; }) as typeof setInterval,
+					clearInterval,
+				},
+			});
+			try {
+				watcher.startResultWatcher();
+			} finally {
+				watcher.stopResultWatcher();
+			}
+
+			assert.equal(watchCalls, 0);
+			assert.deepEqual(intervals, []);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("uses demand-gated Darwin polling for result delivery", () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-darwin-demand-"));
+		try {
+			let demand = true;
+			let poll: (() => void) | undefined;
+			let cleared = false;
+			const state = createState();
+			state.currentSessionId = "session-1";
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				platform: "darwin",
+				hasDeliveryDemand: () => demand,
+				fs: { ...fs, watch: (() => { throw new Error("Darwin must not use fs.watch."); }) as typeof fs.watch },
+				timers: {
+					setTimeout,
+					clearTimeout,
+					setInterval: ((handler: () => void, delay?: number) => { assert.equal(delay, 3000); poll = handler; return { unref() {} } as NodeJS.Timeout; }) as typeof setInterval,
+					clearInterval: (() => { cleared = true; }) as typeof clearInterval,
+				},
+			});
+			try {
+				watcher.startResultWatcher();
+				assert.equal(typeof poll, "function");
+				demand = false;
+				poll?.();
+				assert.equal(cleared, true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("processes deferred session-scoped results after session identity is restored", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-session-"));
 		try {
@@ -104,6 +174,43 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("hands predecessor results to the replacement session without widening ownership", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-transition-"));
+		try {
+			const state = createState();
+			state.currentSessionId = "session-old";
+			const ownership = createResultDeliveryOwnership(state);
+			const delivered: string[] = [];
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				deliverIntercomResults: false,
+				ownership,
+				notifier: { async deliver(result) { delivered.push(result.id!); return true; } },
+			});
+			try {
+				watcher.startResultWatcher();
+				assert.equal(ownership.claimPredecessor("session-old", "session-old"), true);
+				state.currentSessionId = "session-new";
+				watcher.transitionResultDelivery();
+				writeIndexedResult(path.join(resultsDir, "old-run.json"), { id: "old-run", sessionId: "session-old", success: true, summary: "old" });
+				writeIndexedResult(path.join(resultsDir, "new-run.json"), { id: "new-run", sessionId: "session-new", success: true, summary: "new" });
+				writeIndexedResult(path.join(resultsDir, "foreign-run.json"), { id: "foreign-run", sessionId: "session-foreign", success: true, summary: "foreign" });
+				writeAsyncResultFile(path.join(resultsDir, "wrong-owner.json"), { id: "wrong-owner", sessionId: "session-old", completionOwnerId: "other-owner", success: true, summary: "wrong" });
+
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => delivered.length === 2), true);
+				assert.deepEqual(delivered.sort(), ["new-run", "old-run"]);
+				assert.equal(fs.existsSync(path.join(resultsDir, "old-run.json")), false);
+				assert.equal(fs.existsSync(path.join(resultsDir, "new-run.json")), false);
+				assert.equal(fs.existsSync(path.join(resultsDir, "foreign-run.json")), true);
+				assert.equal(fs.existsSync(path.join(resultsDir, "wrong-owner.json")), true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("includes scheduled observer ids while priming current-session results", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-current-prime-"));
 		try {
@@ -141,7 +248,7 @@ describe("result watcher", () => {
 				on() { return fakeWatcher; },
 				close() {},
 				unref() {},
-			} as fs.FSWatcher;
+			} as unknown as fs.FSWatcher;
 			const writeResult = (id: string, sessionId: string) => {
 				writeIndexedResult(path.join(resultsDir, `${id}.json`), {
 					id,
@@ -179,11 +286,11 @@ describe("result watcher", () => {
 				timers: {
 					setTimeout,
 					clearTimeout,
-					setInterval(handler: () => void, delay?: number) {
+					setInterval: ((handler: () => void, delay?: number) => {
 						safetyScan = handler;
 						safetyScanIntervalMs = delay;
 						return { unref() {} } as NodeJS.Timeout;
-					},
+					}) as typeof setInterval,
 					clearInterval() { safetyScan = undefined; },
 				},
 			});
@@ -285,6 +392,82 @@ describe("result watcher", () => {
 			assert.ok(child?.artifactPaths.includes(outputPath));
 			assert.ok(child?.artifactPaths.includes(path.join(asyncDir, "status.json")));
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("observes a hash-only mission result once when its public alias is unaddressable", async (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-mission-enametoolong-"));
+		const resultsDir = path.join(root, "results");
+		const project = path.join(root, "project");
+		const asyncDir = path.join(root, "async-child");
+		fs.mkdirSync(resultsDir, { recursive: true });
+		fs.mkdirSync(project, { recursive: true });
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const originalError = console.error;
+		const errors: unknown[][] = [];
+		try {
+			const runId = `mission-${"x".repeat(250)}`;
+			const publicResultPath = path.join(resultsDir, `${runId}.json`);
+			assert.ok(Buffer.byteLength(`${runId}.json`, "utf-8") > MAX_INDEX_SEGMENT_BYTES);
+			const originalRenameSync = fsDefault.renameSync;
+			const nameTooLong = new Error("public result alias is too long") as NodeJS.ErrnoException;
+			nameTooLong.code = "ENAMETOOLONG";
+			t.mock.method(fsDefault, "renameSync", ((source: fs.PathLike, destination: fs.PathLike) => {
+				if (String(destination) === publicResultPath) throw nameTooLong;
+				return originalRenameSync(source, destination);
+			}) as typeof fsDefault.renameSync);
+			syncBuiltinESMExports();
+			const binding = prepareMissionLaunch({
+				params: { mission: { title: "Long result mission" }, task: "Run async child" },
+				projectRoot: project,
+				config: { directory: path.join(root, "missions"), globalIndexDir: path.join(root, "global-index") },
+				ownerSessionId: "session-owner",
+			});
+			assert.ok(binding);
+			writeMissionAsyncBinding(asyncDir, binding);
+			console.error = (...args: unknown[]) => { errors.push(args); };
+			writeIndexedResult(publicResultPath, {
+				id: runId,
+				runId,
+				sessionId: "session-owner",
+				asyncDir,
+				state: "complete",
+				success: true,
+				summary: "Long mission result completed",
+			});
+			const pendingPath = path.join(resultsDir, "result-pending", encodeIndexSegment("session-owner"), `${encodeIndexSegment(runId, MAX_INDEX_SEGMENT_BYTES - Buffer.byteLength(".json"))}.json`);
+			assert.equal(fs.existsSync(pendingPath), true);
+			const state = createState();
+			state.currentSessionId = "different-session";
+			let parsed = 0;
+			let observed = 0;
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				parseResult(raw) {
+					parsed += 1;
+					return JSON.parse(raw);
+				},
+				observeCompletion() { observed += 1; },
+			});
+			try {
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => observed === 1), true);
+				watcher.primeExistingResults();
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			} finally {
+				watcher.stopResultWatcher();
+			}
+
+			assert.equal(parsed, 1);
+			assert.equal(observed, 1);
+			assert.equal(fs.existsSync(pendingPath), true);
+			assert.equal((JSON.parse(fs.readFileSync(pendingPath, "utf-8")) as { notificationDeliveredAt?: unknown }).notificationDeliveredAt, undefined);
+			assert.equal(readMission(binding.location, binding.missionId).runs.some((run) => run.runId === runId), true);
+			assert.equal(errors.some((entry) => /Failed to (?:promote|inspect|process).*result/i.test(String(entry[0] ?? ""))), false);
+		} finally {
+			console.error = originalError;
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
@@ -448,6 +631,7 @@ describe("result watcher", () => {
 				id: "pending-run",
 				runId: "pending-run",
 				sessionId: "session-current",
+				completionOwnerId: COMPLETION_OWNER_ID,
 				success: true,
 				state: "complete",
 				summary: "done from pending",
@@ -548,6 +732,7 @@ describe("result watcher", () => {
 				id: "scheduled-pending",
 				runId: "scheduled-pending",
 				sessionId: "session-a",
+				completionOwnerId: COMPLETION_OWNER_ID,
 				success: true,
 				state: "complete",
 				summary: "scheduled pending done",
@@ -737,6 +922,67 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("leaves same-session completions for the exact parent owner", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-owner-scope-"));
+		try {
+			const ownerState = createState();
+			ownerState.currentSessionId = "shared-session";
+			ownerState.completionOwnerId = "owner-a";
+			const otherState = createState();
+			otherState.currentSessionId = "shared-session";
+			otherState.completionOwnerId = "owner-b";
+			const resultPath = path.join(resultsDir, "owner-scoped.json");
+			const missingOwnerPath = path.join(resultsDir, "missing-owner.json");
+			writeAsyncResultFile(resultPath, {
+				id: "owner-scoped",
+				runId: "owner-scoped",
+				sessionId: "shared-session",
+				completionOwnerId: "owner-a",
+				success: true,
+				summary: "owned result",
+			});
+			writeAsyncResultFile(missingOwnerPath, {
+				id: "missing-owner",
+				runId: "missing-owner",
+				sessionId: "shared-session",
+				success: true,
+				summary: "legacy result",
+			});
+			let otherDeliveries = 0;
+			const otherWatcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, otherState, resultsDir, 60_000, {
+				deliverIntercomResults: false,
+				notifier: { deliver: async () => { otherDeliveries += 1; return true; } },
+			});
+			try {
+				otherWatcher.primeExistingResults();
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			} finally {
+				otherWatcher.stopResultWatcher();
+			}
+			assert.equal(otherDeliveries, 0);
+			assert.equal(fs.existsSync(resultPath), true);
+			assert.equal(fs.existsSync(missingOwnerPath), true);
+			assert.equal((JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { notificationDeliveredAt?: unknown }).notificationDeliveredAt, undefined);
+
+			let ownerDeliveries = 0;
+			const ownerWatcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, ownerState, resultsDir, 60_000, {
+				deliverIntercomResults: false,
+				notifier: { deliver: async () => { ownerDeliveries += 1; return true; } },
+			});
+			try {
+				ownerWatcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultPath)), true);
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			} finally {
+				ownerWatcher.stopResultWatcher();
+			}
+			assert.equal(ownerDeliveries, 1);
+			assert.equal(fs.existsSync(missingOwnerPath), true, "missing owner fails closed for every window");
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("logs malformed result files instead of swallowing them silently", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
@@ -776,6 +1022,39 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("diagnoses non-filesystem ENAMETOOLONG from parser and notifier callbacks", async () => {
+		for (const source of ["parser", "notifier"] as const) {
+			const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), `pi-result-watcher-${source}-enametoolong-`));
+			const originalError = console.error;
+			const logged: unknown[][] = [];
+			try {
+				const runId = `${source}-enametoolong`;
+				const resultPath = path.join(resultsDir, `${runId}.json`);
+				writeIndexedResult(resultPath, { id: runId, runId, sessionId: "session-current", success: true, summary: "done" });
+				const state = createState();
+				state.currentSessionId = "session-current";
+				const failure = new Error(`${source} rejected payload`) as NodeJS.ErrnoException;
+				failure.code = "ENAMETOOLONG";
+				console.error = (...args: unknown[]) => { logged.push(args); };
+				const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, source === "parser"
+					? { parseResult: () => { throw failure; } }
+					: { notifier: { deliver: async () => { throw failure; } } });
+				try {
+					watcher.primeExistingResults();
+					assert.equal(await waitForPredicate(() => logged.some((entry) => entry[1] === failure)), true);
+				} finally {
+					watcher.stopResultWatcher();
+				}
+
+				assert.equal(fs.existsSync(resultPath), true);
+				assert.equal(logged.some((entry) => entry[1] === failure && /Failed to process subagent result file/.test(String(entry[0] ?? ""))), true);
+			} finally {
+				console.error = originalError;
+				fs.rmSync(resultsDir, { recursive: true, force: true });
+			}
+		}
+	});
+
 	it("normalizes the native fs.watch path before watching result files", () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
@@ -794,7 +1073,7 @@ describe("result watcher", () => {
 				},
 				close() {},
 				unref() {},
-			} as fs.FSWatcher;
+			} as unknown as fs.FSWatcher;
 			const realpathSync = ((target: fs.PathLike, options?: unknown) => fs.realpathSync(target, options as BufferEncoding)) as typeof fs.realpathSync;
 			realpathSync.native = ((target: fs.PathLike) => target === resultsDir ? nativeResultsDir : fs.realpathSync.native(target)) as typeof fs.realpathSync.native;
 			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, {
@@ -840,17 +1119,17 @@ describe("result watcher", () => {
 				},
 				close() {},
 				unref() {},
-			} as fs.FSWatcher;
+			} as unknown as fs.FSWatcher;
 			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, {
 				fs: { ...fs, watch: () => fakeWatcher },
 				deliverIntercomResults: false,
 				timers: {
 					setTimeout,
 					clearTimeout,
-					setInterval(handler: () => void) {
+					setInterval: ((handler: () => void) => {
 						scan = handler;
 						return { unref() {} } as NodeJS.Timeout;
-					},
+					}) as typeof setInterval,
 					clearInterval() {
 						scan = undefined;
 					},
@@ -1549,6 +1828,204 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("delivers a later terminal result after a paused payload for the same run", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-paused-then-complete-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const pi = {
+				events: {
+					on() { return () => {}; },
+					emit(event: string, data: unknown) { emitted.push({ event, data }); },
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-1";
+			let holdPaused: () => void = () => {};
+			const pausedHeld = new Promise<void>((resolve) => { holdPaused = resolve; });
+			let pausedDeliverStarted: () => void = () => {};
+			const pausedStarted = new Promise<void>((resolve) => { pausedDeliverStarted = resolve; });
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, {
+				deliverIntercomResults: false,
+				notifier: {
+					async deliver(result) {
+						if (result.state === "paused") {
+							pausedDeliverStarted();
+							await pausedHeld;
+						}
+						return true;
+					},
+				},
+			});
+			try {
+				writeIndexedResult(path.join(resultsDir, "workflow-detach.json"), {
+					id: "workflow-detach",
+					runId: "workflow-detach",
+					agent: "workflow",
+					mode: "workflow",
+					success: false,
+					state: "paused",
+					summary: "Workflow paused.",
+					sessionId: "session-1",
+					timestamp: 1,
+					workflow: { trace: [{ type: "run", key: "detaches", state: "detached" }] },
+				});
+				watcher.primeExistingResults();
+				await pausedStarted;
+				writeIndexedResult(path.join(resultsDir, "workflow-detach.json"), {
+					id: "workflow-detach",
+					runId: "workflow-detach",
+					agent: "workflow",
+					mode: "workflow",
+					success: true,
+					state: "complete",
+					summary: "Workflow completed after detached child finished.",
+					sessionId: "session-1",
+					timestamp: 2,
+					workflow: { trace: [{ type: "run", key: "detaches", state: "completed" }] },
+				});
+				holdPaused();
+				assert.equal(await waitForPredicate(() => state.completedResults?.get("workflow-detach")?.completion.state === "complete"), true);
+				assert.equal(emitted.some((entry) => {
+					const data = entry.data as { state?: string };
+					return entry.event === "subagent:async-complete" && data.state === "complete";
+				}), true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a same-state paused replacement written during paused delivery", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-paused-same-state-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const pi = {
+				events: {
+					on() { return () => {}; },
+					emit(event: string, data: unknown) { emitted.push({ event, data }); },
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-1";
+			let holdPaused: () => void = () => {};
+			const pausedHeld = new Promise<void>((resolve) => { holdPaused = resolve; });
+			let pausedDeliverStarted: () => void = () => {};
+			const pausedStarted = new Promise<void>((resolve) => { pausedDeliverStarted = resolve; });
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, {
+				deliverIntercomResults: false,
+				notifier: {
+					async deliver(result) {
+						if (result.state === "paused" && result.timestamp === 1) {
+							pausedDeliverStarted();
+							await pausedHeld;
+						}
+						return true;
+					},
+				},
+			});
+			try {
+				const resultFile = path.join(resultsDir, "workflow-still-paused.json");
+				writeIndexedResult(resultFile, {
+					id: "workflow-still-paused",
+					runId: "workflow-still-paused",
+					agent: "workflow",
+					mode: "workflow",
+					success: false,
+					state: "paused",
+					summary: "Workflow paused.",
+					sessionId: "session-1",
+					timestamp: 1,
+					results: [
+						{ workflowKey: "first", runId: "child-1", success: false, detached: true, output: "", outputState: "absent" },
+						{ workflowKey: "second", runId: "child-2", success: false, detached: true, output: "", outputState: "absent" },
+					],
+				});
+				watcher.primeExistingResults();
+				await pausedStarted;
+				writeIndexedResult(resultFile, {
+					id: "workflow-still-paused",
+					runId: "workflow-still-paused",
+					agent: "workflow",
+					mode: "workflow",
+					success: false,
+					state: "paused",
+					summary: "Workflow paused.",
+					sessionId: "session-1",
+					timestamp: 2,
+					results: [
+						{ workflowKey: "first", runId: "child-1", success: true, output: "first child done", outputState: "present" },
+						{ workflowKey: "second", runId: "child-2", success: false, detached: true, output: "", outputState: "absent" },
+					],
+				});
+				holdPaused();
+				assert.equal(await waitForPredicate(() => {
+					const recorded = state.completedResults?.get("workflow-still-paused")?.completion;
+					return recorded?.results?.some((child) => child.runId === "child-1" && child.success === true && child.outputState === "present") === true;
+				}), true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("delivers a terminal result after the paused file was already consumed", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-paused-consumed-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const pi = {
+				events: {
+					on() { return () => {}; },
+					emit(event: string, data: unknown) { emitted.push({ event, data }); },
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-1";
+			const resultFile = path.join(resultsDir, "workflow-consumed.json");
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, { deliverIntercomResults: false });
+			try {
+				writeIndexedResult(resultFile, {
+					id: "workflow-consumed",
+					runId: "workflow-consumed",
+					agent: "workflow",
+					mode: "workflow",
+					success: false,
+					state: "paused",
+					summary: "Workflow paused.",
+					sessionId: "session-1",
+					workflow: { trace: [{ type: "run", key: "detaches", state: "detached" }] },
+				});
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => !fs.existsSync(resultFile)), true);
+				assert.equal(state.completedResults?.get("workflow-consumed")?.completion.state, "paused");
+				writeIndexedResult(resultFile, {
+					id: "workflow-consumed",
+					runId: "workflow-consumed",
+					agent: "workflow",
+					mode: "workflow",
+					success: true,
+					state: "complete",
+					summary: "Workflow completed after detached child finished.",
+					sessionId: "session-1",
+					workflow: { trace: [{ type: "run", key: "detaches", state: "completed" }] },
+				});
+				watcher.primeExistingResults();
+				assert.equal(await waitForPredicate(() => state.completedResults?.get("workflow-consumed")?.completion.state === "complete"), true);
+				assert.equal(emitted.filter((entry) => {
+					const data = entry.data as { state?: string };
+					return entry.event === "subagent:async-complete" && data.state === "complete";
+				}).length > 0, true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("uses local completion fallback silently when no grouped-result listener is available", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
@@ -1692,7 +2169,7 @@ describe("result watcher", () => {
 					intercomTarget: "orchestrator",
 				});
 				watcher.primeExistingResults();
-				await new Promise((resolve) => setTimeout(resolve, 10));
+				await waitForPredicate(() => delivered.length === 1);
 			} finally {
 				watcher.stopResultWatcher();
 			}
@@ -1759,6 +2236,56 @@ describe("result watcher", () => {
 		}
 	});
 
+	it("retries delivery after a transient session index access denial", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-index-retry-"));
+		const originalError = console.error;
+		const originalReadFileSync = fsDefault.readFileSync;
+		try {
+			console.error = () => {};
+			const state = createState();
+			state.currentSessionId = "session-1";
+			const emitted: string[] = [];
+			const fakeWatcher = {
+				on() { return fakeWatcher; },
+				close() {},
+				unref() {},
+			} as unknown as fs.FSWatcher;
+			let watchEvent: ((event: string, file: string | Buffer | null) => void) | undefined;
+			const resultPath = path.join(resultsDir, "index-retry.json");
+			writeIndexedResult(resultPath, { id: "index-retry", runId: "index-retry", sessionId: "session-1", agent: "worker", success: true, summary: "done", timestamp: 1 });
+			let indexReads = 0;
+			fsDefault.readFileSync = ((file, ...args) => {
+				if (String(file).includes(`${path.sep}result-index${path.sep}`)) {
+					indexReads += 1;
+				}
+				if (indexReads === 2 && String(file).includes(`${path.sep}result-index${path.sep}`)) {
+					const error = new Error("permission denied") as NodeJS.ErrnoException;
+					error.code = "EACCES";
+					throw error;
+				}
+				return originalReadFileSync(file, ...args);
+			}) as typeof fsDefault.readFileSync;
+			syncBuiltinESMExports();
+
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit(event) { emitted.push(event); } } }, state, resultsDir, 60_000, {
+				fs: { ...fs, watch: (_path, callback) => { watchEvent = callback as typeof watchEvent; return fakeWatcher; } },
+			});
+			try {
+				watcher.startResultWatcher();
+				watchEvent?.("change", "index-retry.json");
+				assert.equal(await waitForPredicate(() => emitted.includes("subagent:async-complete")), true);
+			} finally {
+				watcher.stopResultWatcher();
+			}
+			assert.equal(fs.existsSync(resultPath), false);
+		} finally {
+			console.error = originalError;
+			fsDefault.readFileSync = originalReadFileSync;
+			syncBuiltinESMExports();
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
 	it("drops stale watcher authority without emitting or deleting", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-stale-"));
 		try {
@@ -1805,6 +2332,111 @@ describe("result watcher", () => {
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });
 		}
+	});
+
+	describe("resultScanLogging", () => {
+		const slowScan = () => {
+			const deadline = Date.now() + 700;
+			while (Date.now() < deadline) { /* busy-wait: force elapsed past 500ms threshold */ }
+			return new Set<string>();
+		};
+
+		const captureScanErrors = (): { errors: string[]; restore: () => void } => {
+			const errors: string[] = [];
+			const originalError = console.error;
+			console.error = (...args: unknown[]) => {
+				const message = args.map(String).join(" ");
+				if (message.includes("Subagent result scan")) errors.push(message);
+			};
+			return { errors, restore: () => { console.error = originalError; } };
+		};
+
+		const runScan = (deps: Record<string, unknown>) => {
+			const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-scanlog-"));
+			const state = createState();
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				observedCompletionRunIds: slowScan,
+				...deps,
+			} as Parameters<typeof createRawResultWatcher>[4]);
+			try {
+				watcher.primeExistingResults();
+			} finally {
+				watcher.stopResultWatcher();
+				fs.rmSync(resultsDir, { recursive: true, force: true });
+			}
+		};
+
+		it('silences empty slow scans with the default "activity" mode', () => {
+			const { errors, restore } = captureScanErrors();
+			try {
+				runScan({});
+				assert.equal(errors.length, 0);
+			} finally {
+				restore();
+			}
+		});
+
+		it('logs empty slow scans under explicit "all" mode', () => {
+			const { errors, restore } = captureScanErrors();
+			try {
+				runScan({ resultScanLogging: "all" });
+				assert.equal(errors.length, 1);
+				assert.match(errors[0], /inspected 0 indexed result file\(s\), scheduled 0/);
+			} finally {
+				restore();
+			}
+		});
+
+		it('silences empty slow scans under "activity"', () => {
+			const { errors, restore } = captureScanErrors();
+			try {
+				runScan({ resultScanLogging: "activity" });
+				assert.equal(errors.length, 0);
+			} finally {
+				restore();
+			}
+		});
+
+		it('keeps slow scans that found work under "activity"', () => {
+			const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-scanlog-work-"));
+			const state = createState();
+			state.currentSessionId = "session-current";
+			writeIndexedResult(path.join(resultsDir, "activity-run.json"), { id: "activity-run", sessionId: "session-current", runId: "activity-run", success: true, summary: "done" });
+			const { errors, restore } = captureScanErrors();
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				observedCompletionRunIds: slowScan,
+				resultScanLogging: "activity",
+			});
+			try {
+				watcher.primeExistingResults();
+				assert.ok(errors.length >= 1, "expected a scan log for a scan that found work");
+				assert.match(errors[0], /inspected [1-9]/);
+			} finally {
+				watcher.stopResultWatcher();
+				restore();
+				fs.rmSync(resultsDir, { recursive: true, force: true });
+			}
+		});
+
+		it('silences all slow scans under "off"', () => {
+			const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-scanlog-off-"));
+			const state = createState();
+			state.currentSessionId = "session-current";
+			writeIndexedResult(path.join(resultsDir, "off-run.json"), { id: "off-run", sessionId: "session-current", runId: "off-run", success: true, summary: "done" });
+			const { errors, restore } = captureScanErrors();
+			const watcher = createResultWatcher({ events: { on: () => () => {}, emit() {} } }, state, resultsDir, 60_000, {
+				observedCompletionRunIds: slowScan,
+				resultScanLogging: "off",
+			});
+			try {
+				watcher.primeExistingResults();
+				assert.equal(errors.length, 0);
+			} finally {
+				watcher.stopResultWatcher();
+				restore();
+				fs.rmSync(resultsDir, { recursive: true, force: true });
+			}
+		});
 	});
 
 });

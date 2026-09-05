@@ -81,7 +81,7 @@ export interface WorktreeCleanupTask {
 }
 
 export type WorktreeCleanupIntent =
-	| { kind: "preserve"; capturedDiffs?: WorktreeDiff[]; handoffManifestPath?: string }
+	| { kind: "preserve"; capturedDiffs?: WorktreeDiff[]; handoffManifestPath?: string; cleanupBlocker?: string }
 	| {
 			kind: "discard";
 			authorization:
@@ -106,6 +106,8 @@ interface CreateWorktreesOptions {
 	agents?: string[];
 	setupHook?: WorktreeSetupHookConfig;
 	baseDir?: string;
+	baseRef?: string;
+	beforeCreate?: (setup: WorktreeSetup) => void;
 }
 
 interface ResolvedWorktreeSetupHook {
@@ -221,13 +223,16 @@ function resolveRepoLayout(cwd: string): JjRepoLayout {
  * Snapshot Source once and record exact S0 commit/change.
  * Per-Child D0 is created later via `jj duplicate -r S0`.
  */
-function snapshotSourceS0(root: string): { sourceBaseCommit: string; baseChange: string } {
+function snapshotSourceS0(root: string, baseRef?: string): { sourceBaseCommit: string; baseChange: string } {
+	// The shared upstream default HEAD means this JJ workspace's current tip.
+	const revision = baseRef === undefined || baseRef === "HEAD" ? "@" : baseRef.trim();
+	if (!revision) throw new Error("JJ baseRef must be a non-empty revision");
 	runJjChecked(root, ["util", "snapshot"]);
 	const sourceBaseCommit = runJjChecked(root, [
 		"--ignore-working-copy",
 		"log",
 		"-r",
-		"@",
+		revision,
 		"--no-graph",
 		"-T",
 		"commit_id",
@@ -236,7 +241,7 @@ function snapshotSourceS0(root: string): { sourceBaseCommit: string; baseChange:
 		"--ignore-working-copy",
 		"log",
 		"-r",
-		"@",
+		revision,
 		"--no-graph",
 		"-T",
 		"change_id",
@@ -963,8 +968,6 @@ function createSingleJjWorktree(
 	runId: string,
 	index: number,
 	baseDir: string,
-	setupHook: ResolvedWorktreeSetupHook | undefined,
-	agent: string | undefined,
 ): WorktreeInfo {
 	const workspaceName = buildWorkspaceName(runId, index);
 	const worktreePath = buildWorktreePath(baseDir, runId, index);
@@ -1061,22 +1064,6 @@ function createSingleJjWorktree(
 		const syntheticPaths = nodeModulesLinked ? ["node_modules"] : [];
 		const agentCwd = repo.cwdRelative ? path.join(resolvedPath, repo.cwdRelative) : resolvedPath;
 
-		if (setupHook) {
-			const hookSyntheticPaths = runWorktreeSetupHook(setupHook, {
-				version: 1,
-				repoRoot: repo.root,
-				worktreePath: resolvedPath,
-				agentCwd,
-				branch: workspaceName,
-				index,
-				runId,
-				// Hook sees S0 freeze (shared); Child WC is D.
-				baseCommit: repo.baseCommit,
-				agent,
-			});
-			syntheticPaths.push(...hookSyntheticPaths);
-		}
-
 		return {
 			path: resolvedPath,
 			agentCwd,
@@ -1109,9 +1096,8 @@ export function createJjWorktrees(
 	// Validate hook/baseDir before creating any D so invalid config leaves no residue.
 	const layout = resolveRepoLayout(cwd);
 	const setupHook = resolveWorktreeSetupHook(layout.root, options?.setupHook);
+	const frozen = snapshotSourceS0(layout.root, options?.baseRef);
 	const baseDir = resolveWorktreeBaseDir(options?.baseDir, layout.root);
-
-	const frozen = snapshotSourceS0(layout.root);
 	const repo: JjRepoState = {
 		...layout,
 		baseCommit: frozen.sourceBaseCommit,
@@ -1126,8 +1112,21 @@ export function createJjWorktrees(
 	try {
 		for (let index = 0; index < count; index++) {
 			setup.worktrees.push(
-				createSingleJjWorktree(repo, runId, index, baseDir, setupHook, options?.agents?.[index]),
+				createSingleJjWorktree(repo, runId, index, baseDir),
 			);
+		}
+		// JJ identities are known only after allocation, like Worktrunk paths.
+		// Journal every allocated identity before running user-controlled hooks.
+		options?.beforeCreate?.(setup);
+		if (setupHook) {
+			for (const worktree of setup.worktrees) {
+				worktree.syntheticPaths.push(...runWorktreeSetupHook(setupHook, {
+					version: 1, repoRoot: repo.root, worktreePath: worktree.path,
+					agentCwd: worktree.agentCwd, branch: worktree.branch,
+					index: worktree.index, runId, baseCommit: repo.baseCommit,
+					agent: options?.agents?.[worktree.index],
+				}));
+			}
 		}
 	} catch (error) {
 		cleanupJjWorktrees(setup, { kind: "setup-rollback" });
@@ -1761,6 +1760,15 @@ export function cleanupJjWorktrees(
 		...(setup.capturedDiffs ? { capturedDiffs: setup.capturedDiffs } : {}),
 	},
 ): WorktreeCleanupReport {
+	if (intent.kind === "preserve" && intent.cleanupBlocker) {
+		return {
+			state: "partial", pruned: false,
+			tasks: setup.worktrees.map((worktree) => ({
+				...taskBase(worktree), worktreeRemoved: false, branchRemoved: false,
+				preserved: true, reason: intent.cleanupBlocker,
+			})),
+		};
+	}
 	const tasks: WorktreeCleanupTask[] = [];
 	// Order: forget + abandon each owned W + remove path first.
 	for (let index = setup.worktrees.length - 1; index >= 0; index--) {

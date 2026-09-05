@@ -82,6 +82,7 @@ describe("buildDoctorReport", () => {
 						builtin: [makeAgent("builtin-a", "builtin")],
 						user: [makeAgent("user-a", "user")],
 						project: [makeAgent("project-a", "project"), makeAgent("project-b", "project")],
+						agentDiagnostics: [{ source: "project", filePath: path.join(root, ".pi", "agents", "broken.md"), name: "broken", error: "invalid runner" }],
 						chains: [makeChain("user-flow", "user"), makeChain("project-flow", "project")],
 						userDir: path.join(root, "home", ".agents"),
 						projectDir: path.join(root, ".pi", "agents"),
@@ -112,13 +113,16 @@ describe("buildDoctorReport", () => {
 			assert.match(report, /- current session file: .*parent\.jsonl/);
 			assert.match(report, /- temp root: ok /);
 			assert.match(report, /- agents: total 4 \(builtin 1, package 0, user 1, project 2\)/);
-				assert.match(report, /Spawn budget\n- usage: 3\/5 used, 2 remaining \(configured 4; granted 1; grant allowance 3\)/);
+			assert.match(report, /- invalid agent broken \(project\): invalid runner/);
+			assert.match(report, /Spawn budget\n- usage: 3\/5 used, 2 remaining \(configured 4; granted 1; grant allowance 3\)/);
 			assert.match(report, /- recent grants: \+1 at 1970-01-01T00:00:00\.000Z \(4 → 5\)/);
 			assert.match(report, /new parent session resets usage and grants; compaction does not/);
 			assert.match(report, /Run fan-out budget\n- configured limit: 64 \(default\)/);
 			assert.match(report, /cumulative claims are never released; a new top-level run creates a new budget/);
 			assert.match(report, /Active async capacity\n- usage: 0\/2 used/);
-			assert.match(report, /missing or unknown cleanup proof retains capacity/);
+			assert.match(report, /terminal state plus matching observed process-terminal proof, or abandoned-timeout for failed runs with a dead runner PID and stale activity when enabled; false keeps unknown-proof slots/);
+			assert.match(report, /Workflow script\n- helpers: runs\.run, runs\.all, runs\.steer, runs\.status, runs\.ref\/refs, emit, console/);
+			assert.match(report, /if runs\.all is missing, reload or update pi-subagents; await Promise\.all\(\[runs\.run\(\.\.\.\)\]\) is also supported/);
 			assert.match(report, /- skills: total 2 \(project 1, user-package 1\)/);
 			assert.match(report, /- bridge: active/);
 			assert.match(report, /- supervisor channel: available \(native:pi-subagents-supervisor-channel\)/);

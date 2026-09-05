@@ -6,11 +6,12 @@ import { discoverAgents } from "../agents/agents.ts";
 import { getArtifactsDir } from "../shared/artifacts.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { resolveWaitToolConfig } from "../runs/background/wait-config.ts";
-import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
-import { readNestedControlRequests, resolveNestedRouteFromEnv, type NestedRoute, writeNestedControlResult } from "../runs/shared/nested-events.ts";
+import type { ChildRuntimeConfig } from "../runs/shared/child-runtime-config.ts";
+import { readNestedControlRequests, resolveInheritedNestedRoute, type NestedRoute, writeNestedControlResult } from "../runs/shared/nested-events.ts";
 import { deliverSubagentIntercomMessageEvent } from "../intercom/result-intercom.ts";
 import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { createSubagentParamsSchema } from "./schemas.ts";
+import { finalizeToolResult } from "./tool-result.ts";
 import { loadConfig, resolveAsyncByDefault } from "./config.ts";
 import { type Details, type SubagentState } from "../shared/types.ts";
 
@@ -50,12 +51,8 @@ function createChildSafeState(): SubagentState {
 	};
 }
 
-function resolveNestedControlRoute(): NestedRoute | undefined {
-	try {
-		return resolveNestedRouteFromEnv();
-	} catch {
-		return undefined;
-	}
+function resolveNestedControlRoute(config: ChildRuntimeConfig): NestedRoute | undefined {
+	return config.nestedRoute ? resolveInheritedNestedRoute(config.nestedRoute) : undefined;
 }
 
 function nestedControlRouteKey(route: NestedRoute): string {
@@ -144,8 +141,9 @@ function startNestedControlInboxListener(pi: ExtensionAPI, state: SubagentState,
 	return () => clearInterval(timer);
 }
 
-export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): void {
-	if (process.env[SUBAGENT_CHILD_ENV] !== "1" || process.env[SUBAGENT_FANOUT_CHILD_ENV] !== "1") return;
+/** Register the child-side `subagent` tool for fanout-authorized children. */
+export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI, childConfig: ChildRuntimeConfig): void {
+	if (!childConfig.fanoutChild) return;
 
 	const globalStore = globalThis as Record<string, unknown>;
 	const registeredKey = "__piSubagentFanoutChildRegisteredApis";
@@ -157,18 +155,21 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): 
 	registeredApis.add(pi);
 
 	const config = loadConfig();
+	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
 	const state = createChildSafeState();
 	const executor = createSubagentExecutor({
 		pi,
 		state,
 		config,
 		asyncByDefault: resolveAsyncByDefault(config),
-		waitToolEnabled: resolveWaitToolConfig(config.waitTool).enabled,
+		waitToolEnabled: waitToolConfig.enabled,
+		waitToolDefaultTimeoutMs: waitToolConfig.defaultTimeoutMs,
 		tempArtifactsDir: getArtifactsDir(null),
 		getSubagentSessionRoot,
 		expandTilde,
 		discoverAgents,
 		allowMutatingManagementActions: false,
+		childRuntime: childConfig,
 	});
 
 	const params = createSubagentParamsSchema();
@@ -177,17 +178,17 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): 
 		label: "Subagent",
 		description: [
 			"Delegate to subagents from child-safe fanout mode.",
-			"Allowed management/control actions: list, get, status, interrupt, resume, steer, doctor.",
-			"Mutating management actions (create, update, delete, eject, disable, enable, reset, grant-spawn-budget) are blocked in this mode.",
+			"Allowed management/control actions: list, get, status, lane.status, interrupt, resume, steer, doctor.",
+			"Mutating management actions (create, update, delete, eject, disable, enable, reset, grant-spawn-budget, lane.recordMerge, lane.recordSupersession) are blocked in this mode.",
 		].join("\n"),
 		parameters: params,
-		execute(id, params, signal, onUpdate, ctx) {
-			return executor.executePublic(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx);
+		async execute(id, params, signal, onUpdate, ctx) {
+			return finalizeToolResult(await executor.executePublic(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx));
 		},
 	};
 
 	pi.registerTool(tool);
-	const route = resolveNestedControlRoute();
+	const route = resolveNestedControlRoute(childConfig);
 	if (!route) return;
 	const listenerCleanupKey = "__piSubagentFanoutChildNestedControlInboxCleanups";
 	const listenerCleanups = globalStore[listenerCleanupKey] instanceof Map

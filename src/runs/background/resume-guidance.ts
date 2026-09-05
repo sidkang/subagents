@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import type { AsyncRunSummary } from "./async-status.ts";
+import { readAsyncRecoveryDescriptor } from "./async-resume.ts";
 
 const INTERCOM_DETACH_ERROR = "detached for intercom coordination";
 
@@ -11,15 +12,17 @@ function isIntercomDetached(run: AsyncRunSummary): boolean {
 
 function formatIntercomDetachGuidance(run: AsyncRunSummary): string | undefined {
 	if (!isIntercomDetached(run)) return undefined;
-	return `Run "${run.id}" detached for intercom coordination. Reply to the supervisor request first, then wait with subagent_wait({ id: "${run.id}" }). Use subagent({ action: "status", id: "${run.id}" }) to recover the result; do not resume or launch a replacement while it remains detached.`;
+	return `Run "${run.id}" detached for intercom coordination. Reply to the supervisor request first, then wait with bg_wait({ id: "${run.id}" }). Use subagent({ action: "status", id: "${run.id}" }) to recover the result; do not resume or launch a replacement while it remains detached.`;
 }
 
 export function formatAsyncReviveCommand(run: AsyncRunSummary): string | undefined {
-	const step = run.steps.find((candidate) => candidate.status === "failed" && candidate.sessionFile && fs.existsSync(candidate.sessionFile));
-	if (!step) {
-		if (run.steps.length === 1 && run.sessionFile && fs.existsSync(run.sessionFile)) {
-			return `subagent({ action: "resume", id: "${run.id}", message: "Continue from the persisted child session and report the result." })`;
-		}
+	const step = run.steps.find((candidate) => candidate.status === "failed");
+	const sessionFile = step?.sessionFile ?? (run.steps.length === 1 ? run.sessionFile : undefined);
+	if (!step || !sessionFile || !fs.existsSync(sessionFile)) return undefined;
+	try {
+		const descriptor = readAsyncRecoveryDescriptor(run.asyncDir);
+		if (!descriptor || descriptor.sourceRunId !== run.id || descriptor.agent !== step.agent) return undefined;
+	} catch {
 		return undefined;
 	}
 	const index = run.steps.length === 1 ? "" : `, index: ${step.index}`;
@@ -36,7 +39,7 @@ export function formatResumeFirstFailedRunDetail(run: AsyncRunSummary): string |
 }
 
 export function formatResumeFirstFailedRunsNote(runs: AsyncRunSummary[]): string {
-	const failedRuns = runs.filter((run) => run.state === "failed");
+	const failedRuns = runs.filter((run) => run.state === "failed" || run.state === "partial");
 	const detachGuidance = failedRuns
 		.map(formatIntercomDetachGuidance)
 		.filter((guidance): guidance is string => Boolean(guidance));

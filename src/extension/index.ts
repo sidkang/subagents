@@ -9,7 +9,7 @@
  * Toggle: async parameter (default: true; set asyncByDefault:false in config.json to opt out)
  *
  * Config file: ~/.pi/agent/extensions/subagent/config.json
- *   { "asyncByDefault": true, "forceTopLevelAsync": true, "maxSubagentDepth": 1, "intercomBridge": { "mode": "always", "instructionFile": "./intercom-bridge.md" }, "worktreeSetupHook": "./scripts/setup-worktree.mjs" }
+ *   { "asyncByDefault": true, "defaultSubagentContext": "fork", "forkContext": { "mode": "pruned", "model": "provider/model" }, "forceTopLevelAsync": true, "maxSubagentDepth": 1, "intercomBridge": { "mode": "always", "instructionFile": "./intercom-bridge.md" }, "worktreeSetupHook": "./scripts/setup-worktree.mjs" }
  */
 
 import { randomUUID } from "node:crypto";
@@ -19,10 +19,15 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { keyText, type ExtensionAPI, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Spacer, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
-import { discoverAgents } from "../agents/agents.ts";
+import { discoverAgentSnapshot, discoverAgents, type AgentConfig, type AgentScope } from "../agents/agents.ts";
+import { clearRuntimeAgentsForPi, listRuntimeAgentConfigs, mergeRuntimeAgents } from "../agents/runtime-agent-registry.ts";
+import { registerRuntimeAgentEventListener } from "../agents/runtime-agent-events.ts";
 import { ensureAccessibleDir } from "../shared/accessible-dir.ts";
 import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
+import { getAgentDir } from "../shared/utils.ts";
+import { isStaleExtensionContextError, withCachedUiContext } from "../shared/extension-context.ts";
+import { currentCompletionOwnerId } from "../shared/completion-owner.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
 import { clearLegacyResultAnimationTimer, renderSubagentResult, renderSubagentSummary } from "../tui/render.ts";
 import { openSubagentFleet } from "../tui/fleet.ts";
@@ -30,30 +35,44 @@ import { SubagentFleetStatus, resolveFleetViewPlacement } from "../tui/fleet-sta
 import { createSubagentParamsSchema } from "./schemas.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
-import { getActiveAsyncCapacitySnapshot, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
-import { cleanupResultIndexes } from "../runs/background/result-files.ts";
+import { getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession } from "../runs/background/active-async-capacity.ts";
+import { cleanupResultIndexes, missionObserverResultCandidateFiles } from "../runs/background/result-files.ts";
+import { ASYNC_RETENTION_DELAY_MS, cleanupAsyncRetention } from "../runs/background/async-retention.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
+import { createResultDeliveryOwnership } from "../runs/background/result-delivery-ownership.ts";
 import { createScheduledRunManager } from "../runs/background/scheduled-runs.ts";
 import { registerSlashCommands } from "../slash/slash-commands.ts";
 import { registerPromptTemplateDelegationBridge } from "../slash/prompt-template-bridge.ts";
 import { registerMainWatchdog } from "../watchdog/register-main.ts";
 import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { createNativeSupervisorChannel } from "../intercom/native-supervisor-channel.ts";
+import {
+	renderSupervisorReply,
+	renderSupervisorRequest,
+	SUPERVISOR_REPLY_ENTRY_TYPE,
+	SUPERVISOR_REQUEST_MESSAGE_TYPE,
+	type SupervisorRequestMessageDetails,
+} from "../intercom/supervisor-ui.ts";
 import { registerHerdrStatusBridge, type HerdrStatusRun } from "../integrations/herdr-status.ts";
+import { hasLiveSubagentWork, registerPiWebSessionLiveness } from "../integrations/pi-web-session-liveness.ts";
+import { createRetainedNestedRouteTracker } from "../runs/background/retained-nested-route-tracker.ts";
+import { listHerdrProjectPaneRoots, restoreHerdrProjectPaneSnapshots } from "../inspectors/herdr/project-panes.ts";
 import { registerSubagentRpcBridge } from "./rpc.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
-import { inspectSubagentStatus } from "../runs/background/run-status.ts";
 import { resolveWaitToolConfig } from "../runs/background/subagent-wait.ts";
 import { registerWaitTool } from "../runs/background/wait-tool.ts";
 import { createWaitSubscriptionManager } from "../runs/background/wait-subscriptions.ts";
 import { drainOutstandingWork } from "../runs/background/auto-drain.ts";
 import registerSubagentNotify, { parseSubagentNotifyContent, type SubagentNotifyDetails } from "../runs/background/notify.ts";
 import { formatSteeringNotice, handleSubagentSteeringNotice, SUBAGENT_STEERING_MESSAGE_TYPE, type SubagentSteeringMessageDetails } from "./steering-notices.ts";
-import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/pi-args.ts";
+import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/child-runtime-config.ts";
+import { disposeChildSessions } from "../runs/shared/child-session.ts";
 import { resolveCurrentSubagentCapabilityCeiling } from "../runs/shared/capability-ceiling.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
-import { loadConfig, resolveAsyncByDefault, resolveScheduledStoreRoot } from "./config.ts";
-import { buildSubagentToolDescription } from "./tool-description.ts";
+import { applyModelExclusionsConfig, loadConfig, resolveAsyncByDefault, resolveScheduledStoreRoot } from "./config.ts";
+import { buildSubagentToolDescription, buildSubagentToolPromptMetadata } from "./tool-description.ts";
+import { formatWorkflowPreflightSummary, normalizeWorkflowPreflight } from "../workflows/workflow-preflight.ts";
+import { finalizeToolResult } from "./tool-result.ts";
 import { collectGoalContinuationNotices } from "../missions/goal-driver.ts";
 import { restoreForegroundRunHistory } from "../runs/foreground/foreground-history.ts";
 import { resolveMissionStoreLocation } from "../missions/store.ts";
@@ -84,6 +103,37 @@ import {
 export { loadConfig, resolveAsyncByDefault } from "./config.ts";
 
 const SLOW_RELOAD_PHASE_MS = 250;
+const RUNTIME_REGISTRY_STORE_KEY = "__piSubagentRuntimeRegistry";
+
+interface SubagentRuntimeEntry {
+	cleanup(): void;
+	sessionManager: object | null;
+	visibleControlNotices: Set<string>;
+}
+
+interface SubagentRuntimeRegistry {
+	bySessionManager: WeakMap<object, SubagentRuntimeEntry>;
+	visibleControlNoticesBySessionManager: WeakMap<object, Set<string>>;
+	activeEntries: Set<SubagentRuntimeEntry>;
+}
+
+function getRuntimeRegistry(): SubagentRuntimeRegistry {
+	const globalStore = globalThis as Record<string, unknown>;
+	const existing = globalStore[RUNTIME_REGISTRY_STORE_KEY] as Partial<SubagentRuntimeRegistry> | undefined;
+	if (existing?.bySessionManager instanceof WeakMap && existing.activeEntries instanceof Set) {
+		if (!(existing.visibleControlNoticesBySessionManager instanceof WeakMap)) {
+			existing.visibleControlNoticesBySessionManager = new WeakMap();
+		}
+		return existing as SubagentRuntimeRegistry;
+	}
+	const registry: SubagentRuntimeRegistry = {
+		bySessionManager: new WeakMap(),
+		visibleControlNoticesBySessionManager: new WeakMap(),
+		activeEntries: new Set(),
+	};
+	globalStore[RUNTIME_REGISTRY_STORE_KEY] = registry;
+	return registry;
+}
 
 function logSlowPhase(label: string, startedAt: number): void {
 	const elapsed = Date.now() - startedAt;
@@ -212,15 +262,25 @@ function workflowLaneKeys(script: string): string[] {
 	return keys;
 }
 
-function formatWorkflowManifest(script: string, async: unknown, clarify: unknown): string {
+function formatWorkflowPreflightCall(input: unknown): string {
+	if (input === undefined) return "";
+	try {
+		return formatWorkflowPreflightSummary(normalizeWorkflowPreflight(input));
+	} catch (error) {
+		return `preflight · rejected: ${error instanceof Error ? error.message : String(error)}`;
+	}
+}
+
+function formatWorkflowManifest(script: string, async: unknown, clarify: unknown, preflightInput?: unknown): string {
 	if (clarify === true) return "workflow script · rejected: clarify UI unsupported";
 	const keys = workflowLaneKeys(script);
 	// The workflow executor starts background work unless callers pass async:false.
 	const mode = async === false ? "foreground" : "background";
-	if (keys.length === 0) return `workflow script · ${mode}`;
+	const preflight = formatWorkflowPreflightCall(preflightInput);
+	if (keys.length === 0) return `workflow script · ${mode}${preflight ? ` · ${preflight}` : ""}`;
 	const visibleKeys = keys.slice(0, 4).join(", ");
 	const remainder = keys.length > 4 ? `, +${keys.length - 4}` : "";
-	return `workflow · ${mode} · ${keys.length} lane${keys.length === 1 ? "" : "s"}: ${visibleKeys}${remainder}`;
+	return `workflow · ${mode} · ${keys.length} lane${keys.length === 1 ? "" : "s"}: ${visibleKeys}${remainder}${preflight ? ` · ${preflight}` : ""}`;
 }
 
 /**
@@ -251,10 +311,6 @@ function isSlashResultRunning(result: { details?: Details }): boolean {
 
 function isSlashResultError(result: { details?: Details }): boolean {
 	return result.details?.results.some((entry) => entry.exitCode !== 0 && entry.progress?.status !== "running") || false;
-}
-
-function isStaleExtensionContextError(error: unknown): boolean {
-	return error instanceof Error && error.message.includes("Extension context no longer active");
 }
 
 function rebuildSlashResultContainer(
@@ -346,9 +402,13 @@ export function projectActiveHerdrRuns(state: SubagentState): HerdrStatusRun[] {
 		.filter((job) => active(job.status))
 		.map((job) => {
 			const children = job.mode === "workflow" ? foregroundChildrenByWorkflow.get(job.asyncId) : undefined;
+			const currentStep = job.steps?.find((step) => step.status === "running")
+				?? (job.currentStep !== undefined ? job.steps?.[job.currentStep] : undefined)
+				?? job.steps?.find((step) => step.status === "pending");
 			return {
 				id: job.asyncId,
 				agents: children?.length ? children.map((child) => child.agent) : job.agents,
+				...(currentStep?.label ? { taskLabel: currentStep.label } : {}),
 				needsAttention: job.activityState === "needs_attention" || children?.some((child) => child.needsAttention),
 			};
 		});
@@ -358,22 +418,15 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	if (process.env[SUBAGENT_CHILD_ENV] === "1") {
 		return;
 	}
-	const globalStore = globalThis as Record<string, unknown>;
-	const runtimeCleanupStoreKey = "__piSubagentRuntimeCleanup";
-	const previousRuntimeCleanup = globalStore[runtimeCleanupStoreKey];
-	if (typeof previousRuntimeCleanup === "function") {
-		try {
-			previousRuntimeCleanup();
-		} catch {
-			// Best effort cleanup for stale timers from an older reload.
-		}
-	}
+	const runtimeRegistry = getRuntimeRegistry();
 
 	DIRS.results = ensureAccessibleDir(DIRS.results);
 	DIRS.async = ensureAccessibleDir(DIRS.async);
 	cleanupOldChainDirs();
 
 	const config = loadConfig();
+	// Apply the process-wide exclusion TTL before any child launch can record a model failure.
+	applyModelExclusionsConfig(config);
 	const waitToolConfig = resolveWaitToolConfig(config.waitTool);
 	const asyncByDefault = resolveAsyncByDefault(config);
 	const fleetViewEnabled = config.fleetView !== false;
@@ -395,6 +448,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const state: SubagentState = {
 		baseCwd: "",
 		currentSessionId: null,
+		statusProjectionSessionId: null,
+		completionOwnerId: currentCompletionOwnerId(),
 		artifactDirPreference: config.artifactDir ?? DEFAULT_ARTIFACT_CONFIG.dir,
 		...(config.authorityPolicy ? { authorityPolicy: config.authorityPolicy } : {}),
 		...(config.missions ? { missionStoreConfig: config.missions } : {}),
@@ -409,6 +464,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			grantHistory: [],
 		},
 		activeAsyncCapacity: { used: 0, limit: resolveMaxActiveAsyncRunsPerSession(config.maxActiveAsyncRunsPerSession) ?? 0 },
+		herdrProjectPanes: new Map(),
 		asyncJobs: new Map(),
 		fleetJobs: new Map(),
 		foregroundRuns: new Map(),
@@ -426,20 +482,38 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			clear: () => {},
 		},
 	};
+	const withLastUiContext = <T>(run: (ctx: ExtensionContext) => T): T | undefined => {
+		const cached = state.lastUiContext;
+		return withCachedUiContext(cached, () => {
+			if (state.lastUiContext === cached) state.lastUiContext = null;
+		}, run);
+	};
 
 	const supervisorChannel = createNativeSupervisorChannel(pi, state);
 	const waitSubscriptionManager = createWaitSubscriptionManager(pi, state);
 	const mainWatchdog = registerMainWatchdog(pi);
-	const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch });
+	const resultDeliveryOwnership = createResultDeliveryOwnership(state);
+	const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch, ownership: resultDeliveryOwnership });
+	let retainedNestedRouteTracker: ReturnType<typeof createRetainedNestedRouteTracker> | undefined;
 	const fleetStatus = fleetViewEnabled
 		? new SubagentFleetStatus(state, async (itemKey) => {
-			const ctx = state.lastUiContext;
-			if (!ctx?.hasUI) return;
-			await openSubagentFleet(ctx, state, { initialKey: itemKey, asyncDirRoot: DIRS.async, resultsDir: DIRS.results, fleetKeybindings: config.fleetKeybindings });
+			const ctx = withLastUiContext((current) => current);
+			if (!ctx) return;
+			try {
+				await openSubagentFleet(ctx, state, { initialKey: itemKey, asyncDirRoot: DIRS.async, resultsDir: DIRS.results, fleetKeybindings: config.fleetKeybindings });
+			} catch (error) {
+				if (isStaleExtensionContextError(error)) {
+					if (state.lastUiContext === ctx) state.lastUiContext = null;
+					return;
+				}
+				throw error;
+			}
 		}, { placement: fleetViewPlacement })
 		: undefined;
 	let executorScheduled: ((id: string, params: SubagentParamsLike, signal: AbortSignal, ctx: ExtensionContext) => Promise<AgentToolResult<Details>>) | undefined;
 	let goalTurnId = 0;
+	let parentSessionEnvValue: string | null = null;
+	let releaseHostSessionLiveness = () => {};
 	const scheduledStoreRoot = config.scheduledRuns?.storeRoot === undefined ? undefined : resolveScheduledStoreRoot(config.scheduledRuns.storeRoot);
 	const scheduledRunManager = createScheduledRunManager({
 		config,
@@ -456,50 +530,99 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		},
 		resolveCapabilityCeiling: (sessionId) => resolveCurrentSubagentCapabilityCeiling(sessionId),
 	});
+	let refreshResultDelivery = () => {};
+	const hasResultDeliveryDemand = () => {
+		if ([...state.asyncJobs.values()].some((job) => job.status === "queued" || job.status === "running")) return true;
+		if (state.foregroundControls.size > 0) return true;
+		if (scheduledRunManager.observedCompletionRunIds().size > 0) return true;
+		return missionObserverResultCandidateFiles(DIRS.results).length > 0;
+	};
+	const discoverAgentsForRuntime = (cwd: string, scope: AgentScope, preferredModelProvider?: string) => {
+		if (listRuntimeAgentConfigs(pi).length === 0) return discoverAgents(cwd, scope, preferredModelProvider);
+		const snapshot = discoverAgentSnapshot(cwd, scope, preferredModelProvider, { includeChains: false });
+		const discovered = snapshot.effective;
+		const all = snapshot.all;
+		const configuredAgents: AgentConfig[] = [
+			...all.builtin,
+			...all.package,
+			...all.user,
+			...all.project,
+		];
+		const merged = mergeRuntimeAgents(pi, discovered, configuredAgents);
+		if (discovered.maxThinking === undefined) return merged;
+		return {
+			...merged,
+			agents: merged.agents.map((agent) => agent.maxThinking === discovered.maxThinking ? agent : { ...agent, maxThinking: discovered.maxThinking }),
+		};
+	};
 	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs, dispose: disposeAsyncJobTracker } = createAsyncJobTracker(pi, state, DIRS.async, {
 		widgetEnabled: asyncWidgetEnabled,
+		onJobTerminal: () => refreshResultDelivery(),
+		supervisorRequestState: supervisorChannel.getSupervisorRequestState,
 	});
-	const { startResultWatcher, primeExistingResults, stopResultWatcher } = createResultWatcher(
+	const resultWatcher = createResultWatcher(
 		pi,
 		state,
 		DIRS.results,
 		10 * 60 * 1000,
 		{
 			notifier: completionNotifier,
+			ownership: resultDeliveryOwnership,
 			observeCompletion: (result) => scheduledRunManager.handleAsyncCompletion(result),
 			observedCompletionRunIds: () => scheduledRunManager.observedCompletionRunIds(),
+			hasDeliveryDemand: hasResultDeliveryDemand,
 			deliverIntercomResults: config.intercomBridge?.resultDelivery === true,
+			resultScanLogging: config.resultScanLogging,
 		},
 	);
+	const { startResultWatcher, transitionResultDelivery, primeExistingResults, stopResultWatcher } = resultWatcher;
+	refreshResultDelivery = resultWatcher.refreshResultDelivery;
+	const asyncRetentionAbort = new AbortController();
+	const asyncRetentionTimer = setTimeout(async () => {
+		try {
+			await cleanupAsyncRetention({
+				asyncDirRoot: DIRS.async,
+				resultsDir: DIRS.results,
+				signal: asyncRetentionAbort.signal,
+				protectedRunIds: new Set([
+					...state.asyncJobs.keys(),
+					...(state.workflowControllers?.keys() ?? []),
+					...scheduledRunManager.referencedAsyncRunIds(),
+				]),
+			});
+		} catch (error) {
+			console.error("Failed to clean retained async subagent state:", error);
+		}
+	}, ASYNC_RETENTION_DELAY_MS);
+	asyncRetentionTimer.unref?.();
 
-	const runtimeCleanup = () => {
-		clearTimeout(resultIndexCleanupTimer);
-		stopResultWatcher();
-		state.currentSessionId = null;
-		completionNotifier.dispose();
-		mainWatchdog.dispose();
-		scheduledRunManager.stop();
-		supervisorChannel.dispose();
-		waitSubscriptionManager.dispose();
-		fleetStatus?.dispose();
-		disposeAsyncJobTracker();
-	};
-	globalStore[runtimeCleanupStoreKey] = runtimeCleanup;
-
-	const executor = createSubagentExecutor({
+	const executorDeps: Parameters<typeof createSubagentExecutor>[0] = {
 		pi,
 		state,
 		config,
 		asyncByDefault,
 		waitToolEnabled: waitToolConfig.enabled,
+		waitToolDefaultTimeoutMs: waitToolConfig.defaultTimeoutMs,
 		handleScheduledRunAction: (params, ctx) => scheduledRunManager.handleToolCall(params, ctx),
 		watchdog: mainWatchdog,
 		tempArtifactsDir,
 		getSubagentSessionRoot,
 		expandTilde,
-		discoverAgents,
-	});
+		discoverAgents: discoverAgentsForRuntime,
+		activateSupervisorTransport: () => supervisorChannel.activateTransport(),
+		refreshResultDelivery: () => refreshResultDelivery(),
+		trackRetainedNestedRoute: undefined,
+	};
+	const executor = createSubagentExecutor(executorDeps);
 	executorScheduled = executor.executeScheduled;
+
+	pi.registerMessageRenderer<SupervisorRequestMessageDetails>(SUPERVISOR_REQUEST_MESSAGE_TYPE, renderSupervisorRequest);
+	const registerEntryRenderer = (pi as unknown as {
+		registerEntryRenderer?: (customType: string, renderer: (entry: { data?: unknown }, options: { expanded: boolean }, theme: ExtensionContext["ui"]["theme"]) => Component | undefined) => void;
+	}).registerEntryRenderer;
+	if (typeof registerEntryRenderer === "function") {
+		registerEntryRenderer.call(pi, SUPERVISOR_REPLY_ENTRY_TYPE, renderSupervisorReply);
+	}
 
 	pi.registerMessageRenderer<SlashMessageDetails>(SLASH_RESULT_TYPE, (message, options, theme) => {
 		const details = resolveSlashMessageDetails(message.details);
@@ -541,6 +664,15 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		if (!options.expanded && trimmedPreview.includes("\n")) {
 			const expandKey = keyText("app.tools.expand");
 			text += `\n  ${theme.fg("dim", `${expandKey} full notification`)}`;
+		}
+		if (details.workflowRunId) {
+			text += `\n  ${theme.fg("muted", `workflow: ${details.workflowRunId}`)}`;
+		}
+		if (details.childRuns?.length) {
+			text += `\n  ${theme.fg("muted", `children: ${details.childRuns.map((child) => `${child.workflowKey ?? child.agent ?? "child"}=${child.runId}`).join(", ")}`)}`;
+		}
+		if (details.reconciledFromDetachedChild) {
+			text += `\n  ${theme.fg("muted", `reconciled child: ${details.reconciledFromDetachedChild}`)}`;
 		}
 		if (details.sessionLabel && details.sessionValue) {
 			text += `\n  ${theme.fg("muted", `${details.sessionLabel}: ${shortenPath(details.sessionValue)}`)}`;
@@ -597,10 +729,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		name: "subagent",
 		label: "Subagent",
 		description: buildSubagentToolDescription(config),
+		...buildSubagentToolPromptMetadata(config),
 		parameters,
 
-		execute(id, params, signal, onUpdate, ctx) {
-			return executeSubagentCollapsed(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx);
+		async execute(id, params, signal, onUpdate, ctx) {
+			return finalizeToolResult(await executeSubagentCollapsed(id, params as SubagentParamsLike, signal ?? new AbortController().signal, onUpdate, ctx));
 		},
 
 		renderCall(args, theme) {
@@ -615,7 +748,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			}
 			if (args.workflowScript)
 				return new Text(
-					`${title}${gap}${formatWorkflowManifest(args.workflowScript, args.async, false)}`,
+					`${title}${gap}${formatWorkflowManifest(args.workflowScript, args.async, false, args.preflight)}`,
+					0,
+					0,
+				);
+			if (args.workflowScriptPath)
+				return new Text(
+					`${title}${gap}${theme.fg("accent", args.workflowScriptPath)}${args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : ""}${args.preflight !== undefined ? `${gap}${theme.fg("dim", formatWorkflowPreflightCall(args.preflight))}` : ""}`,
 					0,
 					0,
 				);
@@ -639,7 +778,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool(tool);
 
-	registerWaitTool(pi, state, waitToolConfig.enabled, waitSubscriptionManager);
+	registerWaitTool(pi, state, waitToolConfig.enabled, waitSubscriptionManager, waitToolConfig.defaultTimeoutMs);
 
 	pi.on("agent_end", async (_event, ctx) => {
 		if (!ctx.hasUI) await drainOutstandingWork({ state, events: pi.events });
@@ -662,31 +801,17 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	registerSlashCommands(pi, state, {
+	const disposeSlashCommands = registerSlashCommands(pi, state, {
 		fleetKeybindings: config.fleetKeybindings,
 		foregroundDetachShortcut: config.foregroundDetachShortcut,
 	});
 
-	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
-	const controlNoticeSeenStoreKey = "__piSubagentVisibleControlNotices";
-	const previousEventUnsubscribes = globalStore[eventUnsubscribeStoreKey];
-	if (Array.isArray(previousEventUnsubscribes)) {
-		for (const unsubscribe of previousEventUnsubscribes) {
-			if (typeof unsubscribe !== "function") continue;
-			try {
-				unsubscribe();
-			} catch {
-				// Best effort cleanup for stale handlers from an older reload.
-			}
-		}
-	}
-	const existingVisibleControlNotices = globalStore[controlNoticeSeenStoreKey];
-	const visibleControlNotices = existingVisibleControlNotices instanceof Set ? existingVisibleControlNotices as Set<string> : new Set<string>();
-	globalStore[controlNoticeSeenStoreKey] = visibleControlNotices;
+	let visibleControlNotices = new Set<string>();
 	const activeHerdrRuns = () => projectActiveHerdrRuns(state);
 	const herdrStatusBridge = registerHerdrStatusBridge({
 		events: pi.events,
 		getRuns: activeHerdrRuns,
+		getProjectPaneCount: () => [...(state.herdrProjectPanes?.values() ?? [])].filter((pane) => pane.state === "open").length,
 		async runHerdr(args) {
 			await pi.exec(process.env.HERDR_BIN || "herdr", [...args], { timeout: 5_000 });
 		},
@@ -704,15 +829,19 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	};
 	const asyncStartedHandler = (payload: unknown) => {
 		handleStarted(payload);
+		supervisorChannel.activateTransport();
+		refreshResultDelivery();
 		fleetStatus?.refresh();
 	};
 	const asyncCompleteHandler = (payload: unknown) => {
 		handleComplete(payload);
+		refreshResultDelivery();
 		refreshActiveAsyncCapacity();
 		scheduledRunManager.handleAsyncCompletion(payload);
 		fleetStatus?.refresh();
 	};
 	const eventUnsubscribes = [
+		registerRuntimeAgentEventListener(pi),
 		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, asyncStartedHandler),
 		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, asyncCompleteHandler),
 		pi.events.on(SUBAGENT_PROCESS_TERMINAL_EVENT, () => {
@@ -724,13 +853,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		herdrStatusBridge.dispose,
 		rpcBridge.dispose,
 	];
-	globalStore[eventUnsubscribeStoreKey] = eventUnsubscribes;
 
 	pi.on("tool_result", (event, ctx) => {
 		if (event.toolName !== "subagent") return;
 		if (!ctx.hasUI) return;
 		state.lastUiContext = ctx;
+		const activeJobCount = state.asyncJobs.size;
 		restoreActiveJobs(ctx);
+		if (state.asyncJobs.size > activeJobCount) herdrStatusBridge.syncRuns();
 		fleetStatus?.setContext(ctx);
 		fleetStatus?.refresh();
 		if (state.asyncJobs.size > 0) {
@@ -753,14 +883,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const suspendWidgetsForCompaction = () => {
 		if (state.widgetsSuspended) return;
 		state.widgetsSuspended = true;
-		if (state.lastUiContext?.hasUI) state.lastUiContext.ui.setWidget(WIDGET_KEY, undefined);
+		withLastUiContext((ctx) => ctx.ui.setWidget(WIDGET_KEY, undefined));
 		fleetStatus?.refresh();
 	};
 	const resumeWidgetsAfterCompaction = () => {
 		if (!state.widgetsSuspended) return;
 		state.widgetsSuspended = false;
-		const ctx = state.lastUiContext;
-		if (ctx?.hasUI) refreshWidget(ctx);
+		withLastUiContext((ctx) => refreshWidget(ctx));
 		fleetStatus?.refresh();
 	};
 
@@ -772,16 +901,20 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		state.activeAsyncCapacity = getActiveAsyncCapacitySnapshot(
 			state.currentSessionId,
 			resolveMaxActiveAsyncRunsPerSession(config.maxActiveAsyncRunsPerSession),
-			{ liveWorkflowRunIds: new Set(state.workflowControllers?.keys() ?? []) },
+			{ liveWorkflowRunIds: new Set(state.workflowControllers?.keys() ?? []), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(config.capacity?.abandonedSlotReleaseAfterMs) },
 		);
 	};
 
-	const resetSessionState = (ctx: ExtensionContext, recovering: boolean) => {
+	const resetSessionState = (ctx: ExtensionContext, recovering: boolean, previousSessionFile?: string) => {
 		state.widgetsSuspended = false;
 		state.baseCwd = ctx.cwd;
 		goalTurnId = 0;
+		const previousRuntimeSessionId = state.currentSessionId;
+		resultDeliveryOwnership.claimPredecessor(previousSessionFile, previousRuntimeSessionId);
 		state.currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+		transitionResultDelivery();
 		state.parentSessionFile = ctx.sessionManager.getSessionFile();
+		state.trustedSessionFileRoot = state.parentSessionFile ? path.join(getAgentDir(), "sessions") : undefined;
 		state.trustedSessionRoots = [...new Set([
 			...(config.defaultSessionDir ? [path.resolve(expandTilde(config.defaultSessionDir))] : []),
 			...(state.parentSessionFile ? [getSubagentSessionRoot(state.parentSessionFile)] : []),
@@ -793,15 +926,18 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			granted: 0,
 			grantHistory: [],
 		};
+		const projectPaneOwnerRoot = path.resolve(ctx.cwd);
+		restoreHerdrProjectPaneSnapshots(state, [...new Set([...(state.herdrProjectPanes?.keys() ?? []), ...listHerdrProjectPaneRoots(projectPaneOwnerRoot), projectPaneOwnerRoot])]);
 		// Set PI_SUBAGENT_PARENT_SESSION for permission-system forwarding.
-		// Only set in the root session (the interactive UI session), not in
-		// child subagent processes — children inherit the parent's value
-		// through the process environment at spawn time and must not overwrite
-		// it with their own session identity.
+		// Only set in the root session (the interactive UI session), not in a
+		// child host: the runner process inherits the parent's value through
+		// its environment at spawn time and must not overwrite it with a child
+		// session's identity.
 		if (!process.env[SUBAGENT_CHILD_ENV]) {
 			const sessionId = ctx.sessionManager.getSessionId();
 			if (sessionId) {
 				process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId;
+				parentSessionEnvValue = sessionId;
 			}
 		}
 		state.lastUiContext = ctx;
@@ -812,6 +948,9 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		cleanupSessionArtifacts(ctx);
 		logSlowPhase("session-artifact-cleanup", phaseStartedAt);
 		state.foregroundControls.clear();
+		retainedNestedRouteTracker?.clear();
+		retainedNestedRouteTracker = undefined;
+		executorDeps.trackRetainedNestedRoute = undefined;
 		state.lastForegroundControlId = null;
 		phaseStartedAt = Date.now();
 		resetJobs(ctx);
@@ -840,6 +979,105 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		fleetStatus?.setContext(ctx);
 	};
 
+	let runtimeCleaned = false;
+	const runtimeEntry: SubagentRuntimeEntry = {
+		sessionManager: null,
+		visibleControlNotices,
+		cleanup() {
+			if (runtimeCleaned) return;
+			runtimeCleaned = true;
+			const shuttingDownParentSession = parentSessionEnvValue;
+			releaseHostSessionLiveness();
+			releaseHostSessionLiveness = () => {};
+			// Workflow continuations retain their launch context; abort them before
+			// teardown so a reload cannot launch through a stale context.
+			for (const controller of state.workflowControllers?.values() ?? []) {
+				if (!controller.signal.aborted) controller.abort(new Error("Workflow stopped because the extension session was replaced or reloaded."));
+			}
+			state.workflowControllers?.clear();
+			state.workflowChildStops?.clear();
+			clearRuntimeAgentsForPi(pi);
+			clearTimeout(resultIndexCleanupTimer);
+			clearTimeout(asyncRetentionTimer);
+			asyncRetentionAbort.abort();
+			stopResultWatcher();
+			resultDeliveryOwnership.clear();
+			completionNotifier.dispose();
+			mainWatchdog.dispose();
+			scheduledRunManager.stop();
+			supervisorChannel.dispose();
+			waitSubscriptionManager.dispose();
+			fleetStatus?.dispose();
+			disposeAsyncJobTracker();
+			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
+			state.cleanupTimers.clear();
+			state.asyncJobs.clear();
+			retainedNestedRouteTracker?.clear();
+			retainedNestedRouteTracker = undefined;
+			executorDeps.trackRetainedNestedRoute = undefined;
+			for (const unsubscribe of eventUnsubscribes) {
+				try {
+					unsubscribe();
+				} catch {
+					// Best effort cleanup during shutdown or reload.
+				}
+			}
+			disposeSlashCommands.dispose();
+			slashBridge.cancelAll();
+			slashBridge.dispose();
+			promptTemplateBridge.cancelAll();
+			promptTemplateBridge.dispose();
+			state.widgetsSuspended = false;
+			state.currentSessionId = null;
+			state.statusProjectionSessionId = null;
+			state.parentSessionFile = null;
+			parentSessionEnvValue = null;
+			if (shuttingDownParentSession && process.env[SUBAGENT_PARENT_SESSION_ENV] === shuttingDownParentSession) {
+				delete process.env[SUBAGENT_PARENT_SESSION_ENV];
+			}
+			if (runtimeEntry.sessionManager && runtimeRegistry.bySessionManager.get(runtimeEntry.sessionManager) === runtimeEntry) {
+				runtimeRegistry.bySessionManager.delete(runtimeEntry.sessionManager);
+			}
+			runtimeRegistry.activeEntries.delete(runtimeEntry);
+			if (runtimeRegistry.activeEntries.size === 0) clearSlashSnapshots();
+			try {
+				if (state.lastUiContext?.hasUI) state.lastUiContext.ui.setWidget(WIDGET_KEY, undefined);
+			} catch (error) {
+				if (!isStaleExtensionContextError(error)) throw error;
+			}
+			state.lastUiContext = null;
+		},
+	};
+
+	const installRuntime = (ctx: ExtensionContext) => {
+		if (runtimeCleaned) {
+			throw new Error("Cannot restart a cleaned pi-subagents extension runtime; register a new extension instance.");
+		}
+		const sessionManager = ctx.sessionManager as object;
+		const previousRuntime = runtimeRegistry.bySessionManager.get(sessionManager);
+		const existingVisibleControlNotices = runtimeRegistry.visibleControlNoticesBySessionManager.get(sessionManager);
+		if (existingVisibleControlNotices) {
+			visibleControlNotices = existingVisibleControlNotices;
+		} else {
+			runtimeRegistry.visibleControlNoticesBySessionManager.set(sessionManager, visibleControlNotices);
+		}
+		runtimeEntry.visibleControlNotices = visibleControlNotices;
+		if (runtimeEntry.sessionManager && runtimeEntry.sessionManager !== sessionManager
+			&& runtimeRegistry.bySessionManager.get(runtimeEntry.sessionManager) === runtimeEntry) {
+			runtimeRegistry.bySessionManager.delete(runtimeEntry.sessionManager);
+		}
+		runtimeEntry.sessionManager = sessionManager;
+		runtimeRegistry.bySessionManager.set(sessionManager, runtimeEntry);
+		runtimeRegistry.activeEntries.add(runtimeEntry);
+		if (previousRuntime && previousRuntime !== runtimeEntry) {
+			try {
+				previousRuntime.cleanup();
+			} catch {
+				// Best effort cleanup for stale resources from the replaced runtime.
+			}
+		}
+	};
+
 	pi.on("agent_start", () => {
 		resumeWidgetsAfterCompaction();
 		herdrStatusBridge.agentStarted();
@@ -855,7 +1093,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_compact", () => {
 		const hasActiveAsyncWork = [...state.asyncJobs.values()].some((job) => job.status === "queued" || job.status === "running");
-		if (!hasActiveAsyncWork || state.lastUiContext?.hasUI !== true) return;
+		if (!hasActiveAsyncWork || !withLastUiContext(() => true)) return;
 		pi.sendMessage(
 			{
 				customType: "subagent-compaction-resume",
@@ -867,57 +1105,39 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", (event, ctx) => {
+		installRuntime(ctx);
 		const recovering = event.reason === "startup" || event.reason === "reload" || event.reason === "resume";
-		resetSessionState(ctx, recovering);
+		resetSessionState(ctx, recovering, event.previousSessionFile);
+		releaseHostSessionLiveness();
+		const sessionId = ctx.sessionManager.getSessionId();
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		const liveness = sessionId
+			? registerPiWebSessionLiveness({
+				sessionId,
+				...(sessionFile ? { sessionFile } : {}),
+				isActive: () => hasLiveSubagentWork(state) || completionNotifier.hasPendingDelivery(),
+			})
+			: { registered: false, release: () => {} };
+		releaseHostSessionLiveness = liveness.release;
+		if (liveness.registered) {
+			retainedNestedRouteTracker = createRetainedNestedRouteTracker(state);
+			executorDeps.trackRetainedNestedRoute = retainedNestedRouteTracker.track;
+		}
 		herdrStatusBridge.sessionStarted({
 			hasUI: ctx.hasUI === true,
 			runs: activeHerdrRuns(),
 		});
 		rpcBridge.emitReady(ctx);
 		supervisorChannel.start();
+		supervisorChannel.activateTransport();
 	});
 
 	pi.on("session_shutdown", async () => {
-		state.widgetsSuspended = false;
-		clearTimeout(resultIndexCleanupTimer);
-		stopResultWatcher();
-		state.currentSessionId = null;
-		state.parentSessionFile = null;
-		completionNotifier.dispose();
-		delete process.env[SUBAGENT_PARENT_SESSION_ENV];
-		for (const unsubscribe of eventUnsubscribes) {
-			try {
-				unsubscribe();
-			} catch {
-				// Best effort cleanup during shutdown.
-			}
-		}
-		if (globalStore[eventUnsubscribeStoreKey] === eventUnsubscribes) {
-			delete globalStore[eventUnsubscribeStoreKey];
-		}
-		scheduledRunManager.stop();
-		disposeAsyncJobTracker();
-		for (const timer of state.cleanupTimers.values()) {
-			clearTimeout(timer);
-		}
-		state.cleanupTimers.clear();
-		state.asyncJobs.clear();
-		clearSlashSnapshots();
-		slashBridge.cancelAll();
-		slashBridge.dispose();
-		promptTemplateBridge.cancelAll();
-		promptTemplateBridge.dispose();
-		supervisorChannel.dispose();
-		fleetStatus?.dispose();
-		if (globalStore[runtimeCleanupStoreKey] === runtimeCleanup) {
-			delete globalStore[runtimeCleanupStoreKey];
-		}
+		runtimeEntry.cleanup();
 		try {
-			if (state.lastUiContext?.hasUI) {
-				state.lastUiContext.ui.setWidget(WIDGET_KEY, undefined);
-			}
+			await disposeChildSessions();
 		} catch (error) {
-			if (!isStaleExtensionContextError(error)) throw error;
+			console.error("Failed to dispose in-process child sessions:", error);
 		}
 		await herdrStatusBridge.flush();
 	});

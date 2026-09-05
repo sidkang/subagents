@@ -9,17 +9,20 @@ export const KNOWN_FIELDS = new Set([
 	"alias",
 	"aliases",
 	"tools",
+	"excludeTools",
+	"allowNestedSubagents",
 	"model",
 	"fallbackModels",
+	"fast",
 	"thinking",
 	"systemPromptMode",
 	"inheritProjectContext",
+	"inheritGlobalContext",
 	"inheritSkills",
 	"defaultContext",
 	"async",
 	"timeoutMs",
 	"toolTimeoutMs",
-	"turnBudget",
 	"acceptance",
 	"acceptanceRole",
 	"skill",
@@ -27,7 +30,9 @@ export const KNOWN_FIELDS = new Set([
 	"skillPath",
 	"extensions",
 	"subagentOnlyExtensions",
+	"mutationTools",
 	"output",
+	"outputMode",
 	"defaultReads",
 	"defaultProgress",
 	"interactive",
@@ -66,15 +71,22 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	];
 	const toolsValue = joinComma(tools);
 	if (toolsValue || preserve("tools")) lines.push(`tools: ${toolsValue ?? ""}`);
+	const excludeToolsValue = joinComma(config.excludeTools);
+	if (excludeToolsValue || preserve("excludeTools")) lines.push(`excludeTools: ${excludeToolsValue ?? ""}`);
+	if (config.allowNestedSubagents === true || preserve("allowNestedSubagents")) {
+		lines.push(`allowNestedSubagents: ${config.allowNestedSubagents === undefined ? "" : config.allowNestedSubagents ? "true" : "false"}`);
+	}
 
 	if (config.model || preserve("model")) lines.push(`model: ${config.model ?? ""}`);
 	const fallbackModelsValue = joinComma(config.fallbackModels);
 	if (fallbackModelsValue || preserve("fallbackModels")) lines.push(`fallbackModels: ${fallbackModelsValue ?? ""}`);
+	if (config.fast === true || preserve("fast")) lines.push(`fast: ${config.fast === undefined ? "" : config.fast ? "true" : "false"}`);
 	if ((config.thinking && (config.thinking !== "off" || preserve("thinking"))) || (!config.thinking && preserve("thinking"))) {
 		lines.push(`thinking: ${config.thinking ?? ""}`);
 	}
 	if (!preservingExistingFrontmatter || preserve("systemPromptMode")) lines.push(`systemPromptMode: ${config.systemPromptMode}`);
 	if (!preservingExistingFrontmatter || preserve("inheritProjectContext")) lines.push(`inheritProjectContext: ${config.inheritProjectContext ? "true" : "false"}`);
+	if (config.inheritGlobalContext || preserve("inheritGlobalContext")) lines.push(`inheritGlobalContext: ${config.inheritGlobalContext ? "true" : "false"}`);
 	if (!preservingExistingFrontmatter || preserve("inheritSkills")) lines.push(`inheritSkills: ${config.inheritSkills ? "true" : "false"}`);
 	if (config.defaultContext || preserve("defaultContext")) lines.push(`defaultContext: ${config.defaultContext ?? ""}`);
 	if (config.runner || preserve("runner")) {
@@ -88,7 +100,6 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	if (config.defaultAsync !== undefined || preserve("async")) lines.push(`async: ${config.defaultAsync === undefined ? "" : config.defaultAsync ? "true" : "false"}`);
 	if (config.defaultTimeoutMs !== undefined || preserve("timeoutMs")) lines.push(`timeoutMs: ${config.defaultTimeoutMs ?? ""}`);
 	if (config.defaultToolTimeoutMs !== undefined || preserve("toolTimeoutMs")) lines.push(`toolTimeoutMs: ${config.defaultToolTimeoutMs ?? ""}`);
-	if (config.defaultTurnBudget || preserve("turnBudget")) lines.push(`turnBudget: ${config.defaultTurnBudget ? JSON.stringify(config.defaultTurnBudget) : ""}`);
 	if (config.defaultAcceptance !== undefined || preserve("acceptance")) {
 		lines.push(`acceptance: ${config.defaultAcceptance === undefined
 			? ""
@@ -111,11 +122,14 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 		const subagentOnlyExtensionsValue = joinComma(config.subagentOnlyExtensions);
 		lines.push(`subagentOnlyExtensions: ${subagentOnlyExtensionsValue ?? ""}`);
 	}
+	const mutationToolsValue = joinComma(config.mutationTools);
+	if (mutationToolsValue || preserve("mutationTools")) lines.push(`mutationTools: ${mutationToolsValue ?? ""}`);
 
-	if (config.output) lines.push(`output: ${config.output}`);
+	if (config.output || preserve("output")) lines.push(`output: ${config.output ?? ""}`);
+	if (config.outputMode || preserve("outputMode")) lines.push(`outputMode: ${config.outputMode ?? ""}`);
 
 	const readsValue = joinComma(config.defaultReads);
-	if (readsValue) lines.push(`defaultReads: ${readsValue}`);
+	if (readsValue || preserve("defaultReads")) lines.push(`defaultReads: ${readsValue ?? ""}`);
 
 	if (config.defaultProgress) lines.push("defaultProgress: true");
 	if (config.interactive) lines.push("interactive: true");

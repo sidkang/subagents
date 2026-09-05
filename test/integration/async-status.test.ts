@@ -1,21 +1,61 @@
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
+import fsDefault, * as fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { formatAsyncRunList, listAsyncRuns } from "../../src/runs/background/async-status.ts";
+import { formatAsyncRunList, formatWorkflowStageLine, listAsyncRuns } from "../../src/runs/background/async-status.ts";
 import { ACTIVE_RUN_INDEX_DIR, DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import { encodeIndexSegment } from "../../src/runs/background/index-segment.ts";
+import { TERMINAL_RUN_INDEX_DIR } from "../../src/runs/background/terminal-run-index.ts";
 import { claimRunFanoutBatch, createRunFanoutBudget, writeRunFanoutBudgetDescriptor } from "../../src/runs/shared/run-fanout-budget.ts";
 
 function createAsyncDir(root: string, id: string, status: Record<string, unknown>): string {
 	const dir = path.join(root, id);
 	fs.mkdirSync(dir, { recursive: true });
-	fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(status), "utf-8");
-	if (status.state === "queued" || status.state === "running") updateActiveRunIndex(dir, status.state);
+	const persisted = status.sessionId === undefined ? { ...status, sessionId: "session-a" } : status;
+	fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify(persisted), "utf-8");
+	updateActiveRunIndex(dir, persisted.state as "queued" | "running" | "complete" | "failed" | "paused" | "stopped" | "rejected");
 	return dir;
 }
 
+const stagedLaneKeys = ["scope-scout", "red-tests", "label-helpers", "summary-title", "detail-row", "tiers-noise", "validation", "minimality-challenge", "fresh-review"];
+
+function stagedLaneStatusGraph(runId: string): Record<string, unknown> {
+	const nodeIds = stagedLaneKeys.map((key) => `${runId}.${key}`);
+	return {
+		runId,
+		mode: "workflow",
+		phases: [{ title: `${runId} staged lane`, nodeIds }],
+		nodes: stagedLaneKeys.map((key, index) => ({
+			id: nodeIds[index],
+			kind: "step",
+			agent: index === 0 ? "scout" : index === 7 ? "simplifier" : "worker",
+			label: key,
+			status: index === 0 ? "running" : "pending",
+			flatIndex: index,
+			stepIndex: index,
+		})),
+		currentNodeId: nodeIds[0],
+	};
+}
+
 describe("async status helpers", () => {
+	it("bounds workflow stage text from persisted status", () => {
+		const line = formatWorkflowStageLine({
+			id: `${"stage".repeat(80)}\u001b[31m`,
+			kind: "step",
+			label: `${"label".repeat(80)}\nsecond line`,
+			agent: "worker".repeat(40),
+			status: "failed",
+			error: `${"boom".repeat(100)}\nwith details`,
+		}, 0, 1);
+
+		assert.equal(line.includes("\u001b"), false);
+		assert.equal(line.includes("\n"), false);
+		assert.ok(line.length < 700, line);
+	});
+
 	it("lists only requested states and includes flattened step summaries", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-"));
 		let budgetDirectory: string | undefined;
@@ -33,7 +73,7 @@ describe("async status helpers", () => {
 				outputFile,
 				steps: [
 					{ agent: "scout", status: "complete", durationMs: 10, description: "Inspect auth only" },
-					{ agent: "worker", status: "running", durationMs: 20, description: "Patch billing only" },
+					{ agent: "worker", status: "running", durationMs: 20, description: "Patch billing only", contextLimit: 128_000, toolBudgetBlocked: true, watchdog: { phase: "stale", seq: 2, lastUpdate: 200 } },
 				],
 			});
 			const descriptor = createRunFanoutBudget("run-a", 64);
@@ -58,12 +98,235 @@ describe("async status helpers", () => {
 			assert.equal(runs[0]?.steps[1]?.status, "running");
 			assert.equal(runs[0]?.steps[0]?.description, "Inspect auth only");
 			assert.equal(runs[0]?.steps[1]?.description, "Patch billing only");
+			assert.equal(runs[0]?.steps[1]?.contextLimit, 128_000);
+			assert.equal(runs[0]?.steps[1]?.toolBudgetBlocked, true);
+			assert.equal(runs[0]?.steps[1]?.watchdog?.phase, "stale");
 			const text = formatAsyncRunList(runs);
 			assert.match(text, /Run fan-out: 3\/64 used, 61 remaining/);
 			assert.match(text, /output: .*output-1\.log/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 			if (budgetDirectory) fs.rmSync(budgetDirectory, { recursive: true, force: true });
+		}
+	});
+
+	it("forwards bounded timeout recovery evidence and formats the recovery route", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-recovery-"));
+		try {
+			const changedFiles = Array.from({ length: 25 }, (_, index) => `src/file-${String(index + 1).padStart(2, "0")}.ts`);
+			createAsyncDir(root, "run-recovery", {
+				runId: "run-recovery",
+				mode: "single",
+				state: "failed",
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{
+					agent: "worker",
+					status: "failed",
+					timedOut: true,
+					timeoutRecovery: {
+						termination: "timed-out",
+						changedFiles,
+						truncated: true,
+						recoveryNeeded: true,
+						reason: "timed-out-with-dirty-worktree",
+						reportStatus: "missing",
+						message: "raw recovery message must not cross the projection",
+						effects: { settlementDiagnostic: { finalTextPresent: true } },
+					},
+				}],
+			});
+
+			const run = listAsyncRuns(root, { states: ["failed"], reconcile: false })[0]!;
+			assert.deepEqual(run.steps[0]?.timeoutRecovery, {
+				termination: "timed-out",
+				changedFiles: changedFiles.slice(0, 20),
+				truncated: true,
+				recoveryNeeded: true,
+				reason: "timed-out-with-dirty-worktree",
+				reportStatus: "missing",
+			});
+			assert.doesNotMatch(JSON.stringify(run), /raw recovery message|settlementDiagnostic/);
+			const text = formatAsyncRunList([run], "Failed async runs");
+			assert.match(text, /Recovery needed: review the diff and artifacts before resuming or launching dependent stages\./);
+			assert.match(text, /requested report: missing/);
+			assert.match(text, /changed tracked files: src\/file-01\.ts, src\/file-02\.ts/);
+			assert.match(text, /file-20\.ts, …/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reports the planned runs.lanes stage count while the first child is running", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-staged-lane-"));
+		try {
+			const runId = "run-staged-lane";
+			createAsyncDir(root, runId, {
+				runId,
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				currentStep: 0,
+				steps: [{ agent: "scout", workflowKey: `${runId}.scope-scout`, label: "scope-scout", status: "running" }],
+				workflowGraph: stagedLaneStatusGraph(runId),
+			});
+
+			const runs = listAsyncRuns(root, { states: ["running"], reconcile: false });
+			const text = formatAsyncRunList(runs);
+			assert.match(text, /stage\s+1\/9/i);
+			assert.doesNotMatch(text, /step\s+1\/1/i);
+			assert.match(text, /scope-scout/);
+			assert.match(text, /stage\s+9\/9:.*fresh-review.*pending/i);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("loads typed host monitor nodes from workflow status without child identity", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-host-step-"));
+		try {
+			createAsyncDir(root, "workflow-host", {
+				runId: "workflow-host",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{ agent: "reviewer", workflowKey: "review", runId: "child-review", status: "running" }],
+				workflowGraph: {
+					runId: "workflow-host",
+					mode: "workflow",
+					phases: [],
+					nodes: [{
+						id: "ci-check",
+						kind: "host-step",
+						label: "CI",
+						status: "completed",
+						hostStep: {
+							version: 1,
+							kind: "host-step",
+							monitorKind: "ci",
+							id: "ci-check",
+							label: "CI",
+							provider: "local-tests",
+							state: "running",
+							detail: "waiting for checks",
+							updatedAt: 150,
+						},
+					}],
+				},
+			});
+
+			const runs = listAsyncRuns(root, { states: ["running"], reconcile: false });
+			assert.equal(runs[0]?.hostSteps?.[0]?.kind, "host-step");
+			assert.equal(runs[0]?.steps[0]?.workflowKey, "review");
+			assert.match(formatAsyncRunList(runs), /host ci: CI \| running \| provider:local-tests \| waiting for checks/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when a persisted host monitor node is malformed", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-host-step-invalid-"));
+		try {
+			createAsyncDir(root, "workflow-host-invalid", {
+				runId: "workflow-host-invalid",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				workflowGraph: {
+					runId: "workflow-host-invalid",
+					mode: "workflow",
+					phases: [],
+					nodes: [{ id: "bad", kind: "host-step", label: "bad", status: "running" }],
+				},
+			});
+			fs.rmSync(path.join(root, ACTIVE_RUN_INDEX_DIR, "workflow-host-invalid"));
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /host step.*expected an object/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+	it("projects bounded lane and display-only worktree metadata from status", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-lane-"));
+		try {
+			createAsyncDir(root, "run-lane", {
+				runId: "run-lane",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{
+					agent: "worker",
+					workflowKey: "writer",
+					lane: { version: 1, key: "writer", mode: "mutation", sourceRef: "owner/repo#1621" },
+					worktreePath: "/tmp/worktrees/run-lane-0",
+					branch: "pi-subagent/run-lane-0",
+					status: "running",
+				}],
+			});
+			const run = listAsyncRuns(root, { states: ["running"] })[0]!;
+			assert.deepEqual(run.steps[0]?.lane, { version: 1, key: "writer", mode: "mutation", sourceRef: "owner/repo#1621" });
+			assert.equal(run.steps[0]?.worktreePath, "/tmp/worktrees/run-lane-0");
+			assert.equal(run.steps[0]?.branch, "pi-subagent/run-lane-0");
+			assert.match(formatAsyncRunList([run]), /lane writer/);
+			assert.match(formatAsyncRunList([run]), /worktree .*run-lane-0 .*branch pi-subagent\/run-lane-0/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects malformed or mismatched lane identity in status", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-lane-invalid-"));
+		try {
+			const runDir = createAsyncDir(root, "run-lane-invalid", {
+				runId: "run-lane-invalid",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", workflowKey: "writer", lane: { version: 1, key: "other" }, status: "running" }],
+			});
+			fs.rmSync(path.join(root, ACTIVE_RUN_INDEX_DIR, "run-lane-invalid"));
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], repairScan: true }), /does not match workflow key/);
+			assert.equal(fs.existsSync(path.join(runDir, "status.json")), true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("renders persisted preflight mismatch warnings in async status lists", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-preflight-"));
+		try {
+			createAsyncDir(root, "run-preflight", {
+				runId: "run-preflight",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				preflight: {
+					version: 1,
+					coverage: "complete",
+					lanes: [{ key: "writer", mode: "mutation" }],
+				},
+				workflow: {
+					trace: [],
+					emits: [],
+					console: [],
+					preflightWarnings: ["Preflight advisory: workflow key 'review' launched without a declared lane."],
+				},
+			});
+
+			const runs = listAsyncRuns(root, { states: ["running"] });
+			const text = formatAsyncRunList(runs);
+			assert.match(text, /Plan: 1 lane · writer/);
+			assert.match(text, /Plan note: 1 preflight mismatch · details available for debug\./);
+			assert.doesNotMatch(text, /key \| mode \| decision \| claims \| expected output \| independence/);
+			assert.doesNotMatch(text, /Preflight warnings:/);
+			assert.doesNotMatch(text, /workflow key 'review' launched without a declared lane/);
+			assert.deepEqual(runs[0]?.preflight, { version: 1, coverage: "complete", lanes: [{ key: "writer", mode: "mutation" }] });
+			assert.deepEqual(runs[0]?.workflow?.preflightWarnings, ["Preflight advisory: workflow key 'review' launched without a declared lane."]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 
@@ -135,7 +398,7 @@ describe("async status helpers", () => {
 				startedAt: 100,
 				lastUpdate: 200,
 				steps: [
-					{ agent: "scout", context: "fresh", status: "running" },
+					{ agent: "scout", sessionName: "  scout: Scan the auth flow  ", context: "fresh", status: "running" },
 					{ agent: "worker", context: "fork", status: "running" },
 				],
 			});
@@ -145,7 +408,7 @@ describe("async status helpers", () => {
 			assert.deepEqual(runs[0]?.steps.map((step) => step.context), ["fresh", "fork"]);
 			const text = formatAsyncRunList(runs);
 			assert.match(text, /run-context \| running .* \| parallel \[mixed\]/);
-			assert.match(text, /1\. scout \[fresh\] \| running/);
+			assert.match(text, /1\. scout: Scan the auth flow \[fresh\] \| running/);
 			assert.match(text, /2\. worker \[fork\] \| running/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
@@ -341,7 +604,7 @@ describe("async status helpers", () => {
 		fs.writeFileSync(path.join(dir, "status.json"), "{not-json", "utf-8");
 		try {
 			assert.throws(
-				() => listAsyncRuns(root),
+				() => listAsyncRuns(root, { repairScan: true }),
 				/Failed to parse async status file/,
 			);
 		} finally {
@@ -360,9 +623,10 @@ describe("async status helpers", () => {
 				startedAt: 100,
 				steps: [{ agent: "worker", status: "running" }],
 			});
+			fs.rmSync(path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-session"));
 
 			assert.throws(
-				() => listAsyncRuns(root),
+				() => listAsyncRuns(root, { repairScan: true }),
 				/sessionId must be a string/,
 			);
 		} finally {
@@ -604,6 +868,373 @@ describe("async status helpers", () => {
 
 			assert.deepEqual(runs.map((run) => run.id), ["active"]);
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates corrupt active status while restoring valid runs and releases an aged marker", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-corrupt-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const corruptDir = path.join(root, "bad-run");
+			const corruptStatusPath = path.join(corruptDir, "status.json");
+			fs.mkdirSync(corruptDir, { recursive: true });
+			fs.writeFileSync(corruptStatusPath, Buffer.from([0, 0, 0]));
+			fs.writeFileSync(path.join(corruptDir, "runner.stderr.log"), "runner stopped unexpectedly\n", "utf-8");
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-run");
+			fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+			fs.writeFileSync(markerPath, "", "utf-8");
+			fs.utimesSync(markerPath, new Date(1_000), new Date(1_000));
+
+			const runs = listAsyncRuns(root, {
+				states: ["running"],
+				reconcile: false,
+				now: () => 1_000 + DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS + 1,
+			});
+
+			assert.deepEqual(runs.map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(corruptDir), true);
+			assert.deepEqual(fs.readFileSync(corruptStatusPath), Buffer.from([0, 0, 0]));
+			assert.equal(fs.readFileSync(path.join(corruptDir, "runner.stderr.log"), "utf-8"), "runner stopped unexpectedly\n");
+			assert.equal(fs.existsSync(markerPath), false);
+			assert.ok(diagnostics.some((message) => message.includes("bad-run") && message.includes(corruptStatusPath) && message.includes("Failed to parse async status file")));
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active status validation failures while preserving ordinary validation errors", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-validation", {
+				runId: "bad-validation",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", workflowKey: "writer", lane: { version: 1, key: "other" }, status: "running" }],
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-validation");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-validation") && message.includes("Failed to validate async status file")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /Failed to validate async status file/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active reconciliation validation failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-reconcile-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-reconcile", {
+				runId: "bad-reconcile",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", model: 123, status: "running" }],
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-reconcile");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"] }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-reconcile") && message.includes("steps[0].model must be a string")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], repairScan: true }), /steps\[0\]\.model must be a string/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active status summary projection failures while preserving ordinary projection errors", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-summary-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-summary", {
+				runId: "bad-summary",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+				workflowChildren: {
+					version: 1,
+					parentToolCallId: "call_123",
+					workflowRunId: "other-run",
+					inventoryComplete: true,
+					workflowState: "running",
+					children: [],
+				},
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-summary");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-summary") && message.includes("workflowChildren.workflowRunId does not match")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /workflowChildren\.workflowRunId does not match/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active workflowChildren identifier projection failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-child-id-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-child-id", {
+				runId: "bad-child-id",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+				workflowChildren: {
+					version: 1,
+					parentToolCallId: "   ",
+					workflowRunId: "bad-child-id",
+					inventoryComplete: true,
+					workflowState: "running",
+					children: [],
+				},
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-child-id");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-child-id") && message.includes("workflowChildren.parentToolCallId must be a non-empty identifier")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /workflowChildren\.parentToolCallId must be a non-empty identifier/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active output file projection failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-output-file-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-output-file", {
+				runId: "bad-output-file",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				outputFile: { path: "output.txt" },
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-output-file");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-output-file") && message.includes("outputFile must be a string")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /outputFile must be a string/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active workflowGraph host-step projection failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-host-step-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-host-step", {
+				runId: "bad-host-step",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+				workflowGraph: {
+					runId: "bad-host-step",
+					mode: "workflow",
+					phases: [],
+					nodes: [{ id: "gate", kind: "host-step", label: "gate", status: "running" }],
+				},
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-host-step");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"], reconcile: false }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-host-step") && message.includes("hostStep': expected an object")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], reconcile: false, repairScan: true }), /hostStep': expected an object/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates active workflowGraph container validation failures while preserving ordinary failures", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-workflow-graph-invalid-active-"));
+		const originalError = console.error;
+		const diagnostics: string[] = [];
+		try {
+			console.error = (...args: unknown[]) => diagnostics.push(args.map(String).join(" "));
+			createAsyncDir(root, "good-run", {
+				runId: "good-run",
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+			});
+			const invalidDir = createAsyncDir(root, "bad-workflow-graph", {
+				runId: "bad-workflow-graph",
+				mode: "workflow",
+				state: "running",
+				startedAt: 100,
+				steps: [{ agent: "worker", status: "running" }],
+				workflowGraph: {
+					runId: "bad-workflow-graph",
+					mode: "workflow",
+					phases: [],
+					nodes: null,
+				},
+			});
+			const markerPath = path.join(root, ACTIVE_RUN_INDEX_DIR, "bad-workflow-graph");
+
+			assert.deepEqual(listAsyncRuns(root, { states: ["running"] }).map((run) => run.id), ["good-run"]);
+			assert.equal(fs.existsSync(invalidDir), true);
+			assert.equal(fs.existsSync(markerPath), true);
+			assert.ok(diagnostics.some((message) => message.includes("bad-workflow-graph") && message.includes("workflowGraph': nodes must be an array")));
+
+			fs.rmSync(markerPath);
+			assert.throws(() => listAsyncRuns(root, { states: ["running"], repairScan: true }), /workflowGraph': nodes must be an array/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("lists recent terminal runs from time-sortable session markers", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-terminal-index-"));
+		try {
+			for (let index = 1; index <= 3; index++) {
+				createAsyncDir(root, `terminal-${index}`, {
+					runId: `terminal-${index}`,
+					sessionId: "session-a",
+					mode: "single",
+					state: "complete",
+					startedAt: index,
+					endedAt: index * 100,
+					steps: [{ agent: "worker", status: "complete" }],
+				});
+			}
+
+			const runs = listAsyncRuns(root, { sessionId: "session-a", states: ["complete"], entryLimit: 2, reconcile: false });
+			assert.deepEqual(runs.map((run) => run.id), ["terminal-3", "terminal-2"]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("removes invalid terminal markers while reading the advisory index", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-terminal-heal-"));
+		try {
+			const marker = path.join(root, TERMINAL_RUN_INDEX_DIR, encodeIndexSegment("session-a"), "0000000000000100-missing.json");
+			fs.mkdirSync(path.dirname(marker), { recursive: true });
+			fs.writeFileSync(marker, JSON.stringify({ version: 1, runId: "missing", sessionId: "session-a", endedAt: 100 }));
+
+			assert.deepEqual(listAsyncRuns(root, { sessionId: "session-a", states: ["complete"], reconcile: false }), []);
+			assert.equal(fs.existsSync(marker), false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not enumerate the async root for full-id or unsafe-prefix misses", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-exact-miss-"));
+		const originalReaddirSync = fsDefault.readdirSync;
+		try {
+			fsDefault.readdirSync = (() => { throw new Error("async root enumerated"); }) as typeof fsDefault.readdirSync;
+			syncBuiltinESMExports();
+			assert.deepEqual(listAsyncRuns(root, { runId: "12345678-1234-1234-1234-123456789012", reconcile: false }), []);
+			assert.deepEqual(listAsyncRuns(root, { runId: "short", reconcile: false }), []);
+		} finally {
+			fsDefault.readdirSync = originalReaddirSync;
+			syncBuiltinESMExports();
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});

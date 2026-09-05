@@ -61,6 +61,12 @@ function createTempGitRepo(prefix) {
 function writeGetAgentDirStub(staging) {
 	const utilsDir = join(staging, "src", "shared");
 	mkdirSync(utilsDir, { recursive: true });
+	// Keep current handoff validators real while the fixture substitutes only
+	// authority and worktree cleanup. These imports grew with upstream 0.65.
+	writeFileSync(join(utilsDir, "launch-contract.ts"), `export { stableJsonDigest } from ${JSON.stringify(pathToFileURL(join(root, "src/shared/launch-contract.ts")).href)};\n`);
+	const runsShared = join(staging, "src/runs/shared");
+	mkdirSync(runsShared, { recursive: true });
+	writeFileSync(join(runsShared, "lane-metadata.ts"), `export { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from ${JSON.stringify(pathToFileURL(join(root, "src/runs/shared/lane-metadata.ts")).href)};\n`);
 	writeFileSync(
 		join(utilsDir, "utils.ts"),
 		[

@@ -7,8 +7,9 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { discoverAgentsAll } from "../../src/agents/agents.ts";
 import { handleCreate } from "../../src/agents/agent-management.ts";
 import { clearSkillCache, discoverAvailableSkills, resolveSkillPath } from "../../src/agents/skills.ts";
-import { loadConfig, updateConfig } from "../../src/extension/config.ts";
+import { applyModelExclusionsConfig, loadConfig, resolveModelExclusionTTL, updateConfig } from "../../src/extension/config.ts";
 import { diagnoseIntercomBridge, resolveIntercomBridge } from "../../src/intercom/intercom-bridge.ts";
+import { DEFAULT_MODEL_EXCLUSION_TTL_MS, MAX_MODEL_EXCLUSION_TTL_MS, clearExclusions, flushPersist, recordModelFailure, reloadFromDisk } from "../../src/runs/shared/model-exclusions.ts";
 import { loadRunsForAgent, recordRun } from "../../src/runs/shared/run-history.ts";
 import { cleanupAllArtifactDirs, getArtifactsDir, getProjectArtifactsDir } from "../../src/shared/artifacts.ts";
 import { TEMP_ARTIFACTS_DIR } from "../../src/shared/types.ts";
@@ -91,13 +92,23 @@ describe("PI_CODING_AGENT_DIR runtime paths", () => {
 
 		process.env.PI_CODING_AGENT_DIR = agentDir;
 		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
-		writeFile(configPath, JSON.stringify({ asyncByDefault: true, maxSubagentDepth: 3, artifactDir: "session", artifactConfig: { cleanupDays: 9007199254740991 } }));
+		writeFile(configPath, JSON.stringify({ asyncByDefault: true, defaultSubagentContext: "fresh", maxSubagentDepth: 3, artifactDir: "session", artifactConfig: { cleanupDays: 9007199254740991 } }));
 
 		const config = loadConfig();
 		assert.equal(config.asyncByDefault, true);
+		assert.equal(config.defaultSubagentContext, "fresh");
 		assert.equal(config.maxSubagentDepth, 3);
 		assert.equal(config.artifactDir, "session");
 		assert.equal(config.artifactConfig?.cleanupDays, Number.MAX_SAFE_INTEGER);
+	});
+
+	it("requires a pruning model when pruned fork mode is enabled", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ forkContext: { mode: "pruned" } }));
+		assert.throws(() => loadConfig(), /forkContext\.model is required/);
+
+		writeFile(configPath, JSON.stringify({ forkContext: { mode: "pruned", model: "openai-codex/gpt-5.6-luna:max" } }));
+		assert.deepEqual(loadConfig().forkContext, { mode: "pruned", model: "openai-codex/gpt-5.6-luna:max" });
 	});
 
 	it("discovers user agents, chains, and settings under the configured agent dir", () => {
@@ -145,6 +156,41 @@ Inspect env.
 		);
 		assert.equal(created.isError, false, readText(created));
 		assert.equal(fs.existsSync(path.join(agentDir, "agents", `${createdName}.md`)), true);
+	});
+
+	it("ignores nested .pi and sync-backups agent definitions", () => {
+		const userAgentsDir = path.join(agentDir, "agents");
+		const rootAgentPath = path.join(userAgentsDir, "root-agent.md");
+		writeFile(rootAgentPath, `---
+name: root-agent
+description: Root agent
+---
+
+Use the configured root agent.
+`);
+		const nestedBackupAgentPath = path.join(userAgentsDir, ".pi", "agent", "sync-backups", "20260712-163714", "agents", "stale.md");
+		writeFile(nestedBackupAgentPath, `---
+name: stale
+model: nonexistent/model
+description: Stale backup agent
+---
+
+This definition must not be executable.
+`);
+		const directBackupAgentPath = path.join(userAgentsDir, "sync-backups", "20260712-163714", "agents", "also-stale.md");
+		writeFile(directBackupAgentPath, `---
+name: also-stale
+description: Another stale backup agent
+---
+
+This definition must not be executable either.
+`);
+
+		const discovered = discoverAgentsAll(cwd);
+		assert.ok(discovered.user.find((agent) => agent.name === "root-agent" && agent.filePath === rootAgentPath));
+		assert.equal(discovered.user.some((agent) => agent.name === "stale"), false);
+		assert.equal(discovered.user.some((agent) => agent.name === "also-stale"), false);
+		assert.equal(discovered.user.some((agent) => agent.filePath === nestedBackupAgentPath || agent.filePath === directBackupAgentPath), false);
 	});
 
 	it("resolves user skills, settings skills, and package skills from the configured agent dir", () => {
@@ -211,6 +257,21 @@ Package skill content.
 		assert.equal(fs.existsSync(artifactPath), false);
 	});
 
+	it("records explicit run outcomes without guessing legacy outcomes", () => {
+		const historyPath = path.join(agentDir, "run-history.jsonl");
+		writeFile(historyPath, `${JSON.stringify({ agent: "outcome-agent", task: "[redacted]", ts: 1, status: "error", duration: 1, exit: 143 })}\n`);
+		recordRun("outcome-agent", "failed", 1, 2);
+		recordRun("outcome-agent", "timed out", 1, 3, { timedOut: true });
+		recordRun("outcome-agent", "interrupted", 1, 4, { interrupted: true });
+		recordRun("outcome-agent", "stopped", 1, 5, { stopped: true });
+		recordRun("outcome-agent", "completed", 0, 6);
+		recordRun("outcome-agent", "signalled", 143, 7, { processSignal: "SIGTERM" });
+
+		const history = loadRunsForAgent("outcome-agent");
+		assert.deepEqual(history.map((entry) => entry.outcome), ["stopped", "completed", "stopped", "interrupted", "timed_out", "failed", undefined]);
+		assert.equal(history.at(-1)?.exit, 143);
+	});
+
 	it("resolves configured artifact directory preferences", () => {
 		const sessionFile = path.join(agentDir, "sessions", "session-1", "session.jsonl");
 
@@ -222,11 +283,94 @@ Package skill content.
 		assert.throws(() => getArtifactsDir(sessionFile, cwd, "workspace" as never), /Unsupported artifactDir/);
 	});
 
+	it("validates default subagent context values", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ defaultSubagentContext: "fresh" }));
+		assert.equal(loadConfig().defaultSubagentContext, "fresh");
+
+		writeFile(configPath, JSON.stringify({ defaultSubagentContext: "other" }));
+		assert.throws(() => updateConfig((config) => config), /config\.defaultSubagentContext must be "fresh" or "fork"/);
+	});
+
+	it("loads exact model response aliases and preserves them during config updates", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		const modelResponseAliases = {
+			"databricks-bedrock/ias-claude-opus-5": ["claude-opus-5", "exact/Response:high"],
+			"gateway/owner/model": [],
+		};
+		writeFile(configPath, JSON.stringify({ modelResponseAliases }));
+		assert.deepEqual(loadConfig().modelResponseAliases, modelResponseAliases);
+		updateConfig((config) => ({ ...config, asyncByDefault: false }));
+		assert.deepEqual(loadConfig(), { modelResponseAliases, asyncByDefault: false });
+		writeFile(configPath, JSON.stringify({ modelResponseAliases: {} }));
+		assert.deepEqual(loadConfig().modelResponseAliases, {});
+	});
+
+	it("fails config load for malformed model response aliases with useful diagnostics", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		for (const modelResponseAliases of [null, [], "alias", { "": [] }, { model: [] }, { "/model": [] }, { "provider/ ": [] }, { " /model": [] }]) {
+			writeFile(configPath, JSON.stringify({ modelResponseAliases }));
+			assert.throws(() => loadConfig(), /config\.modelResponseAliases.*(?:JSON object|provider\/model ID)/);
+		}
+		for (const aliases of [null, "response", [""], [" "], [1], ["valid", false]]) {
+			writeFile(configPath, JSON.stringify({ modelResponseAliases: { "provider/model": aliases } }));
+			assert.throws(() => loadConfig(), /config\.modelResponseAliases\["provider\/model"\].*array of non-empty response ID strings/);
+		}
+	});
+
+	it("loads and applies model exclusion TTL config", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		const exclusionPath = path.join(tempDir, "model-exclusions.json");
+		const previousExclusionPath = process.env.PI_MODEL_EXCLUSIONS_PATH;
+		process.env.PI_MODEL_EXCLUSIONS_PATH = exclusionPath;
+		try {
+			writeFile(configPath, JSON.stringify({ modelExclusions: { defaultTtlMs: 300_000 } }));
+			const config = loadConfig();
+			assert.equal(config.modelExclusions?.defaultTtlMs, 300_000);
+			assert.equal(resolveModelExclusionTTL(config), 300_000);
+			assert.equal(resolveModelExclusionTTL({}), DEFAULT_MODEL_EXCLUSION_TTL_MS);
+
+			applyModelExclusionsConfig(config);
+			reloadFromDisk();
+			recordModelFailure({ modelId: "gpt-5", provider: "openai", reason: "test" });
+			const entry = (JSON.parse(fs.readFileSync(exclusionPath, "utf-8")).exclusions as Array<{ recordedAt: number; expiresAt: number }>)[0];
+			assert.ok(entry);
+			assert.equal(entry.expiresAt - entry.recordedAt, 300_000);
+
+			for (const invalidTtl of [0, -1, MAX_MODEL_EXCLUSION_TTL_MS + 1, "300000", true, null]) {
+				writeFile(configPath, JSON.stringify({ modelExclusions: { defaultTtlMs: invalidTtl } }));
+				assert.throws(() => updateConfig((current) => current), /config\.modelExclusions\.defaultTtlMs must be a finite positive number/);
+			}
+		} finally {
+			clearExclusions();
+			flushPersist();
+			reloadFromDisk();
+			applyModelExclusionsConfig({});
+			if (previousExclusionPath === undefined) delete process.env.PI_MODEL_EXCLUSIONS_PATH;
+			else process.env.PI_MODEL_EXCLUSIONS_PATH = previousExclusionPath;
+			fs.rmSync(exclusionPath, { force: true });
+		}
+	});
+
 	it("rejects invalid artifactDir config values", () => {
 		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
 		writeFile(configPath, JSON.stringify({ artifactDir: "workspace" }));
 
 		assert.throws(() => updateConfig((config) => config), /config\.artifactDir must be "project", "session", or "temp"/);
+	});
+
+	it("loads and validates abandoned async capacity cleanup policy", () => {
+		const configPath = path.join(agentDir, "extensions", "subagent", "config.json");
+		writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: 600_000 } }));
+		assert.equal(loadConfig().capacity?.abandonedSlotReleaseAfterMs, 600_000);
+
+		writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: false } }));
+		assert.equal(loadConfig().capacity?.abandonedSlotReleaseAfterMs, false);
+
+		for (const invalid of [299_999, 86_400_001, 0, "600000", null]) {
+			writeFile(configPath, JSON.stringify({ capacity: { abandonedSlotReleaseAfterMs: invalid } }));
+			assert.throws(() => updateConfig((config) => config), /config\.capacity\.abandonedSlotReleaseAfterMs must be false or an integer/);
+		}
 	});
 
 	it("loads and validates Fleet keybinding config", () => {

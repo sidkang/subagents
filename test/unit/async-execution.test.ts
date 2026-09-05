@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, emitAsyncProcessTerminalEvent, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
-import type { AgentConfig } from "../../src/agents/agents.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ProcessTerminalV1 } from "../../src/shared/types.ts";
+import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, emitProcessTerminalEvent, formatAsyncStartedMessage, resolveAsyncRunnerLogPaths } from "../../src/runs/background/async-execution.ts";
+import type { AgentConfig } from "../../src/agents/agents.ts";
+import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
 
 const agent = (name: string, toolBudget?: AgentConfig["toolBudget"]): AgentConfig => ({
 	name,
@@ -26,53 +28,80 @@ const ctx = {
 	modelScope: undefined,
 };
 
-const terminalProof: ProcessTerminalV1 = {
-	version: 1,
-	state: "observed",
-	runId: "run-1",
-	runnerProcessInstanceId: "runner-1",
-	observedAt: 1,
-	instances: [],
-};
-
 describe("async runner execution", () => {
-	it("drops a stale context when an async runner emits its terminal proof", () => {
-		let calls = 0;
-		const pi = {
-			events: {
-				emit() {
-					calls++;
-					throw new Error("This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().");
-				},
+	it("uses supplied discovery context for missing async agents", () => {
+		const result = buildAsyncRunnerSteps("missing-agent", {
+			chain: [{ agent: "missing", task: "Do not launch" }],
+			agents: [agent("arbitrary")],
+			unknownAgentDiagnosticContext: {
+				cwd: path.resolve(ctx.cwd),
+				scope: "both",
+				directories: [{ source: "project", path: path.join(ctx.cwd, ".pi", "agents"), state: "empty" }],
+				agents: [agent("discovered")],
 			},
-		} as Pick<ExtensionAPI, "events">;
-
-		assert.doesNotThrow(() => emitAsyncProcessTerminalEvent(pi, terminalProof));
-		assert.equal(calls, 1);
+			ctx,
+			maxSubagentDepth: 1,
+			asyncDir: path.join(process.cwd(), ".tmp-missing-agent"),
+		});
+		assert.ok("error" in result);
+		assert.match(result.error, /^Unknown agent: missing\nEffective cwd: /);
+		assert.match(result.error, /discovered \(project\)/);
+		assert.doesNotMatch(result.error, /arbitrary \(project\)/);
 	});
 
-	it("does not mistake a subscriber error mentioning reload for a stale context", () => {
-		const pi = {
-			events: {
-				emit() {
-					throw new Error("subscriber failed: stale after session replacement or reload");
-				},
-			},
-		} as Pick<ExtensionAPI, "events">;
+	it("uses the resolved cwd override for no-context missing-agent fallback discovery", () => {
+		const override = path.join("diagnostic-cwd-override", "nested");
+		const result = buildAsyncRunnerSteps("missing-agent-cwd", {
+			chain: [{ agent: "missing", task: "Do not launch" }],
+			agents: [agent("arbitrary")],
+			ctx,
+			cwd: override,
+			maxSubagentDepth: 1,
+			asyncDir: path.join(process.cwd(), ".tmp-missing-agent-cwd"),
+		});
+		assert.ok("error" in result);
+		assert.ok(result.error.startsWith(`Unknown agent: missing\nEffective cwd: ${path.resolve(ctx.cwd, override)}`));
+		assert.doesNotMatch(result.error, /arbitrary \(project\)/);
+	});
 
-		assert.throws(() => emitAsyncProcessTerminalEvent(pi, terminalProof), /subscriber failed/);
+	it("loads launch rules from the resolved async step cwd", () => {
+		const repo = fs.mkdtempSync(path.join(os.tmpdir(), "async-step-rules-"));
+		const app = path.join(repo, "packages", "app");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = path.join(repo, "agent-home");
+		try {
+			fs.mkdirSync(path.join(app, ".pi"), { recursive: true });
+			fs.writeFileSync(path.join(app, ".pi", "settings.json"), JSON.stringify({ subagents: { watchdog: { rules: { action: "block", roleModels: { worker: { deny: ["mock/*"] } } } } } }, null, 2), "utf-8");
+			const result = buildAsyncRunnerSteps("async-step-rules", {
+				chain: [{ agent: "worker", task: "Do work", cwd: "packages/app" }],
+				agents: [{ ...agent("worker"), model: "mock/denied" }],
+				ctx: { ...ctx, cwd: repo },
+				cwd: repo,
+				asyncDir: path.join(repo, ".pi", "subagents", "async-step-rules"),
+				maxSubagentDepth: 1,
+			});
+
+			assert.ok("error" in result);
+			assert.match(result.error, /Launch blocked by subagents\.watchdog\.rules: Agent 'worker' was launched with denied model 'mock\/denied'/);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(repo, { recursive: true, force: true });
+		}
 	});
 
 	it("formats interactive yield and headless auto-drain guidance separately", () => {
 		const interactive = formatAsyncStartedMessage("Async: worker [interactive]", true);
 		assert.match(interactive, /interactive session[\s\S]*return control/i);
-		assert.match(interactive, /do not call subagent_wait\(\) merely to wait/i);
-		assert.match(interactive, /nonBlocking: true/);
+		assert.match(interactive, /native completion notification/i);
+		assert.match(interactive, /does not need a wait call/i);
+		assert.match(interactive, /provider, detached, or other background work that lacks a native completion notification/i);
+		assert.doesNotMatch(interactive, /bg_wait\(\{ id:/i);
 		assert.doesNotMatch(interactive, /auto-drains current-session background work/i);
 
 		const headless = formatAsyncStartedMessage("Async: worker [headless]", false);
-		assert.match(headless, /non-interactive run.*auto-drains current-session background work at agent_end/i);
-		assert.match(headless, /call subagent_wait\(\).*results before it ends/i);
+		assert.match(headless, /non-interactive run.*auto-drains current-session subagent work at agent_end/i);
+		assert.match(headless, /Use bg_wait only.*provider, detached, or other background-work results.*no native completion notification/i);
 		assert.doesNotMatch(headless, /nonBlocking: true/);
 		assert.doesNotMatch(headless, /By default, return control to the user/i);
 	});
@@ -108,6 +137,31 @@ describe("async runner execution", () => {
 		assert.deepEqual(result.steps[0]?.toolBudget, { hard: 3, block: ["find"] });
 		assert.equal(result.steps[0]?.waitToolEnabled, false);
 		assert.deepEqual(result.steps[1]?.toolBudget, { hard: 2, block: ["grep"] });
+	});
+	it("carries the resolved model context window into async runner steps", () => {
+		const result = buildAsyncRunnerSteps("context-limit-run", {
+			chain: [{ agent: "worker", task: "inspect context" }],
+			agents: [{ ...agent("worker"), model: "mock/context" }],
+			availableModels: [{ provider: "mock", id: "context", fullId: "mock/context", contextWindow: 128_000 }],
+			ctx,
+			asyncDir: path.join(process.cwd(), ".tmp-async-context-limit-test"),
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok("steps" in result, "expected successful step build");
+		assert.equal(result.steps[0]?.contextLimit, 128_000);
+	});
+
+	it("carries explicit nested fanout authorization into async runner steps", () => {
+		const nestedAgent = { ...agent("delegator"), allowNestedSubagents: true };
+		const result = buildAsyncRunnerSteps("nested-fanout-run", {
+			chain: [{ agent: "delegator", task: "delegate" }],
+			agents: [nestedAgent],
+			ctx,
+		});
+
+		assert.equal(result.error, undefined);
+		assert.equal(result.steps[0]?.allowNestedSubagents, true);
 	});
 
 	it("assigns default and agent-level deadlines to async serial and parallel children", () => {
@@ -184,5 +238,35 @@ describe("async runner execution", () => {
 
 		assert.ok("steps" in result, "expected successful step build");
 		assert.deepEqual(result.steps[0]?.toolBudget, { hard: 5, block: ["ls"] });
+	});
+});
+
+describe("async runner process terminal events", () => {
+	const proof = { version: 1, runId: "run-terminal", runnerProcessInstanceId: "runner-1", state: "unknown", reason: "writer-close-unverified" };
+	const staleMessage = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().";
+
+	const makeCtx = (emit: (name: string, payload?: unknown) => unknown) => ({
+		...ctx,
+		pi: { events: { emit } } as unknown as ExtensionAPI,
+	});
+
+	it("emits the process terminal proof on a live event bus", () => {
+		const emitted: Array<[string, unknown]> = [];
+		emitProcessTerminalEvent(makeCtx((name, payload) => { emitted.push([name, payload]); }), proof);
+
+		assert.deepEqual(emitted, [[SUBAGENT_PROCESS_TERMINAL_EVENT, proof]]);
+	});
+
+	it("drops stale extension ctx failures without throwing", () => {
+		assert.doesNotThrow(() => emitProcessTerminalEvent(makeCtx(() => {
+			throw new Error(staleMessage);
+		}), proof));
+	});
+
+	it("preserves non-stale subscriber errors, including messages that mention reload", () => {
+		for (const message of ["event bus unavailable", "subscriber failed: extension ctx is stale after reload"]) {
+			const error = new Error(message);
+			assert.throws(() => emitProcessTerminalEvent(makeCtx(() => { throw error; }), proof), (thrown) => thrown === error);
+		}
 	});
 });

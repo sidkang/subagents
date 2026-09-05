@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
 import {
 	ASYNC_DIR,
@@ -53,6 +56,78 @@ describe("resolveTempScopeId", () => {
 });
 
 describe("shared temp paths", () => {
+	it("uses the explicit temp root before shared paths resolve", () => {
+		const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-temp-override-"));
+		const override = path.join(fixture, "async state");
+		const isolatedHome = path.join(fixture, "home");
+		try {
+			const moduleUrl = new URL("../../src/shared/types.ts", import.meta.url).href;
+			const script = `import { ASYNC_DIR, RESULTS_DIR, TEMP_ROOT_DIR } from ${JSON.stringify(moduleUrl)}; console.log(JSON.stringify({ ASYNC_DIR, RESULTS_DIR, TEMP_ROOT_DIR }));`;
+			const result = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", script], {
+				encoding: "utf-8",
+				env: { ...process.env, HOME: isolatedHome, USERPROFILE: isolatedHome, PI_SUBAGENTS_TEMP_ROOT: override },
+			});
+			assert.equal(result.status, 0, result.stderr);
+			assert.deepEqual(JSON.parse(result.stdout.trim()), {
+				ASYNC_DIR: path.join(override, "async-subagent-runs"),
+				RESULTS_DIR: path.join(override, "async-subagent-results"),
+				TEMP_ROOT_DIR: override,
+			});
+		} finally {
+			fs.rmSync(fixture, { recursive: true, force: true });
+		}
+	});
+
+	it("isolates agent-dir profile writes from an inherited PI_CODING_AGENT_DIR", () => {
+		const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-isolation-"));
+		const tempRoot = path.join(fixture, "temp-root");
+		const callerAgentDir = path.join(fixture, "caller-agent");
+		try {
+			const loaderUrl = new URL("../support/isolated-temp-root.mjs", import.meta.url).href;
+			const profilesUrl = new URL("../../src/profiles/profiles.ts", import.meta.url).href;
+			const utilsUrl = new URL("../../src/shared/utils.ts", import.meta.url).href;
+			const script = `
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { applySubagentProfile, getSubagentProfilesDir } from ${JSON.stringify(profilesUrl)};
+import { getAgentDir } from ${JSON.stringify(utilsUrl)};
+
+const profilesDir = getSubagentProfilesDir();
+fs.mkdirSync(profilesDir, { recursive: true });
+fs.writeFileSync(path.join(profilesDir, "isolated.json"), JSON.stringify({ subagents: { agentOverrides: { worker: { thinking: "high" } } } }));
+const result = applySubagentProfile("isolated");
+console.log(JSON.stringify({ agentDir: getAgentDir(), profilePath: path.join(profilesDir, "isolated.json"), settingsPath: result.settingsPath }));
+`;
+			const env = {
+				...process.env,
+				PI_CODING_AGENT_DIR: callerAgentDir,
+				PI_SUBAGENTS_TEMP_ROOT: tempRoot,
+			};
+			delete env.PI_SUBAGENTS_TEST_LOADER;
+			const result = spawnSync(process.execPath, [
+				"--experimental-strip-types",
+				"--import", loaderUrl,
+				"--input-type=module",
+				"--eval", script,
+			], {
+				cwd: process.cwd(),
+				encoding: "utf-8",
+				env,
+			});
+			assert.equal(result.status, 0, result.stderr);
+			const output = JSON.parse(result.stdout.trim()) as { agentDir: string; profilePath: string; settingsPath: string };
+			const isolatedAgentDir = path.join(tempRoot, "home", ".pi", "agent");
+			assert.equal(output.agentDir, isolatedAgentDir);
+			assert.equal(output.profilePath, path.join(isolatedAgentDir, "profiles", "pi-subagents", "isolated.json"));
+			assert.equal(output.settingsPath, path.join(isolatedAgentDir, "settings.json"));
+			assert.equal(fs.existsSync(output.profilePath), true);
+			assert.equal(fs.existsSync(output.settingsPath), true);
+			assert.equal(fs.existsSync(callerAgentDir), false);
+		} finally {
+			fs.rmSync(fixture, { recursive: true, force: true });
+		}
+	});
+
 	it("anchors shared temp directories under one scoped root", () => {
 		assert.equal(path.dirname(RESULTS_DIR), TEMP_ROOT_DIR);
 		assert.equal(path.dirname(ASYNC_DIR), TEMP_ROOT_DIR);

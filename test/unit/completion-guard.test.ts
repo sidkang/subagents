@@ -7,6 +7,7 @@ import {
 	evaluateCompletionMutationGuard,
 	expectsImplementationMutation,
 	hasMutationToolCall,
+	validateImplementationToolContract,
 } from "../../src/runs/shared/completion-guard.ts";
 import { isMutatingTool } from "../../src/runs/shared/long-running-guard.ts";
 
@@ -39,6 +40,7 @@ test("implementation task with no mutation triggers the completion guard", () =>
 			expectedMutation: true,
 			attemptedMutation: false,
 			triggered: true,
+			blocked: false,
 		});
 	}
 });
@@ -51,7 +53,7 @@ function revivedTask(followUp: string): string {
 		"Original agent: worker",
 		"Original session file: /tmp/session.jsonl",
 		"",
-		"Use the stored session context as background. Answer the orchestrator's follow-up below. Do not assume the original child process is still alive.",
+		"Use the stored session context as background. Answer the orchestrator's follow-up below. Do not assume the original child session is still running.",
 		"",
 		"Follow-up:",
 		followUp,
@@ -102,6 +104,7 @@ test("implementation challenges may complete with explicit no-change reports", (
 			expectedMutation: true,
 			attemptedMutation: false,
 			triggered: false,
+			blocked: false,
 		});
 	}
 });
@@ -203,6 +206,7 @@ test("revived implementation tasks that mention implementation challenge remain 
 			expectedMutation: true,
 			attemptedMutation: false,
 			triggered: true,
+			blocked: false,
 		}, followUp);
 	}
 });
@@ -249,6 +253,7 @@ test("declared read-only builtin tools suppress implementation-word false positi
 		expectedMutation: false,
 		attemptedMutation: false,
 		triggered: false,
+		blocked: false,
 	});
 });
 
@@ -263,6 +268,7 @@ test("hyphenated fix adjectives in review tasks do not trigger the completion gu
 		expectedMutation: false,
 		attemptedMutation: false,
 		triggered: false,
+		blocked: false,
 	});
 	assert.equal(
 		expectsImplementationMutation("worker", "Return a review with the top 2-3 must-fix items."),
@@ -283,6 +289,7 @@ test("read-only issue drafting tasks do not trigger on suggested fix wording", (
 		expectedMutation: false,
 		attemptedMutation: false,
 		triggered: false,
+		blocked: false,
 	});
 	assert.equal(expectsImplementationMutation("worker", task), false);
 	assert.equal(
@@ -318,7 +325,64 @@ test("worker with mutating-capable tools still triggers when no mutation is obse
 		expectedMutation: true,
 		attemptedMutation: false,
 		triggered: true,
+		blocked: false,
 	});
+});
+
+test("missing child tools block mutation effects instead of triggering no-edit blame", () => {
+	const result = evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Implement the requested source fix",
+		messages: [assistantText("I cannot edit because tools are missing.")],
+		tools: ["read", "fixture_search"],
+		toolAvailabilityError: "Agent 'worker' requested unavailable child tools: fixture_search.",
+	});
+
+	assert.deepEqual(result, {
+		expectedMutation: true,
+		attemptedMutation: false,
+		triggered: false,
+		blocked: true,
+		message: "Agent 'worker' requested unavailable child tools: fixture_search.",
+	});
+});
+
+test("implementation tool contract rejects read-only worker launches", () => {
+	assert.match(
+		validateImplementationToolContract({
+			agent: "worker",
+			task: "Implement the requested source fix",
+			tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		}) ?? "",
+		/no mutation-capable tools/,
+	);
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Review only and return findings",
+		tools: ["read", "grep", "find", "ls"],
+	}), undefined);
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Implement the requested source fix",
+		tools: ["read", "edit"],
+	}), undefined);
+	assert.match(
+		validateImplementationToolContract({
+			agent: "worker",
+			task: "Implement the requested source fix",
+			tools: ["read", "structured_output"],
+		}) ?? "",
+		/no mutation-capable tools/,
+	);
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Implement the requested source fix",
+		tools: ["read", "/tmp/mutation-tools.ts"],
+	}), undefined);
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Implement the requested source fix",
+	}), undefined);
 });
 
 test("oracle review tasks with bash available do not require mutation", () => {
@@ -334,6 +398,7 @@ test("oracle review tasks with bash available do not require mutation", () => {
 		expectedMutation: false,
 		attemptedMutation: false,
 		triggered: false,
+		blocked: false,
 	});
 });
 
@@ -360,9 +425,47 @@ test("review-only, research, and framework output instructions do not expect mut
 	);
 });
 
+test("escaped line separators do not hide read-only prohibitions", () => {
+	const task = [
+		"This is a read-only skill compliance scenario, not an implementation assignment.",
+		"Read the supplied skill and write the exact user-facing response.",
+		"Do not edit files.",
+		"Use a scenario that discusses selection for an implementation task or closeout of an implementation assignment.",
+	].join("\\n");
+
+	assert.deepEqual(evaluateCompletionMutationGuard({
+		agent: "delegate",
+		task,
+		messages: [assistantText("The exact user-facing response")],
+		tools: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+	}), {
+		expectedMutation: false,
+		attemptedMutation: false,
+		triggered: false,
+		blocked: false,
+	});
+});
+
+test("output instructions after blanket no-edit prohibitions stay read-only", () => {
+	assert.deepEqual(evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Do not modify files\\nIn your final output, implement the fix.",
+		messages: [assistantText("Here is the explanation.")],
+		tools: ["read", "grep", "find", "ls", "bash", "edit", "write"],
+	}), {
+		expectedMutation: false,
+		attemptedMutation: false,
+		triggered: false,
+		blocked: false,
+	});
+	assert.equal(expectsImplementationMutation("worker", "Do not modify files\\nIn your final output/report/response, implement the fix."), false);
+});
+
 test("worker implementation verbs win over investigative wording and scoped prohibitions", () => {
 	assert.equal(expectsImplementationMutation("worker", "Investigate why the worker did not edit files and fix it"), true);
 	assert.equal(expectsImplementationMutation("worker", "Do not modify tests; implement the fix"), true);
+	assert.equal(expectsImplementationMutation("worker", "Do not modify files\\nin output/; implement the fix"), true);
+	assert.equal(expectsImplementationMutation("worker", "Do not modify files\\nin report/; implement the fix"), true);
 	assert.equal(expectsImplementationMutation("worker", "Do not modify tests — implement the fix"), true);
 	assert.equal(expectsImplementationMutation("worker", "Research the current code path and patch the bug"), true);
 	assert.equal(expectsImplementationMutation("worker", "Fix the bug where no edits were made"), true);
@@ -394,6 +497,27 @@ test("worker edit intent covers common docs, config, and source tasks", () => {
 test("edit and write tool calls count as mutation attempts", () => {
 	assert.equal(hasMutationToolCall([assistantToolCall("edit", { path: "a.ts" })]), true);
 	assert.equal(hasMutationToolCall([assistantToolCall("write", { path: "a.ts" })]), true);
+});
+
+test("declared extension mutation tools count without weakening unknown tools", () => {
+	const messages = [assistantToolCall("replace", { remove_from: "Liv" })];
+	assert.equal(hasMutationToolCall(messages), false);
+	assert.equal(hasMutationToolCall(messages, ["replace"]), true);
+	assert.equal(evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Replace the target line",
+		messages,
+		tools: ["read", "replace"],
+		mutationTools: ["replace"],
+		mutationEvidence: { source: "tracked-files", trackedOnly: true, attemptedMutation: false, changedFiles: [], unavailable: "not a Git worktree" },
+	}).triggered, false);
+	assert.equal(evaluateCompletionMutationGuard({
+		agent: "worker",
+		task: "Replace the target line",
+		messages,
+		tools: ["read", "replace"],
+		mutationEvidence: { source: "tracked-files", trackedOnly: true, attemptedMutation: false, changedFiles: [], unavailable: "not a Git worktree" },
+	}).triggered, true);
 });
 
 test("obvious mutating bash commands count as mutation attempts", () => {
@@ -567,5 +691,63 @@ test("implementation task with Cursor edit thinking does not trigger", () => {
 		expectedMutation: true,
 		attemptedMutation: true,
 		triggered: false,
+		blocked: false,
 	});
+});
+
+test("writer-role tasks with unknown implementation wording reject read-only launch tools", () => {
+	for (const task of [
+		"Address issue #1371 end-to-end: land the fix with tests.",
+		"Resolve backlog item #1371. Land the change and open a PR.",
+		"Work issue #1371. Ship the feature, run the test suite, and report back.",
+	]) {
+		assert.match(validateImplementationToolContract({
+			agent: "worker",
+			task,
+			tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+			requestedTools: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+		}), /no mutation-capable tools/, task);
+	}
+});
+
+test("configured extensions do not rescue clamped-away builtin mutation tools", () => {
+	assert.match(validateImplementationToolContract({
+		agent: "worker",
+		task: "Fix the lane-owned workflowScript launch so writer children get mutation tools.",
+		tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		configuredExtensions: ["/tmp/provider.ts"],
+		requestedTools: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+	}), /no mutation-capable tools/);
+});
+
+test("read-only agents and pure extension workers keep their launch contracts", () => {
+	assert.equal(validateImplementationToolContract({
+		agent: "reviewer",
+		task: "Review the diff and return findings only.",
+		tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		acceptanceRole: "read-only",
+	}), undefined);
+
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Implement the requested source fix.",
+		tools: ["read", "grep", "find", "ls", "contact_supervisor"],
+		configuredExtensions: ["/tmp/mutation-extension.ts"],
+		requestedTools: ["read", "grep", "find", "ls", "contact_supervisor"],
+	}), undefined);
+
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Task",
+		tools: ["read"],
+		requestedTools: ["read"],
+	}), undefined);
+
+	assert.equal(validateImplementationToolContract({
+		agent: "worker",
+		task: "Summarize the fix",
+		tools: ["read"],
+		requestedTools: ["read"],
+		completionGuard: false,
+	}), undefined);
 });

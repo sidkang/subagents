@@ -130,13 +130,13 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 		removeTempDir(tempDir);
 	});
 
-	it("captures stderr on non-zero exit", async () => {
+	it("reports a child session failure as the run error", async () => {
 		mockPi.onCall({ exitCode: 2, stderr: "Fatal: out of memory" });
 		const agents = makeAgentConfigs(["crash"]);
 
 		const result = await runSync(tempDir, agents, "crash", "Do heavy work", {});
 
-		assert.equal(result.exitCode, 2);
+		assert.equal(result.exitCode, 1);
 		assert.ok(result.error?.includes("out of memory"));
 	});
 
@@ -155,6 +155,44 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 
 		assert.notEqual(result.exitCode, 0, "should detect hidden failure");
 		assert.ok(result.error?.includes("connection refused"));
+	});
+
+	it("fails a zero-exit child that stops during a tool after earlier assistant output", async () => {
+		mockPi.onCall({
+			jsonl: [
+				events.assistantMessage("Work is in progress"),
+				events.toolStart("bash", { command: "write files" }),
+			],
+			exitCode: 0,
+		});
+		const agents = makeAgentConfigs(["worker"]);
+
+		const result = await runSync(tempDir, agents, "worker", "Do work", {});
+
+		assert.equal(result.exitCode, 1);
+		assert.match(result.error ?? "", /ended during 'bash' tool execution before the tool completed/);
+		assert.match(result.error ?? "", /Earlier assistant output is not a terminal result/);
+		assert.doesNotMatch(result.error ?? "", /cold-start/);
+	});
+
+	it("keeps a terminal answer authoritative over an earlier tool timeout", async () => {
+		mockPi.onCall({
+			steps: [
+				{ jsonl: [events.toolStart("bash")] },
+				{ delay: 50, jsonl: [events.assistantMessage("Done")] },
+			],
+			keepAliveAfterFinalMessageMs: 1_500,
+		});
+		const agents = makeAgentConfigs(["worker"]);
+
+		const result = await runSync(tempDir, agents, "worker", "Do work", {
+			toolTimeoutMs: 600,
+			timeoutMs: 5_000,
+		});
+
+		assert.equal(result.exitCode, 0);
+		assert.equal(result.timedOut, undefined);
+		assert.equal(result.finalOutput, "Done");
 	});
 
 	it("kills a wedged foreground tool at the configured per-tool timeout", { skip: process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
@@ -207,7 +245,10 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 	});
 
 	it("handles abort signal (completes faster than delay)", async () => {
-		mockPi.onCall({ delay: 10000 });
+		mockPi.onCall({ steps: [
+			{ jsonl: [events.toolStart("bash", { command: "wait" })] },
+			{ delay: 10000 },
+		] });
 		const agents = makeAgentConfigs(["slow"]);
 		const controller = new AbortController();
 
@@ -221,5 +262,6 @@ describe("runSync error handling", { skip: !piAvailable ? "pi packages not avail
 
 		// Key: should complete much faster than the 10s delay
 		assert.ok(elapsed < 5000, `should abort early, took ${elapsed}ms`);
+		assert.doesNotMatch(result.error ?? "", /exited during 'bash' tool execution/);
 	});
 });

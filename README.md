@@ -4,7 +4,7 @@
 
 # pi-subagents
 
-This fork snapshot is `pi-subagents@0.50.0+sid.2` on upstream `0.50.0` / `a14687b38761ba8e2d0fb41563401d0db12ec465`. See [Fork changes](./docs/fork-changes.md).
+This fork snapshot is `pi-subagents@0.65.1+sid.1` on upstream `0.65.1` / `83be9c3de2cde1553c0269f383efc1eb1194dc8b`. See [Fork changes](./docs/fork-changes.md).
 
 `pi-subagents` lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
 
@@ -34,6 +34,8 @@ pi update --extension git:github.com/sidkang/subagents@dev
 
 Do not load this package together with another extension that registers the same `subagent` surface.
 
+Background children require pi installed as the npm package (`@earendil-works/pi-coding-agent`): the detached runner imports pi's packages from that package directory. A standalone single-file pi binary has no package directory and cannot run background children; foreground children (`async: false`) still work there.
+
 ## Try this first
 
 You do not need to create agents, write config, or learn slash commands. After installing, ask Pi in plain language:
@@ -60,7 +62,7 @@ That is enough to start. Pi decides whether to call the `subagent` tool, which a
 
 Pi is the parent session. A subagent is a focused child Pi session with its own job.
 
-When you ask for a subagent, Pi starts the child, gives it the task, and brings the result back. Foreground runs stream in the conversation. Background runs keep working and can be checked later.
+When you ask for a subagent, Pi starts the child, gives it the task, and brings the result back. Foreground children run as sessions inside the parent Pi process and stream in the conversation. Background children run as sessions inside a detached runner process that keeps working and can be checked later.
 
 Installing the extension does not start an automatic reviewer in the background. It gives Pi a delegation tool. If you want every implementation reviewed, say so in your prompt or project instructions:
 
@@ -85,12 +87,16 @@ Rule of thumb: `scout` before you understand the code, `researcher` before you t
 
 ## Common workflows
 
+The package includes `/council` and `council-mode`, plus documented model-based
+`council-*` profile examples that you add in your own agent directory.
+
 | Want | Ask naturally |
 |------|---------------|
 | Get a second opinion | "Ask oracle to review this plan and challenge assumptions." |
 | Solve a hard problem | "Use oracle to investigate this bug before we edit." |
 | Review a diff | "Use reviewer to review this diff." |
 | Run parallel reviewers | "Run reviewers for correctness, tests, and cleanup." |
+| Debate a material decision | "Use `/council` with model-based advisors to compare this decision." |
 | Implement then review | "Implement this, then review it." |
 | Review until clean | "Run a review loop on this change with a max of 3 rounds." |
 | Execute a plan carefully | "Have worker implement this approved plan, then run reviewers and apply the feedback." |

@@ -29,21 +29,24 @@ describe("async stale-run reconciliation", () => {
 		assert.equal(checkPidLiveness(123, () => { throw new Error("boom"); }), "unknown");
 	});
 
-	it("marks a running async run failed when the runner pid is dead and no result exists", () => {
+	it("marks a dead runner failed and writes exactly one completion result", () => {
 		const root = tempRoot("pi-stale-run-");
 		try {
 			const asyncDir = path.join(root, "run-dead");
 			const resultsDir = path.join(root, "results");
 			writeStatus(asyncDir, {
+				lifecycleArtifactVersion: 3,
 				runId: "run-dead",
 				sessionId: "session-current",
+				completionOwnerId: "owner-current",
 				mode: "single",
 				state: "running",
 				pid: 12345,
+				processTerminal: { version: 1, state: "pending", runId: "run-dead", runnerProcessInstanceId: "runner-dead" },
 				startedAt: 1000,
 				lastUpdate: 1000,
 				currentStep: 0,
-				steps: [{ agent: "scout", status: "running", startedAt: 1000 }],
+				steps: [{ agent: "scout", status: "running", startedAt: 1000, contextOverflow: true }],
 			});
 
 			const result = reconcileAsyncRun(asyncDir, {
@@ -58,15 +61,27 @@ describe("async stale-run reconciliation", () => {
 			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
 			assert.equal(status.state, "failed");
 			assert.equal(status.sessionId, "session-current");
+			assert.equal(status.completionOwnerId, "owner-current");
 			assert.equal(status.steps[0].status, "failed");
 			assert.match(status.steps[0].error, /process 12345 exited or disappeared/);
 			const resultJson = JSON.parse(fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8"));
 			assert.equal(resultJson.success, false);
 			assert.equal(resultJson.sessionId, "session-current");
+			assert.equal(resultJson.completionOwnerId, "owner-current");
 			assert.equal(resultJson.state, "failed");
 			assert.equal(resultJson.exitCode, 1);
+			assert.equal(resultJson.results[0].contextOverflow, true);
 			assert.match(resultJson.summary, /process 12345 exited or disappeared/);
 			assert.match(fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf-8"), /subagent\.run\.repaired_stale/);
+
+			const resultText = fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8");
+			const second = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 3000,
+			});
+			assert.equal(second.repaired, false);
+			assert.equal(fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8"), resultText);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -199,7 +214,7 @@ describe("async stale-run reconciliation", () => {
 				state: "failed",
 				results: [
 					{ agent: "scout", success: true, sessionFile: scoutSession, model: "fast", attemptedModels: ["planned-scout", "fast"] },
-					{ agent: "worker", success: false, error: "boom", sessionFile: workerSession, model: "careful", attemptedModels: ["planned-worker", "careful"] },
+					{ agent: "worker", success: false, error: "boom", sessionFile: workerSession, model: "careful", attemptedModels: ["planned-worker", "careful"], contextOverflow: true },
 				],
 			}, null, 2), "utf-8");
 
@@ -221,6 +236,7 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(result.status?.steps?.[1]?.error, "boom");
 			assert.equal(result.status?.steps?.[1]?.model, "careful");
 			assert.deepEqual(result.status?.steps?.[1]?.attemptedModels, ["planned-worker", "careful"]);
+			assert.equal(result.status?.steps?.[1]?.contextOverflow, true);
 			assert.equal(result.status?.steps?.[1]?.sessionFile, workerSession);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });

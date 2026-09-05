@@ -1,11 +1,30 @@
 import * as fs from "node:fs";
-import type { ArtifactPaths, SubagentState, WaitCompletion, WaitCompletionChild } from "../../shared/types.ts";
+import type { ArtifactPaths, SubagentState, Usage, WaitCompletion, WaitCompletionChild } from "../../shared/types.ts";
 import type { AsyncRunSummary } from "./async-status.ts";
 import { readCompletionReplay, writeCompletionReplay } from "./completion-replay.ts";
-import { resultFilePath, resultPayloadPathForSessionRun } from "./result-files.ts";
+import { fallbackResultPayloadPathForSessionRun, resultFilePath, resultPayloadPathForSessionRun } from "./result-files.ts";
+import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
+import { projectTimeoutRecovery } from "../shared/mutation-evidence.ts";
 
 function asNonEmptyString(value: unknown): string | undefined {
 	return typeof value === "string" && value ? value : undefined;
+}
+
+function nonNegativeNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function projectedUsage(value: unknown): Usage | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const input = nonNegativeNumber(record.input);
+	const output = nonNegativeNumber(record.output);
+	const cacheRead = nonNegativeNumber(record.cacheRead);
+	const cacheWrite = nonNegativeNumber(record.cacheWrite);
+	const cost = nonNegativeNumber(record.cost);
+	const turns = nonNegativeNumber(record.turns);
+	if (input === undefined || output === undefined || cacheRead === undefined || cacheWrite === undefined || cost === undefined || turns === undefined || !Number.isSafeInteger(turns)) return undefined;
+	return { input, output, cacheRead, cacheWrite, cost, turns };
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -14,8 +33,22 @@ function errorCode(error: unknown): string | undefined {
 		: undefined;
 }
 
+function isAccessDenied(error: unknown): boolean {
+	const code = errorCode(error);
+	return code === "EPERM" || code === "EACCES";
+}
+
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+const STRUCTURED_OUTPUT_INLINE_LIMIT_BYTES = 4 * 1024;
+
+export function projectStructuredOutput(value: unknown): unknown {
+	if (value === undefined) return undefined;
+	const serialized = JSON.stringify(value);
+	if (typeof serialized !== "string") throw new Error("Structured output must be JSON-serializable");
+	return Buffer.byteLength(serialized, "utf8") <= STRUCTURED_OUTPUT_INLINE_LIMIT_BYTES ? JSON.parse(serialized) : undefined;
 }
 
 /**
@@ -37,22 +70,36 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 				: undefined;
 			const agent = asNonEmptyString(child.agent);
 			const childRunId = asNonEmptyString(child.runId);
+			const usage = projectedUsage(child.usage);
+			const sessionFile = asNonEmptyString(child.sessionFile);
 			const error = asNonEmptyString(child.error);
 			const model = asNonEmptyString(child.model);
+			const structuredOutput = projectStructuredOutput(child.structuredOutput);
+			const structuredOutputPath = asNonEmptyString(child.structuredOutputPath);
+			const contextOverflow = child.contextOverflow === true;
+			const timeoutRecovery = projectTimeoutRecovery(child.timeoutRecovery);
 			return [{
 				...(agent ? { agent } : {}),
 				...(childRunId ? { runId: childRunId } : {}),
+				...(usage ? { usage } : {}),
+				...(sessionFile ? { sessionFile } : {}),
 				...(typeof child.success === "boolean" ? { success: child.success } : {}),
 				...(outputState ? { outputState } : {}),
+				...(structuredOutput !== undefined ? { structuredOutput } : {}),
+				...(structuredOutputPath ? { structuredOutputPath } : {}),
 				...(error ? { error } : {}),
 				...(model ? { model } : {}),
+				...(contextOverflow ? { contextOverflow: true } : {}),
 				...(artifactPaths ? { artifactPaths } : {}),
+				...(timeoutRecovery ? { timeoutRecovery } : {}),
 			}];
 		})
 		: undefined;
 	const agent = asNonEmptyString(data.agent);
 	const mode = asNonEmptyString(data.mode);
 	const state = asNonEmptyString(data.state);
+	const workflowChildren = parseWorkflowChildSummary(data.workflowChildren);
+	if (workflowChildren && workflowChildren.workflowRunId !== runId) throw new Error("workflowChildren.workflowRunId does not match its completion run id.");
 	return {
 		runId,
 		...(agent ? { agent } : {}),
@@ -60,11 +107,12 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 		...(state ? { state } : {}),
 		...(typeof data.success === "boolean" ? { success: data.success } : {}),
 		...(results && results.length > 0 ? { results } : {}),
+		...(workflowChildren ? { workflowChildren } : {}),
 	};
 }
 
 /**
- * Record a consumed terminal payload for later surfacing by subagent_wait, pruning
+ * Record a consumed terminal payload for later surfacing by bg_wait, pruning
  * stale entries with the same TTL that dedupes completion notifications. The result
  * file is deleted after delivery, so this record is the only in-process source once
  * the watcher has consumed it.
@@ -115,9 +163,21 @@ export function collectWaitCompletions(terminal: AsyncRunSummary[], state: Subag
 			continue;
 		}
 		const publicResultPath = resultFilePath(resultsDir, run.id);
-		const resultPath = run.sessionId
-			? resultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id) ?? publicResultPath
-			: publicResultPath;
+		let resultPath = publicResultPath;
+		try {
+			resultPath = run.sessionId
+				? resultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id) ?? publicResultPath
+				: publicResultPath;
+		} catch (error) {
+			if (!isAccessDenied(error) || !run.sessionId) throw error;
+			try {
+				resultPath = fallbackResultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id) ?? publicResultPath;
+			} catch (fallbackError) {
+				throw new Error(`Failed to read subagent result '${publicResultPath}': ${errorMessage(fallbackError)}`, {
+					cause: fallbackError instanceof Error ? fallbackError : undefined,
+				});
+			}
+		}
 		try {
 			const raw = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as Record<string, unknown>;
 			completions.push(toWaitCompletion(raw, run.id));
