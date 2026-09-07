@@ -21,11 +21,6 @@ export const HOST_PEER_ALIASES: ReadonlyArray<{ specifier: string; pkg: string; 
 	{ specifier: "@earendil-works/pi-coding-agent", pkg: "@earendil-works/pi-coding-agent", subpath: "." },
 	{ specifier: "@earendil-works/pi-agent-core", pkg: "@earendil-works/pi-agent-core", subpath: "." },
 	{ specifier: "@earendil-works/pi-agent-core/node", pkg: "@earendil-works/pi-agent-core", subpath: "./node" },
-	{ specifier: "@earendil-works/chord", pkg: "@earendil-works/chord", subpath: "." },
-	{ specifier: "@earendil-works/chord/context", pkg: "@earendil-works/chord", subpath: "./context" },
-	{ specifier: "@earendil-works/pi-server", pkg: "@earendil-works/pi-server", subpath: "." },
-	{ specifier: "@earendil-works/pi-server/unix", pkg: "@earendil-works/pi-server", subpath: "./unix" },
-	{ specifier: "@earendil-works/pi-client/unix", pkg: "@earendil-works/pi-client", subpath: "./unix" },
 	{ specifier: "@earendil-works/pi-tui", pkg: "@earendil-works/pi-tui", subpath: "." },
 	{ specifier: "@earendil-works/pi-ai", pkg: "@earendil-works/pi-ai", subpath: "./compat" },
 	{ specifier: "@earendil-works/pi-ai/compat", pkg: "@earendil-works/pi-ai", subpath: "./compat" },
@@ -34,6 +29,19 @@ export const HOST_PEER_ALIASES: ReadonlyArray<{ specifier: string; pkg: string; 
 	{ specifier: "typebox", pkg: "typebox", subpath: "." },
 	{ specifier: "typebox/compile", pkg: "typebox", subpath: "./compile" },
 	{ specifier: "typebox/value", pkg: "typebox", subpath: "./value" },
+];
+
+/** Public Pi manifests introduce chord in 0.85.0 (absent through 0.84.4). */
+const CHORD_PEER_ALIASES = [
+	{ specifier: "@earendil-works/chord", pkg: "@earendil-works/chord", subpath: "." },
+	{ specifier: "@earendil-works/chord/context", pkg: "@earendil-works/chord", subpath: "./context" },
+];
+
+/** Experimental dependencies accidentally published in exactly Pi 0.85.0. */
+const PI0850_PEER_ALIASES = [
+	{ specifier: "@earendil-works/pi-server", pkg: "@earendil-works/pi-server", subpath: "." },
+	{ specifier: "@earendil-works/pi-server/unix", pkg: "@earendil-works/pi-server", subpath: "./unix" },
+	{ specifier: "@earendil-works/pi-client/unix", pkg: "@earendil-works/pi-client", subpath: "./unix" },
 ];
 
 interface PackageManifest {
@@ -103,7 +111,11 @@ export function resolvePackageSubpath(packageDir: string, subpath: string): stri
 
 /** Find `pkg` as the pi package itself, one of its dependencies, or a sibling in a hoisted install. */
 export function findHostPeerPackageDir(piPackageRoot: string, pkg: string): string | undefined {
-	if (readManifest(piPackageRoot)?.name === pkg) return piPackageRoot;
+	return findPeerPackageDir(piPackageRoot, pkg, readManifest(piPackageRoot)?.name);
+}
+
+function findPeerPackageDir(piPackageRoot: string, pkg: string, hostName: unknown): string | undefined {
+	if (hostName === pkg) return piPackageRoot;
 	const candidates = [path.join(piPackageRoot, "node_modules", pkg)];
 	let dir = piPackageRoot;
 	for (;;) {
@@ -127,14 +139,21 @@ export function resolveHostPeerAliases(
 	const aliases: Record<string, string> = {};
 	const missing: string[] = [];
 	const supplemental: string[] = [];
-	for (const { specifier, pkg, subpath } of HOST_PEER_ALIASES) {
-		const packageDir = findHostPeerPackageDir(piPackageRoot, pkg);
+	const hostManifest = readManifest(piPackageRoot);
+	const isPi0850 = hostManifest?.version === "0.85.0";
+	// Only known stable pre-chord versions may omit it. Unknown/prerelease
+	// hosts retain the required aliases, rather than hiding a broken install.
+	const stableVersion = typeof hostManifest?.version === "string" ? /^0\.(\d+)\.\d+$/.exec(hostManifest.version) : null;
+	const isPreChord = stableVersion !== null && Number(stableVersion[1]) < 85;
+	const required = [...HOST_PEER_ALIASES, ...(isPreChord ? [] : CHORD_PEER_ALIASES), ...(isPi0850 ? PI0850_PEER_ALIASES : [])];
+	for (const { specifier, pkg, subpath } of required) {
+		const packageDir = findPeerPackageDir(piPackageRoot, pkg, hostManifest?.name);
 		let target = packageDir ? resolvePackageSubpath(packageDir, subpath) : undefined;
 		// Pi 0.85.0 omitted this runtime dependency. Never replace working host
 		// exports or extend this exact version contract to other peers/hosts.
 		if ((!target || !fs.existsSync(target))
 			&& (specifier === "@earendil-works/pi-server" || specifier === "@earendil-works/pi-server/unix")
-			&& readManifest(piPackageRoot)?.version === "0.85.0"
+			&& isPi0850
 			&& (!packageDir || readManifest(packageDir)?.version === "0.85.0")) {
 			const localDir = findHostPeerPackageDir(extensionRoot, pkg);
 			if (localDir && readManifest(localDir)?.version === "0.85.0") {

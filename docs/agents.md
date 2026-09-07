@@ -39,12 +39,13 @@ Builtins load at the lowest priority, so a user or project agent with the same n
 |-------|--------------------------|
 | `scout` | Fast local codebase recon: relevant files, entry points, data flow, risks, and where another agent should start. |
 | `researcher` | Web/docs research with sources: official docs, specs, benchmarks, recent changes, and a concise research brief. |
+| `evidence-auditor` | Independent evidence review of important claims in an existing research brief. |
 | `worker` | Implementation work, including approved oracle handoffs. It edits files, validates, and escalates unapproved decisions instead of guessing. |
 | `reviewer` | Code review and small fixes. It checks the implementation against the task/plan, tests, edge cases, and simplicity. |
 | `oracle` | A second opinion before acting. It challenges assumptions, catches drift, and recommends the safest next move without editing. |
 | `delegate` | A lightweight general delegate when you want a child agent that behaves close to the parent session. |
 
-Rule of thumb: `scout` before you understand the code, `researcher` before you trust external facts, `worker` to implement, `reviewer` to check, and `oracle` when the decision itself feels risky.
+Rule of thumb: `scout` before you understand the code, `researcher` before you trust external facts, `evidence-auditor` before you rely on important research, `worker` to implement, `reviewer` to check, and `oracle` when the decision itself feels risky.
 
 `oracle` is an advisory reviewer that critiques direction and proposes an execution prompt without editing files. `advisor` is the same bundled role under the Claude Code-compatible name.
 
@@ -184,11 +185,15 @@ Native `oracle` runs inside Pi and can use its configured read tools. The Claude
 | `external-job-requests/` and `external-job-responses/` | Host-mediated provider bridge | pending request, terminal response | Host process writes a matching response and removes the request | Bridge timeout or malformed request response | Requests are operation-scoped. Recovery sends `reattach`/`result`, not `start` or `follow-up`, when job metadata exists. `start` and `follow-up` use durable dispatch claims | Provider not registered, host bridge not loaded, malformed request, provider exception, ambiguous dispatch without a provider job id |
 | Provider artifact path | External provider | provider-defined terminal artifact | Provider returns `artifactPath`, or Pi writes returned text to `external-job-<index>.result.md` | Provider reports failure or no result | Existing artifact path is retained in `status.json` | Missing artifact with no text output returns a terminal message instead of inventing content |
 
-The `researcher` builtin uses `web_search`, `fetch_content`, and `get_search_content`. Those require [pi-web-access](https://github.com/nicobailon/pi-web-access):
+### Web research prerequisites
+
+The `researcher` and `evidence-auditor` builtins use `web_search`, `fetch_content`, `get_search_content`, and selective `source_check` validation. Those require [pi-web-access](https://github.com/nicobailon/pi-web-access):
 
 ```bash
 pi install npm:pi-web-access
 ```
+
+The provider must be loaded in the child and register all four tools, including `source_check`, before launch; a missing required tool prevents a successful run. Foreground children do not load ambient parent extensions: configure `extensions` or `subagentOnlyExtensions` explicitly, or use background extension discovery as described in [Tool and extension selection](#tool-and-extension-selection). For `researcher`, fetched-source inspection is a fallback for a registered `source_check` call failing, not for missing registration.
 
 ## Overriding builtins and custom agents
 
@@ -228,6 +233,14 @@ Disable and restore:
 
 `eject`, `disable`, `enable`, and `reset` accept `agentScope: "user" | "project"` and operate in one scope at a time. Project overrides still win over user ones, so a project-scope disable survives a user-scope `enable` until you target the project scope.
 
+## Parent prompt discovery
+
+Set `advertise: true` in a specialist's agent file frontmatter for parent-prompt discovery. When the `subagent` tool is active, pi-subagents adds an agent-owned catalog of names and descriptions to the parent system prompt. Disabled agents and agents excluded by the current capability ceiling are omitted. Advertisement is not supported through settings overrides or runtime registration.
+
+Advertisement is opt-in discovery, not automatic routing. The catalog is sorted by name and limited to 16 agents and 12,288 total rendered UTF-8 bytes, including XML escaping, instructions, and omission counts. Descriptions are capped at 512 UTF-8 bytes before escaping. Entries that cannot fit are omitted; canonical agent names are never truncated. The parent still calls `subagent({ action: "list", capabilities: true })` before execution to confirm that the selected agent is executable (including `runner.available === true` for external CLI agents).
+
+The file catalog snapshot refreshes at session start/reload and after extension-owned agent-management mutations. External file or settings edits require `/reload`; ordinary turns do not poll the filesystem. Tool availability and capability-ceiling filtering are checked in memory on every prompt. A failed management-triggered refresh withdraws the catalog until a successful refresh, without changing the persisted mutation's result.
+
 ## Prompt assembly
 
 Subagents are narrow by default. Custom agents start with a clean system prompt and only the context you intentionally give them. They do not automatically inherit Pi's whole base prompt, project instruction files, or discovered skills catalog.
@@ -254,6 +267,7 @@ name: scout
 # Optional: registers this as code-analysis.scout while preserving name: scout
 package: code-analysis
 description: Fast codebase recon
+advertise: true
 aliases: explorer, code-scout
 tools: read, grep, find, ls, bash, mcp:chrome-devtools
 excludeTools: bash
@@ -301,6 +315,7 @@ Field notes:
 | Field | Notes |
 |-------|-------|
 | `package` | Optional package identifier. A file with `name: scout` and `package: code-analysis` registers as `code-analysis.scout`; serialization keeps `name` and `package` separate. |
+| `advertise` | Set `true` to include this agent's name and description in the parent system prompt when the `subagent` tool is active. Defaults to `false`. |
 | `aliases` | Optional comma-separated or block-list names that resolve to this agent for selection and explicit `agent` and task inputs. Runtime status, persistence, and config still use the canonical `name`. Exact canonical names take precedence over aliases, and alias collisions between distinct canonical agents fail as ambiguous. |
 | `tools` | Strict child tool allowlist. Named extension tools must also have their provider loaded. `mcp:` entries select direct MCP tools when `pi-mcp-adapter` is installed. |
 | `excludeTools` | Optional child tool deny-list applied after normal tool resolution. With an explicit `tools` allowlist, matching names are removed; when `tools` is omitted, the names are excluded from the child session's default tool set. Unknown names are ignored by Pi without making the agent definition invalid. |
@@ -308,7 +323,7 @@ Field notes:
 | `extensions` | Omitted means a background child loads the parent's ambient extensions; empty means no ambient extensions; list values load exactly those extensions. Foreground children never load ambient extensions, so for them only listed values apply. |
 | `subagentOnlyExtensions` | Extension paths loaded only in this agent's child sessions. Tools registered there are unavailable to the main agent unless also installed through normal Pi extension configuration. |
 | `model` | Default model. Bare ids prefer the current provider when possible, then unique registry matches. |
-| `fallbackModels` | Ordered backup models for provider/model failures such as quota, auth, provider-reported timeout, or unavailable model. Expiration of the run-level `timeoutMs` / `maxRuntimeMs` deadline is terminal and does not trigger fallback. Ordinary task failures do not trigger fallback. |
+| `fallbackModels` | Ordered backup models for retryable provider/model failures before any tool activity. After tool work, only an eligible native foreground or background read-only HTTP 429 can continue once on a compatible same-configured-provider model, reopening the exact retained file with a fixed continuation prompt rather than replaying the task. This shares one recovery allowance with compaction-abort recovery and preserves the original deadline/cancellation. Ordinary task/deadline failures and external runners do not gain this exception. Requires the owned builtin `read`/`ls` profile without wait, coordination, custom tools or configured tool budgets. Foreground denies any configured usage budget; background permits only an authoritative remaining token allowance, not cost or unknown coverage. Retained history alone is insufficient. See [supported configuration and compatibility limits](models.md#native-read-only-continuation-after-http-429). |
 | `thinking` | Appended as a `:level` suffix at runtime unless a suffix is already present. |
 | `systemPromptMode` | `replace` by default; `append` keeps Pi's base prompt. |
 | `inheritProjectContext` | Keeps or strips inherited repository instruction blocks. |
@@ -330,6 +345,8 @@ Field notes:
 | `interactive` | Parsed for compatibility but not currently enforced. |
 | `maxSubagentDepth` | Tightens nested delegation for this agent's children. |
 | `memory` | Opt-in role-specific persistent memory. See below. |
+
+When the completion guard would flag missing edits, a model intent arbiter can rescue only a confident read-only task. Foreground uses the parent model; native background uses the child attempt's existing model services after child shutdown. Ordinary completions do not invoke classification or resolve arbiter auth. Disabled arbitration (`PI_SUBAGENTS_LLM_INTENT_ARBITER=0`), unavailable model/auth, errors, ambiguous intent, and tasks over 8,000 characters keep the guard result. The classification prompt has a 10-second timeout; preceding auth and module loading are outside that bound. This does not change capability limits or the v1 contract's default-off guard and explicit missing-effect semantics.
 
 ## Per-agent persistent memory
 

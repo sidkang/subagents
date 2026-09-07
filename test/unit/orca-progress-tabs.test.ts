@@ -193,11 +193,19 @@ test("malformed optional observer metadata cannot break child execution", { skip
 		env: { ...process.env, ORCA_TEST_CAPTURE: capture },
 	} as never);
 	assert.ok(tab);
-	tab.finish("completed");
-	await waitForFile(capture);
+	await tab.finish("completed");
+	// Capture precedes the watchdog's final manifest/queue writes; wait for its close.
+	await tab.creationSettled;
 	const args = JSON.parse(fs.readFileSync(capture, "utf-8")) as string[];
 	assert.equal(args[args.indexOf("--title") + 1], "subagents · subagent · 1");
-	removeProgressFiles("run-0-");
+	const manifestDir = path.join(dir, ".pi", "subagents", "views", "orca");
+	const [manifestName] = fs.readdirSync(manifestDir);
+	const manifest = JSON.parse(fs.readFileSync(path.join(manifestDir, manifestName!), "utf-8"));
+	assert.equal(manifest.state, "open");
+	const viewer = args[args.indexOf("--command") + 1]!;
+	assert.match(await captureCommand(viewer, dir), /completed/);
+	assert.equal(fs.existsSync(manifest.logPath), false);
+	assert.equal(fs.existsSync(manifest.logPath.replace(/\.log$/, ".done")), false);
 });
 
 test("disabled Orca progress tabs do not invoke Orca", async () => {

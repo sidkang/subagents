@@ -356,13 +356,13 @@ function assertDivergentSiblingSurvived(source, divergentCommit, uniqueName) {
 	assert.match(content.stdout, /FOREIGN_DIVERGENT_CONTENT/);
 }
 
-test("fork worktree seam routes a JJ cwd to isolated JJ workspaces", () => {
+test("fork worktree seam routes a JJ cwd to isolated JJ workspaces", async () => {
 	const source = createTempJjSource("subagents-fork-route-");
 	const baseDir = mkdtempSync(join(tmpdir(), "subagents-fork-route-base-"));
 	const diffsDir = mkdtempSync(join(tmpdir(), "subagents-fork-route-diffs-"));
 	let setup;
 	try {
-		setup = createForkWorktrees(source, "fork-route", 2, { baseDir });
+		setup = await createForkWorktrees(source, "fork-route", 2, { baseDir });
 		assert.equal(setup.backend, "jj");
 		assert.equal(setup.worktrees.length, 2);
 		assert.ok(setup.worktrees.every((worktree) => worktree.backend === "jj"));
@@ -704,7 +704,7 @@ test("Git fallback / worktree:false: stock path never invokes jj", async () => {
 	let setup;
 	try {
 		assert.equal(isJjWorktreeCwd(gitRepo), false);
-		setup = createForkWorktrees(gitRepo, "git-zero-jj", 1, { baseDir });
+		setup = await createForkWorktrees(gitRepo, "git-zero-jj", 1, { baseDir });
 		assert.notEqual(setup.backend, "jj");
 		writeFileSync(join(setup.worktrees[0].path, "git-only.txt"), "git\n");
 		const diffs = diffForkWorktrees(setup, ["worker"], diffsDir);
@@ -757,7 +757,7 @@ test("JJ: rejects worktree base directories inside Pi extensions and symlink ali
 			() => createJjWorktrees(source, "extension-subdir", 1, { baseDir: join(extensionsDir, "checkout") }),
 			/worktree base directory cannot be inside Pi extensions directory/i,
 		);
-		assert.throws(
+		await assert.rejects(
 			() => createForkWorktrees(source, "extension-dir-route", 1, { baseDir: extensionsDir }),
 			/worktree base directory cannot be inside Pi extensions directory/i,
 		);
@@ -765,7 +765,7 @@ test("JJ: rejects worktree base directories inside Pi extensions and symlink ali
 			() => createJjWorktrees(source, "extension-symlink", 1, { baseDir: join(aliasDir, "checkout") }),
 			/worktree base directory cannot be inside Pi extensions directory/i,
 		);
-		assert.throws(
+		await assert.rejects(
 			() => createForkWorktrees(source, "extension-symlink-route", 1, { baseDir: join(aliasDir, "checkout") }),
 			/worktree base directory cannot be inside Pi extensions directory/i,
 		);
@@ -1792,7 +1792,7 @@ export function writeAtomicJson(path, value) {
 		);
 		const manifestPath = join(handoffDir, "handoff.json");
 		// Write pending handoff (preserves cleanup tasks with JJ identity)
-		handoff.writePendingParallelHandoff({
+		handoff.writeParallelHandoffGroup({
 			manifestPath,
 			runId: "handoff-run",
 			mode: "parallel",
@@ -1801,6 +1801,8 @@ export function writeAtomicJson(path, value) {
 			stepIndex: 0,
 			flatStartIndex: 0,
 			setup,
+			diffs: [],
+			results: [],
 		});
 		const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
 		assert.equal(manifest.version, 1);
@@ -1869,7 +1871,7 @@ test("final cleanup report keeps D0 so later discard reconstructs full identity"
 		staging = staged.staging;
 		const handoff = staged.handoff;
 		const manifestPath = join(handoffDir, "handoff.json");
-		handoff.writePendingParallelHandoff({
+		handoff.writeParallelHandoffGroup({
 			manifestPath,
 			runId: "handoff-d0",
 			mode: "parallel",
@@ -1878,6 +1880,8 @@ test("final cleanup report keeps D0 so later discard reconstructs full identity"
 			stepIndex: 0,
 			flatStartIndex: 0,
 			setup,
+			diffs: [],
+			results: [],
 		});
 
 		foreignPath = join(foreignBase, "foreign-child-of-D");
@@ -2523,7 +2527,7 @@ export function writeAtomicJson(path, value) {
 		const liveWt = liveSetup.worktrees[0];
 		const liveD = liveWt.workspaceChangeId;
 		const goodPath = join(handoffDir, "handoff-good.json");
-		handoff.writePendingParallelHandoff({
+		handoff.writeParallelHandoffGroup({
 			manifestPath: goodPath,
 			runId: "mal-good",
 			mode: "parallel",
@@ -2532,6 +2536,8 @@ export function writeAtomicJson(path, value) {
 			stepIndex: 0,
 			flatStartIndex: 0,
 			setup: liveSetup,
+			diffs: [],
+			results: [],
 		});
 		const goodManifest = JSON.parse(readFileSync(goodPath, "utf8"));
 		assert.equal(goodManifest.groups[0].frozenBaseCommitId, undefined);

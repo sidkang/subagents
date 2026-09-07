@@ -5,10 +5,12 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
+import { formatAsyncResultTranscript } from "../../src/runs/background/fleet-view.ts";
 import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { claimRunFanoutBatch, createRunFanoutBudget, writeRunFanoutBudgetDescriptor } from "../../src/runs/shared/run-fanout-budget.ts";
 import { TEMP_ROOT_DIR, type SubagentState } from "../../src/shared/types.ts";
+import { getArtifactPaths, getArtifactsDir } from "../../src/shared/artifacts.ts";
 
 function errno(code: string): NodeJS.ErrnoException {
 	const error = new Error(code) as NodeJS.ErrnoException;
@@ -22,6 +24,200 @@ function textContent(result: ReturnType<typeof inspectSubagentStatus>): string {
 }
 
 describe("async run status inspection", () => {
+	it("preserves short transcript ANSI escaping and the unindented binary placeholder", () => {
+		const text = formatAsyncResultTranscript({
+			id: "short-preview", state: "complete",
+			output: "\u001b[0m".repeat(4) + "a".repeat(24) + "\nPNG\0payload\nlatest context",
+		}, "/artifacts/result.json");
+		assert.equal(text, [
+			"Run: short-preview", "State: complete", "Artifacts:", "  Result: /artifacts/result.json",
+			"Result transcript tail:",
+			"  [U+001B][0m[U+001B][0m[U+001B][0m[U+001B][0maaaaaaaaaaaaaaaaaaaaaaaa",
+			"[binary content omitted for safe display]",
+			"  latest context",
+		].join("\n"));
+	});
+
+	it("bounds compact JSON session previews without changing short output or stored evidence", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-transcript-preview-"));
+		try {
+			const asyncDir = path.join(root, "runs", "preview");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const sessionFile = path.join(root, "session.jsonl");
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId: "preview", mode: "single", state: "complete",
+				steps: [{ agent: "worker", status: "complete", sessionFile }],
+			}));
+			const inspect = () => textContent(inspectSubagentStatus({ id: "preview", view: "transcript", lines: 35 }, {
+				asyncDirRoot: path.join(root, "runs"), resultsDir: path.join(root, "results"), sessionRoots: [root],
+			}));
+			const record = (role: string, text: string) => JSON.stringify({ message: { role, content: [{ type: "text", text }] } });
+			fs.writeFileSync(sessionFile, record("assistant", "Short 世界 😀\nsecond line") + "\n");
+			assert.equal(inspect(), [
+				"Run: preview", "State: complete", "Mode: single", "Step: 0 (worker) | complete", "Artifacts:",
+				`  Session: ${sessionFile}`, `Session transcript tail from ${sessionFile}:`, "  assistant: Short 世界 😀", "  second line",
+			].join("\n"));
+			const payload = JSON.stringify({ output: "😀世界\n".repeat(8_000) });
+			const stored = [record("assistant", "before tool"), record("toolResult", payload), "{malformed", record("assistant", "latest context")].join("\n") + "\n";
+			fs.writeFileSync(sessionFile, stored);
+			const text = inspect();
+			const body = text.split(`Session transcript tail from ${sessionFile}:\n`)[1]!;
+			assert.ok(body.length < 3_000, `single-entry preview rendered ${body.length} characters`);
+			assert.ok(body.split("\n").every((line) => line.length <= 2002));
+			assert.match(body, /toolResult: \{"output":/);
+			assert.match(body, /… \[content omitted\]/);
+			assert.match(body, /before tool/);
+			assert.ok(body.endsWith("  assistant: latest context"));
+			assert.doesNotMatch(body, /[\uD800-\uDFFF]|\uFFFD|U\+D[89AB]/u);
+			assert.match(text, /State: complete/);
+			assert.ok(text.includes(`Session: ${sessionFile}`));
+			assert.match(text, /Warnings:\n  Skipped 1 malformed session tail line/);
+			assert.equal(fs.readFileSync(sessionFile, "utf8"), stored);
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	for (const source of ["output", "recent", "result", "nested"] as const) {
+		it(`bounds the aggregate rendered ${source} transcript, retaining newest context`, () => {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-transcript-body-budget-"));
+			const route = createNestedRoute(`preview-${source}-root`);
+			try {
+				const id = `preview-${source}`;
+				const asyncDir = path.join(root, "runs", id);
+				const resultsDir = path.join(root, "results");
+				if (source !== "nested") fs.mkdirSync(asyncDir, { recursive: true });
+				fs.mkdirSync(resultsDir);
+				// Escaping expands each unsafe code point, so budget the final rendered text.
+				const entries = Array.from({ length: 100 }, (_, i) => `entry-${i}: ${"世界😀\u202e".repeat(70)}`);
+				entries.push("huge: " + "😀".repeat(10_000), "latest context");
+				const sessionFile = path.join(root, "session.jsonl");
+				const outputPath = path.join(asyncDir, "output-0.log");
+				const resultPath = path.join(resultsDir, `${id}.json`);
+				let artifactPath = source === "output" ? outputPath : source === "result" ? resultPath : sessionFile;
+				if (source === "nested") {
+					fs.writeFileSync(sessionFile, entries.map((text) => JSON.stringify({ message: { role: "assistant", content: text } })).join("\n"));
+					writeNestedEvent(route, { type: "subagent.nested.updated", ts: 150, parentRunId: route.rootRunId, parentStepIndex: 0,
+						child: { id, parentRunId: route.rootRunId, parentStepIndex: 0, depth: 1, path: [{ runId: route.rootRunId, stepIndex: 0, agent: "orchestrator" }], state: "complete", mode: "single", agent: "worker", sessionFile, lastUpdate: 150 } });
+				} else if (source === "result") {
+					fs.writeFileSync(resultPath, JSON.stringify({ id, agent: "worker", state: "complete", output: entries.join("\n"), sessionFile }));
+				} else {
+					fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: id, mode: "single", state: "complete",
+						steps: [{ agent: "worker", status: "complete", sessionFile, ...(source === "recent" ? { recentOutput: entries } : {}) }] }));
+					if (source === "output") fs.writeFileSync(outputPath, entries.join("\n"));
+					else artifactPath = path.join(asyncDir, "status.json");
+				}
+				const stored = fs.readFileSync(artifactPath, "utf8");
+				const result = inspectSubagentStatus({ id, view: "transcript", lines: 500 }, {
+					asyncDirRoot: path.join(root, "runs"), resultsDir, sessionRoots: [root],
+				});
+				assert.equal(result.isError, undefined);
+				const text = textContent(result);
+				const body = text.split(/(?:Transcript tail from .*|Recent output from status\.json|Result transcript tail|Session transcript tail from .*):\n/)[1]!;
+				assert.ok(body !== undefined, text);
+				assert.ok(Buffer.byteLength(body) <= 32 * 1024, `${source} body rendered ${Buffer.byteLength(body)} bytes`);
+				assert.ok(body.split("\n").every((line) => line.length <= 2002));
+				assert.match(body, /earlier lines omitted/);
+				assert.match(body, /huge: .*… \[content omitted\]/);
+				assert.match(body, /entry-99:/);
+				assert.doesNotMatch(body, /entry-0:|[\uD800-\uDFFF\u202e]|\uFFFD/u);
+				assert.ok(body.endsWith("latest context"));
+				assert.match(text, /State: complete/);
+				assert.match(text, /Artifacts:/);
+				assert.ok(text.includes(source === "output" ? outputPath : source === "result" ? resultPath : sessionFile));
+				assert.equal(fs.readFileSync(artifactPath, "utf8"), stored);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+				fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+			}
+		});
+	}
+
+	it("inspects live foreground artifacts on demand with child selection, ownership and bounded tails", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-live-foreground-transcript-"));
+		try {
+			const artifactRoot = getArtifactsDir(null, root, "project");
+			fs.mkdirSync(artifactRoot, { recursive: true });
+			const control = {
+				runId: "live-foreground", sessionId: "current", mode: "parallel" as const, cwd: root, startedAt: 1, updatedAt: 1,
+				activeChildren: new Map([2, 5].map((index) => [index, { index, agent: "worker", startedAt: 1, updatedAt: 1 }])),
+			};
+			const state = {
+				baseCwd: root, currentSessionId: "current", artifactDirPreference: "project", asyncJobs: new Map(),
+				foregroundControls: new Map([[control.runId, control]]), lastForegroundControlId: control.runId,
+			} as unknown as SubagentState;
+			const deps = { state, asyncDirRoot: path.join(root, "runs"), resultsDir: path.join(root, "results") };
+			const file = getArtifactPaths(artifactRoot, control.runId, "worker", 5).transcriptPath;
+			const record = (text: string) => `${JSON.stringify({ recordType: "message", role: "assistant", text })}\n`;
+			fs.writeFileSync(file, record("first\nsecond\nthird"));
+			const inspect = (params = {}) => inspectSubagentStatus({ view: "transcript", ...params }, deps);
+			assert.match(textContent(inspect()), /requires index.*Active child indexes: 2, 5/);
+			const selected = inspect({ id: "live-fore", index: 5, lines: 2 });
+			assert.equal(selected.isError, undefined);
+			assert.match(textContent(selected), /Child: 5 \(worker\)/);
+			assert.match(textContent(selected), /tail truncated/);
+			assert.match(textContent(selected), /second\nthird$/);
+			assert.doesNotMatch(textContent(selected), /first/);
+			fs.appendFileSync(file, record("fresh activity"));
+			assert.match(textContent(inspect({ index: 5 })), /fresh activity/);
+			fs.appendFileSync(file, [
+				{ recordType: "tool_start", toolName: "bash", toolCallId: "tool-1", argsPreview: "pwd" },
+				{ recordType: "message", role: "toolResult", toolCallId: "tool-1", text: "tool output" },
+				{ recordType: "message", role: "user", text: "supervisor guidance" },
+			].map((event) => JSON.stringify(event) + "\n").join(""));
+			assert.match(textContent(inspect({ index: 5 })), /Tool: bash \(complete\)\npwd\ntool output\nSupervisor: supervisor guidance/);
+			assert.match(textContent(inspect({ index: 2 })), /Transcript unavailable/);
+			assert.doesNotMatch(textContent(inspect({ index: 2 })), /fresh activity/);
+			for (const index of [-1, 1.5, 99]) assert.equal(inspect({ index }).isError, true);
+			control.sessionId = "other";
+			assert.match(textContent(inspect({ id: control.runId, index: 5 })), /not owned by the current session/);
+			assert.doesNotMatch(textContent(inspect({ id: control.runId, index: 5 })), /fresh activity/);
+			state.currentSessionId = null;
+			assert.equal(inspect({ id: control.runId, index: 5 }).isError, true);
+			state.currentSessionId = control.sessionId = "current";
+			fs.writeFileSync(file, record("界".repeat(30_000)));
+			const bytes = textContent(inspect({ index: 5, lines: 500 }));
+			assert.match(bytes, /tail truncated/);
+			assert.ok(Buffer.byteLength(bytes.split("(tail truncated):\n")[1]!) <= 32 * 1024);
+			assert.doesNotMatch(bytes, /\uFFFD/);
+			fs.writeFileSync(file, Array.from({ length: 600 }, (_, index) => record(`record-${index}`)).join(""));
+			const records = textContent(inspect({ index: 5, lines: 100_000 }));
+			assert.match(records, /tail truncated/);
+			assert.equal(records.split("(tail truncated):\n")[1]!.split("\n").length, 240);
+			assert.doesNotMatch(records, /record-0\b/);
+			assert.match(records, /record-599/);
+			fs.writeFileSync(file, record("界\n".repeat(600)));
+			const lines = textContent(inspect({ index: 5, lines: 100_000 }));
+			assert.equal(lines.split("(tail truncated):\n")[1]!.split("\n").length, 500);
+			fs.writeFileSync(file, record("x".repeat(2 * 1024 * 1024)) + record("latest\u001b\u202e") + '{"partial":');
+			const tail = textContent(inspect({ index: 5 }));
+			assert.match(tail, /tail truncated/);
+			assert.match(tail, /latest/);
+			assert.doesNotMatch(tail, /[\u001b\u202e]/u);
+			fs.unlinkSync(file);
+			const outside = path.join(root, "outside.jsonl");
+			fs.writeFileSync(outside, record("OUTSIDE_SECRET"));
+			fs.symlinkSync(outside, file);
+			const refused = textContent(inspect({ index: 5 }));
+			assert.match(refused, /refused a symlink/);
+			assert.match(refused, /Transcript unavailable/);
+			assert.doesNotMatch(refused, /OUTSIDE_SECRET/);
+			control.activeChildren.clear();
+			assert.match(textContent(inspect()), /no active foreground child/);
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
+
+	it("projects only published receipt references from result-only status", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-receipt-status-"));
+		try {
+			const resultPath = path.join(root, "receipt-run.json");
+			for (const workflowReceipt of [{ path: "/opaque/published.json", receipt: {} }, undefined, { path: 42 }, []]) {
+				fs.writeFileSync(resultPath, JSON.stringify({ runId: "receipt-run", mode: "workflow", success: true, workflowReceipt }));
+				const result = inspectSubagentStatus({ id: "receipt-run" }, { asyncDirRoot: path.join(root, "absent"), resultsDir: root });
+				const expected = workflowReceipt && "path" in workflowReceipt && typeof workflowReceipt.path === "string" ? workflowReceipt.path : undefined;
+				assert.equal(result.details?.workflowReceiptPath, expected);
+				assert.equal(textContent(result).includes("Workflow receipt:"), expected !== undefined);
+			}
+		} finally { fs.rmSync(root, { recursive: true, force: true }); }
+	});
 	afterEach(() => {
 		delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_JOB_PROVIDER_REGISTRY_KEY)];
 	});

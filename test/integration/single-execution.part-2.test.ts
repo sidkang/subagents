@@ -23,6 +23,9 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
+import { createServer, type Socket } from "node:net";
+import { once } from "node:events";
+import { SUBAGENT_FOREGROUND_COMPLETE_EVENT } from "../../src/shared/types.ts";
 import {
 	createTempDir,
 	createEventBus,
@@ -66,6 +69,119 @@ import { toSubagentDelegationExecutionParams } from "../../src/slash/delegation-
 
 describe("single sync execution", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installSingleExecutionHooks();
+
+	for (const mode of ["abort", "attached", "detached"] as const) {
+		it(`foreground setup lifecycle: ${mode}`, { skip: !createSubagentExecutor || process.platform === "win32" ? "requires real POSIX setup hook" : undefined, timeout: 20_000 }, async () => {
+			execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
+			execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir });
+			execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir });
+			fs.writeFileSync(path.join(tempDir, "base.txt"), "base\n");
+			execFileSync("git", ["add", "base.txt"], { cwd: tempDir });
+			execFileSync("git", ["commit", "-m", "base"], { cwd: tempDir, stdio: "ignore" });
+			const holdPath = path.join(tempDir, ".git", "hold-hook");
+			const releaseChild = path.join(tempDir, ".git", "release-child");
+			const launchMarker = path.join(tempDir, ".git", "model-launched.txt");
+			const server = createServer();
+			server.listen(0, "127.0.0.1");
+			await once(server, "listening");
+			const address = server.address() as { port: number };
+			const hook = path.join(tempDir, ".git", "setup-hook.cjs");
+			fs.writeFileSync(hook, `#!${process.execPath}\nconst fs = require('node:fs');
+process.stdin.resume();
+if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
+ const socket = require('node:net').connect(${address.port}, '127.0.0.1', () => socket.write('ready'));
+ socket.on('data', data => { if (data.toString() === 'release') { socket.end(); console.log('{}'); } else socket.write('ack'); });
+ setTimeout(() => process.exit(90), 15000).unref();
+}\n`, { mode: 0o755 });
+			const baseDir = createTempDir();
+			const bus = createEventBus();
+			const executor = makeExecutor([makeAgent("worker", { systemPrompt: "Intercom orchestration channel:" })], { worktreeBaseDir: baseDir, worktreeSetupHook: hook }, false, { sessionId: "session-123", count: 0 }, true, new Map(), undefined, undefined, bus);
+			let notified = false;
+			let notify!: () => void;
+			const notification = new Promise<void>((resolve) => { notify = resolve; });
+			bus.on(SUBAGENT_FOREGROUND_COMPLETE_EVENT, () => { notified = true; notify(); });
+			const controller = new AbortController();
+			let socket: Socket | undefined;
+			let child: Promise<ExecutorToolResult> | undefined;
+			let setup: Promise<ExecutorToolResult> | undefined;
+			try {
+				let childSettled = false;
+				let childCompleted!: () => void;
+				const completed = new Promise<void>((resolve) => { childCompleted = resolve; });
+				if (mode !== "abort") {
+					let childReady!: () => void;
+					const ready = new Promise<void>((resolve) => { childReady = resolve; });
+					mockPi.onCall({ steps: [{ jsonl: [events.toolStart("contact_supervisor", { reason: "need_decision", message: "Ready" })] }, { waitForPath: releaseChild, jsonl: [events.assistantMessage("child A done")] }] });
+					child = executor.execute("lifecycle-A", { async: false, agent: "worker", task: "A", worktree: true, acceptance: false }, controller.signal, (update) => {
+						if (update.details?.progress?.some((entry) => entry.currentTool === "contact_supervisor")) childReady();
+						if (update.details?.progress?.some((entry) => entry.status === "completed")) childCompleted();
+					}, makeMinimalCtx(tempDir));
+					void child.then(() => { childSettled = true; });
+					await Promise.race([ready, child.then((result) => { throw new Error(`A returned before ready: ${JSON.stringify(result)}`); })]);
+					if (mode === "detached") {
+						bus.emit(INTERCOM_DETACH_REQUEST_EVENT, { requestId: "lifecycle-detach" });
+						assert.equal((await child).details.results[0]?.detached, true);
+					}
+				}
+				fs.writeFileSync(holdPath, "hold");
+				const connection = once(server, "connection");
+				mockPi.onCall({ output: "child B done", writeFiles: [{ path: launchMarker, content: "launched" }] });
+				const otherOwner = makeExecutor([makeAgent("worker")], { worktreeBaseDir: baseDir, worktreeSetupHook: hook });
+				setup = otherOwner.execute("lifecycle-B", { async: false, agent: "worker", task: "B", worktree: true, acceptance: false }, controller.signal, undefined, makeMinimalCtx(tempDir));
+				[socket] = await Promise.race([connection, setup.then((result) => { throw new Error(`Setup returned before hook ready: ${JSON.stringify(result)}`); })]) as [Socket];
+				await once(socket, "data"); // Real hook ready; the owner serviced I/O while setup remains held.
+				if (mode === "abort") {
+					controller.abort();
+					const result = await setup;
+					assert.equal(result.isError, true);
+					assert.equal(mockPi.callCount(), 0);
+					assert.equal(fs.existsSync(launchMarker), false, "aborted setup must not reach child side effects");
+					assert.ok(result.details.parallelHandoff?.path, result.content[0]?.text);
+					const handoff = JSON.parse(fs.readFileSync(result.details.parallelHandoff.path, "utf8"));
+					const cleanup = handoff.groups[0].cleanup;
+					assert.equal(cleanup.state, "complete");
+					assert.equal(cleanup.tasks.length, 1);
+					assert.match(cleanup.errors.join("\n"), /"processTree":"observed"/);
+					for (const task of cleanup.tasks) {
+						assert.equal(task.worktreeRemoved, true);
+						assert.equal(task.branchRemoved, true);
+						assert.equal(fs.existsSync(task.path), false);
+						assert.equal(execFileSync("git", ["branch", "--list", task.branch], { cwd: tempDir, encoding: "utf8" }).trim(), "");
+					}
+				} else {
+					fs.writeFileSync(releaseChild, "release");
+					await completed;
+					const ack = once(socket, "data");
+					socket.write("ping");
+					await ack;
+					assert.equal(mode === "detached" ? notified : childSettled, false, "A must await finalization behind B setup");
+					socket.write("release");
+					const [a, b] = await Promise.all([child!, setup]);
+					if (mode === "detached") await notification;
+					assert.equal(fs.readFileSync(launchMarker, "utf8"), "launched");
+					for (const result of [a, b]) {
+						assert.equal(result.isError, undefined, result.content[0]?.text);
+						assert.ok(result.details.parallelHandoff?.path);
+						const handoff = JSON.parse(fs.readFileSync(result.details.parallelHandoff.path, "utf8"));
+						assert.equal(handoff.groups[0].cleanup.state, "complete");
+						for (const task of handoff.groups[0].cleanup.tasks) {
+							assert.equal(task.worktreeRemoved, true);
+							assert.equal(task.branchRemoved, true);
+							assert.equal(fs.existsSync(task.path), false);
+						}
+					}
+				}
+			} finally {
+				controller.abort();
+				fs.writeFileSync(releaseChild, "release");
+				socket?.end("release");
+				await Promise.allSettled([child, setup]);
+				socket?.destroy();
+				await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+				removeTempDir(baseDir);
+			}
+		});
+	}
 
 	it("keeps async workflows failed when a coordinated child is mixed with a real failure", { skip: !createSubagentExecutor ? "executor unavailable" : undefined }, async () => {
 		mockPi.onCall({
@@ -377,9 +493,9 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 				ctx,
 			);
 
+			asyncDir = result.details.asyncDir;
 			assert.equal(result.isError, undefined, result.content[0]?.text ?? "async launch failed");
 			assert.ok(result.details.asyncId);
-			asyncDir = result.details.asyncDir;
 			resultPath = path.join(DIRS.results, `${result.details.asyncId}.json`);
 
 			const status = JSON.parse(fs.readFileSync(path.join(asyncDir!, "status.json"), "utf-8")) as { runId?: string; sessionId?: string };
@@ -396,11 +512,36 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			assert.equal(persisted.state, "complete");
 			assert.deepEqual(readCall().runtime?.toolBudget, toolBudget);
 			assert.equal(mockPi.callCount(), 1);
-			const processTerminalPath = path.join(asyncDir!, "process-terminal.json");
-			const processTerminal = JSON.parse(fs.readFileSync(processTerminalPath, "utf-8")) as { state?: string };
-			assert.match(processTerminal.state ?? "", /^(observed|unknown)$/);
 		} finally {
-			if (asyncDir) fs.rmSync(asyncDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+			// bg_wait completes at the logical result, not the parent's process-close publication.
+			// Await that publication even on assertion failure, before reading proof or deleting artifacts.
+			if (asyncDir) {
+				const eventsPath = path.join(asyncDir, "events.jsonl");
+				const deadline = Date.now() + 10_000;
+				while (true) {
+					let journal = "";
+					try {
+						journal = fs.readFileSync(eventsPath, "utf-8");
+					} catch (error) {
+						if (!["ENOENT", "EINTR", "EAGAIN", "EBUSY"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+					}
+					// Ignore an in-flight final record and malformed diagnostics, not terminal proof.
+					const terminal = journal.split("\n").slice(0, -1).some((line) => {
+						try {
+							return JSON.parse(line)?.type === "subagent.run.process_terminal";
+						} catch {
+							return false;
+						}
+					});
+					if (terminal) break;
+					assert.ok(Date.now() <= deadline, `Timed out waiting for async event 'subagent.run.process_terminal': ${eventsPath}`);
+					await new Promise((resolve) => setTimeout(resolve, 50));
+				}
+				const processTerminalPath = path.join(asyncDir, "process-terminal.json");
+				const processTerminal = JSON.parse(fs.readFileSync(processTerminalPath, "utf-8")) as { state?: string };
+				assert.match(processTerminal.state ?? "", /^(observed|unknown)$/);
+				fs.rmSync(asyncDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+			}
 			if (resultPath) fs.rmSync(resultPath, { force: true });
 		}
 	});
@@ -1140,7 +1281,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		fs.writeFileSync(path.join(repo, "base.txt"), "base\n", "utf-8");
 		execFileSync("git", ["add", "base.txt"], { cwd: repo });
 		execFileSync("git", ["commit", "-m", "base"], { cwd: repo, stdio: "ignore" });
-		const setup = createWorktrees(repo, "action", 1, { baseDir });
+		const setup = await createWorktrees(repo, "action", 1, { baseDir });
 		const worktree = setup.worktrees[0]!;
 		const manifestPath = path.join(repo, ".pi", "subagents", "artifacts", "handoff.json");
 		const baseCommit = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
@@ -1393,7 +1534,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(mockPi.callCount(), 1);
 	});
 
-	it("agent contract v1 reports omitted acceptance separately without injecting a prompt", async () => {
+	it("agent contract reports omitted acceptance separately without injecting a prompt", async () => {
 		mockPi.onCall({ output: "Plan only" });
 		const agents = [makeAgent("worker", { tools: ["read", "write"] })];
 
@@ -1422,7 +1563,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.doesNotMatch(readCall().args.join("\n"), /## Acceptance Contract/);
 	});
 
-	it("agent contract v1 keeps acceptance rejection out of execution status", async () => {
+	it("agent contract keeps acceptance rejection out of execution status", async () => {
 		mockPi.onCall({ output: "Done\n```acceptance-report\n{\"criteriaSatisfied\":[{\"id\":\"criterion-1\",\"status\":\"not-satisfied\",\"evidence\":\"no proof\"}]}\n```" });
 		const agents = [makeAgent("worker", { tools: ["read"], completionGuard: false })];
 
@@ -1440,7 +1581,7 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.match(result.acceptance.runtimeChecks?.[0]?.message ?? "", /not-satisfied/);
 	});
 
-	it("agent contract v1 records explicit completion guard as an effect", async () => {
+	it("agent contract records explicit completion guard as an effect", async () => {
 		mockPi.onCall({ output: "Plan only" });
 		const agents = [makeAgent("worker", { tools: ["read", "write"], completionGuard: true })];
 
@@ -1480,6 +1621,138 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.deepEqual(child?.structuredOutput, { ok: true, note: "captured" });
 		assert.match(child?.finalOutput ?? "", /"ok": true/);
 		if (child?.artifactPaths?.outputPath) assert.match(fs.readFileSync(child.artifactPaths.outputPath, "utf-8"), /"note": "captured"/);
+	});
+
+	it("routes retained workflow follow-ups to distinct outputs without overwriting the writer report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		for (const relative of [false, true]) {
+			const writerPath = path.join(tempDir, `writer-${relative}.md`);
+			const challengeOutput = relative ? "challenge-relative.md" : path.join(tempDir, "challenge-absolute.md");
+			mockPi.onCall({ output: "original writer report" });
+			mockPi.onCall({ output: "retained challenge report" });
+			mockPi.onCall({ output: "repeated challenge report" });
+			const result = await makeExecutor([makeAgent("echo")], {}, true).execute(
+				`workflow-retained-output-${relative}`,
+				{
+					async: false,
+					workflowScript: `
+						const writer = await runs.run("writer", { agent: "echo", task: "Write report", acceptance: false, output: ${JSON.stringify(writerPath)} });
+						const challenge = await runs.run("challenge", { resume: ${relative ? "writer.runId.slice(0, 12)" : "writer.runId"}, task: "Challenge report", output: ${JSON.stringify(challengeOutput)} });
+						const repeated = await runs.run("repeated", { resume: challenge.runId, task: "Challenge again", output: false });
+						return { writer, challenge, repeated };
+					`,
+				},
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+			const { writer, challenge, repeated } = result.details.workflow?.value as Record<string, { ok: boolean; runId: string; outputReference: string; continuation: { runIds: string[] } }>;
+			assert.equal(writer.ok, true);
+			assert.equal(challenge.ok, true);
+			assert.equal(repeated.ok, true);
+			assert.deepEqual(challenge.continuation.runIds, [writer.runId, challenge.runId]);
+			assert.deepEqual(repeated.continuation.runIds, [writer.runId, challenge.runId, repeated.runId]);
+			for (const child of [writer, challenge, repeated]) {
+				const entry = Object.values(result.details.workflow!.receipt!.entries).find((entry) => entry.latestRunId === child.runId);
+				assert.deepEqual(entry?.continuation, child.continuation);
+			}
+			assert.notEqual(challenge.runId, writer.runId);
+			assert.equal(writer.outputReference, writerPath);
+			const challengePath = relative ? path.join(TEMP_ARTIFACTS_DIR, "outputs", `workflow-retained-output-${relative}`, challengeOutput) : challengeOutput;
+			assert.equal(challenge.outputReference, challengePath);
+			assert.notEqual(challenge.outputReference, writer.outputReference);
+			assert.equal(fs.readFileSync(writer.outputReference, "utf-8"), "original writer report");
+			assert.equal(fs.readFileSync(challenge.outputReference, "utf-8"), "retained challenge report");
+			assert.deepEqual(result.details.results.map((child) => child.savedOutputPath), [writerPath, challengePath, undefined]);
+		}
+		assert.equal(mockPi.callCount(), 6);
+	});
+
+	it("preserves string resume lineage from the recorded terminal workflow receipt", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "writer" });
+		mockPi.onCall({ output: "challenge" });
+		mockPi.onCall({ output: "repeated" });
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ctx = makeMinimalCtx(tempDir);
+		const started = await executor.execute("lineage-source", {
+			async: true,
+			workflowScript: `
+				const writer = await runs.run("writer", { agent: "echo", task: "Write", async: false, acceptance: false, output: false });
+				const challenge = await runs.run("challenge", { resume: writer.runId, task: "Challenge", output: false });
+				return { writer, challenge };
+			`,
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(started.isError, undefined);
+		const resultPath = path.join(DIRS.results, `${started.details.asyncId}.json`);
+		for (let attempt = 0; attempt < 500 && !fs.existsSync(resultPath); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		const settled = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+		const { writer, challenge } = settled.workflow.value;
+		assert.equal(challenge.ok, true);
+		assert.deepEqual(challenge.continuation.runIds, [writer.runId, challenge.runId]);
+		assert.deepEqual(settled.workflowReceipt.receipt.entries.challenge.continuation, challenge.continuation);
+		const repeated = await executor.execute("lineage-repeated", {
+			async: false,
+			workflowScript: `return runs.run("repeated", { resume: ${JSON.stringify(challenge.runId)}, task: "Repeat challenge", output: false });`,
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(repeated.isError, undefined, repeated.content[0]?.text);
+		const child = repeated.details.workflow!.value as { runId: string; continuation: { runIds: string[] } };
+		assert.deepEqual(child.continuation.runIds, [writer.runId, challenge.runId, child.runId]);
+		assert.deepEqual(repeated.details.workflow!.receipt!.entries.repeated.continuation, child.continuation);
+
+		// A recorded but malformed receipt is not the same as an absent older receipt.
+		fs.writeFileSync(settled.workflowReceipt.path, "{broken");
+		const rejected = await executor.execute("lineage-malformed", {
+			async: false,
+			workflowScript: `return runs.run("rejected", { resume: ${JSON.stringify(challenge.runId)}, task: "Do not launch", output: false });`,
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(rejected.isError, true);
+		assert.match(rejected.content[0]?.text ?? "", /could not be read/);
+		assert.deepEqual(rejected.details.workflow!.receipt!.entries.rejected.continuation.runIds, []);
+		assert.equal(mockPi.callCount(), 3);
+		for (const evidence of ["missing", "mismatched"]) {
+			if (evidence === "missing") fs.rmSync(settled.workflowReceipt.path);
+			else {
+				const receipt = settled.workflowReceipt.receipt;
+				receipt.entries.challenge.latestRunId = "unrelated-run";
+				receipt.entries.challenge.continuation.runIds = ["unrelated-run"];
+				fs.writeFileSync(settled.workflowReceipt.path, JSON.stringify(receipt));
+			}
+			mockPi.onCall({ output: "continued without older evidence" });
+			const fallback = await executor.execute(`lineage-${evidence}`, {
+				async: false,
+				workflowScript: `return runs.run("fallback", { resume: ${JSON.stringify(challenge.runId)}, task: "Continue", output: false });`,
+			}, new AbortController().signal, undefined, ctx);
+			assert.equal(fallback.isError, undefined, fallback.content[0]?.text);
+			const continued = fallback.details.workflow!.value as { runId: string; continuation: { runIds: string[] } };
+			assert.deepEqual(continued.continuation.runIds, [challenge.runId, continued.runId]);
+			assert.deepEqual(fallback.details.workflow!.receipt!.entries.fallback.continuation, continued.continuation);
+		}
+		assert.equal(mockPi.callCount(), 5);
+	});
+
+	it("rejects missing and stale string resume IDs without claiming continuation lineage", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "writer" });
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ctx = makeMinimalCtx(tempDir);
+		const first = await executor.execute("lineage-stale-source", {
+			async: false,
+			workflowScript: `return runs.run("writer", { agent: "echo", task: "Write", acceptance: false, output: false });`,
+		}, new AbortController().signal, undefined, ctx);
+		assert.equal(first.isError, undefined);
+		const writer = first.details.workflow!.value as { runId: string; results: Array<{ sessionFile: string }> };
+		fs.rmSync(writer.results[0].sessionFile);
+		for (const id of ["missing-retained-run", writer.runId]) {
+			const rejected = await executor.execute("lineage-rejected", {
+				async: false,
+				workflowScript: `return runs.run("rejected", { resume: ${JSON.stringify(id)}, task: "Do not launch" });`,
+			}, new AbortController().signal, undefined, ctx);
+			assert.equal(rejected.isError, true);
+			assert.match(rejected.content[0]?.text ?? "", /not found|does not exist/);
+			assert.equal(rejected.details.workflow!.receipt!.entries.rejected.latestRunId, undefined);
+			assert.deepEqual(rejected.details.workflow!.receipt!.entries.rejected.continuation.runIds, []);
+		}
+		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("applies explicit structured-output contract fields when resuming a foreground workflow child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -2499,20 +2772,20 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 	it("prefers empty-output fallback over an earlier tool error", async () => {
 		mockPi.onCall({
-			jsonl: [
+			stdoutRaw: [
 				events.toolResult("read", "ENOENT: no such file or directory", true),
 				events.toolResult("read", "recovered file contents"),
 				{
 					type: "message_end",
 					message: {
 						role: "assistant",
-						content: [],
+						content: [{ type: "text", text: "" }],
 						model: "openai/gpt-5-mini",
 						stopReason: "stop",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+						usage: { input: 0, output: 4, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
 					},
 				},
-			],
+			].map((event) => JSON.stringify(event)).join("\n"),
 			exitCode: 0,
 		});
 		mockPi.onCall({ output: "Recovered on fallback" });

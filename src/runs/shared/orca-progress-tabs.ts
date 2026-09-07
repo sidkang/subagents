@@ -53,6 +53,8 @@ const ORCA_CLEANUP_WATCHDOG_SCRIPT = [
 ].join("");
 
 export interface OrcaProgressTab {
+	/** Resolves when the terminal-create watchdog closes, after its final manifest/queue writes (success or failure). Not viewer completion. */
+	readonly creationSettled: Promise<void>;
 	append(text: string): void;
 	section(input: { agent: string; index: number; count: number }): void;
 	event(event: { type?: string; message?: Message; toolName?: string; args?: unknown }): void;
@@ -402,6 +404,8 @@ export function createOrcaProgressTab(input: {
 		}
 	};
 	let createSettled = false;
+	let resolveCreationSettled!: () => void;
+	const creationSettled = new Promise<void>((resolve) => { resolveCreationSettled = resolve; });
 	let cleanupPaths: string[] | undefined;
 	const scheduleDeferredCleanup = () => {
 		if (!createSettled || cleanupPaths === undefined) return;
@@ -434,6 +438,7 @@ export function createOrcaProgressTab(input: {
 			createSettled = true;
 			if (code !== 0) failObserver();
 			scheduleDeferredCleanup();
+			resolveCreationSettled();
 		});
 		watchdog.once("error", () => {
 			markCreateReady();
@@ -450,6 +455,7 @@ export function createOrcaProgressTab(input: {
 
 	let finished = false;
 	return {
+		creationSettled,
 		append(text) {
 			if (finished) return;
 			writeProgress(text);

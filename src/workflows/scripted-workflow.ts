@@ -6,10 +6,11 @@ import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../runs/shared/para
 import { HOST_STEP_MAX_COUNT } from "../runs/shared/host-step-status.ts";
 import { classifyTaskMutationIntent } from "../runs/shared/task-intent.ts";
 import { describeGateAcceptanceConflict } from "../runs/shared/acceptance.ts";
-import type { AcceptanceRecoveryMetadata, HostStepNodeV1, SingleResult } from "../shared/types.ts";
+import type { AcceptanceRecoveryMetadata, HostStepNode, SingleResult } from "../shared/types.ts";
 import { normalizeWorkflowHostCommandParams, type WorkflowHostCommandParams, type WorkflowHostCommandResult } from "./host-command.ts";
 
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const BASE_REF_VALIDATION_ERROR = "baseRef must be a valid Git ref: use HEAD or a supported named ref (for example, refs/heads/main). Full 40/64-character commit IDs and revision expressions are unsupported.";
 function validGitRef(ref: unknown): ref is string {
 	if (typeof ref !== "string" || !ref || ref === "@" || Buffer.byteLength(ref, "utf-8") > 1024 || ref.startsWith("/") || ref.endsWith("/") || ref.includes("//") || ref.includes("..") || ref.includes("@{")) return false;
 	if (/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(ref)) return false;
@@ -644,7 +645,7 @@ function validateRunCall(key, params, label, fingerprints) {
   }
   if (Object.prototype.hasOwnProperty.call(params, "clarify")) throw new Error(label + " does not support clarify UI.");
   if (params.worktree !== undefined && typeof params.worktree !== "boolean") throw new Error(label + " worktree must be true or false.");
-  if (params.baseRef !== undefined && (typeof params.baseRef !== "string" || !validGitRef(params.baseRef))) throw new Error(label + " baseRef must be a valid Git ref.");
+  if (params.baseRef !== undefined && (typeof params.baseRef !== "string" || !validGitRef(params.baseRef))) throw new Error(label + " baseRef must be a valid Git ref: use HEAD or a supported named ref (for example, refs/heads/main). Full 40/64-character commit IDs and revision expressions are unsupported.");
   validateLaneMetadata(params.lane, label + " lane", key);
   if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) throw new Error(label + " gate must be a non-empty command string.");
   if (params.gate !== undefined && params.acceptance !== undefined && params.acceptance !== false) throw new Error(label + " gate cannot be combined with acceptance; use one gate command or acceptance.verify." + describeGateAcceptanceConflict(params.gate, params.acceptance));
@@ -1098,8 +1099,22 @@ export class WorkflowScriptError extends Error {
 	}
 }
 
+export type WorkflowChildSettledOutcome = "completed" | "failed" | "paused" | "stopped";
+
+export interface WorkflowChildSettledNotification {
+	workflowRunId: string;
+	childKey: string;
+	childRunId?: string;
+	outcome: WorkflowChildSettledOutcome;
+	outputReference?: string;
+	error?: string;
+	workflowRunning: boolean;
+}
+
 export interface RunWorkflowScriptOptions {
 	script: string;
+	/** Workflow run ID for notifications. Required when onChildSettled is provided. */
+	workflowRunId?: string;
 	/** Host-only first-slice admission context. It is never sent to the workflow worker. */
 	oneUsePermit?: { claim: (key: string) => string | undefined };
 	timeoutMs?: number;
@@ -1110,11 +1125,11 @@ export interface RunWorkflowScriptOptions {
 	globalConcurrencyLimit?: number;
 	admit?: (calls: Array<{ key: string; params: Record<string, unknown> }>) => void | Promise<void>;
 	launch: (key: string, params: Record<string, unknown>, signal: AbortSignal, admission: { admitted: boolean; batch: boolean }) => Promise<WorkflowScriptChildResult>;
-	resolveResume?: (reference: WorkflowReceiptResumeReference, signal: AbortSignal) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
+	resolveResume?: (reference: WorkflowReceiptResumeReference | string, signal: AbortSignal, index?: number) => string | WorkflowResolvedResumeReference | Promise<string | WorkflowResolvedResumeReference>;
 	status: (keyOrRunId: string, signal: AbortSignal) => Promise<WorkflowScriptChildResult>;
 	steer?: (key: string, message: string, options: WorkflowSteerOptions, signal: AbortSignal) => Promise<WorkflowSteerResult>;
 	host?: (key: string, params: WorkflowHostCommandParams, signal: AbortSignal) => Promise<WorkflowHostCommandResult>;
-	onHostStep?: (hostStep: HostStepNodeV1) => void;
+	onHostStep?: (hostStep: HostStepNode) => void;
 	state?: {
 		get: (key: string) => unknown | Promise<unknown>;
 		set: (key: string, value: unknown) => void | Promise<void>;
@@ -1123,6 +1138,7 @@ export interface RunWorkflowScriptOptions {
 	onTrace?: (trace: WorkflowScriptTraceEntry[]) => void;
 	onLanePlan?: (lanes: WorkflowLanePlan[]) => void;
 	onEmit?: (emits: unknown[]) => void;
+	onChildSettled?: (notification: WorkflowChildSettledNotification) => void;
 }
 
 function combinedAbortSignal(signals: AbortSignal[]): AbortSignal {
@@ -1502,7 +1518,7 @@ function definitelyNonJson(node: AstNode, normalizeUndefined = false): string | 
 	if (node.type === "ObjectExpression" && Array.isArray(node.properties)) {
 		const values = new Map<string, AstNode>();
 		for (const property of node.properties) {
-			if (!astNode(property) || property.type !== "Property" || !astNode(property.value)) return undefined;
+			if (!astNode(property) || property.type !== "Property" || !astNode(property.value) || property.kind !== "init") return undefined;
 			const key = staticPropertyKey(property);
 			if (key === undefined) return undefined;
 			values.set(key, property.value);
@@ -1529,6 +1545,26 @@ function directObjectPropertyValue(node: AstNode, name: string): AstNode | undef
 		if (staticPropertyKey(property) === name) value = property.value;
 	}
 	return value;
+}
+
+function validateStaticBaseRef(params: AstNode, owner: string): WorkflowScriptValidationError[] {
+	if (params.type !== "ObjectExpression" || !Array.isArray(params.properties)) return [];
+	// Inspect the final definition only. A later spread or unknown key may overwrite it.
+	for (let index = params.properties.length - 1; index >= 0; index--) {
+		const property = params.properties[index];
+		if (!astNode(property) || property.type !== "Property") return [];
+		const key = staticPropertyKey(property);
+		if (key === undefined) return [];
+		if (key !== "baseRef") continue;
+		if (property.kind !== "init" || !astNode(property.value)) return [];
+		const valueNode = property.value;
+		const value = literalString(valueNode);
+		if ((value !== undefined || valueNode.type === "Literal") && !validGitRef(value)) {
+			return [{ message: `${owner} ${BASE_REF_VALIDATION_ERROR}`, ...nodeLocation(valueNode) }];
+		}
+		return [];
+	}
+	return [];
 }
 
 function directRunsAllKeys(call: AstNode): Array<{ key: string; node: AstNode }> {
@@ -1572,6 +1608,7 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 			const key = literalString(keyNode);
 			if (keyNode && key !== undefined && !KEY_PATTERN.test(key)) errors.push({ message: "runs.run key must be 1-128 characters using letters, numbers, '.', '_' or '-', and start with a letter or number.", ...nodeLocation(keyNode) });
 			if (astNode(args[1])) {
+				errors.push(...validateStaticBaseRef(args[1], "runs.run"));
 				const message = definitelyNonJson(args[1]);
 				if (message) errors.push({ message: `runs.run params are invalid: ${message}.`, ...nodeLocation(args[1]) });
 			}
@@ -1581,6 +1618,7 @@ export function validateWorkflowScript(script: string): WorkflowScriptValidation
 			const args = Array.isArray(node.arguments) ? node.arguments : [];
 			if (astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements)) {
 				for (const item of args[0].elements) if (astNode(item)) {
+					errors.push(...validateStaticBaseRef(item, "runs.all item"));
 					const message = definitelyNonJson(item);
 					if (message) errors.push({ message: `runs.all item params are invalid: ${message}.`, ...nodeLocation(item) });
 				}
@@ -1751,7 +1789,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			console.error("Workflow onLanePlan callback failed:", error);
 		}
 	};
-	const hostStepChanged = (hostStep: HostStepNodeV1) => {
+	const hostStepChanged = (hostStep: HostStepNode) => {
 		try {
 			options.onHostStep?.(hostStep);
 		} catch (error) {
@@ -1788,6 +1826,30 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		});
 		traceChanged();
 		return true;
+	};
+	const notifyChildSettled = (key: string, result: WorkflowScriptChildResult): void => {
+		if (!options.onChildSettled || !options.workflowRunId) return;
+		const outcome: WorkflowChildSettledOutcome = result.ok
+			? "completed"
+			: result.stopped
+				? "stopped"
+				: result.detached
+					? "paused"
+					: "failed";
+		const outputReference = result.outputReference ?? result.artifactPaths[0];
+		try {
+			options.onChildSettled({
+				workflowRunId: options.workflowRunId,
+				childKey: key,
+				...(result.runId ? { childRunId: result.runId } : {}),
+				outcome,
+				...(outputReference ? { outputReference } : {}),
+				...(!result.ok && result.error ? { error: result.error } : {}),
+				workflowRunning: !settled && !finishing,
+			});
+		} catch (error) {
+			console.error("Workflow onChildSettled callback failed:", error);
+		}
 	};
 	options.registerStopChild?.(stopChild);
 
@@ -2047,7 +2109,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				if (!options.host) return respond(Promise.reject(new Error("runs.host is unavailable in this host context.")));
 				if (hostCalls.size >= HOST_STEP_MAX_COUNT) return respond(Promise.reject(new Error(`workflowScript supports at most ${HOST_STEP_MAX_COUNT} runs.host calls.`)));
 				const startedAt = Date.now();
-				const startedStep: HostStepNodeV1 = {
+				const startedStep: HostStepNode = {
 					version: 1,
 					kind: "host-step",
 					monitorKind: "command",
@@ -2130,7 +2192,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				return respond(Promise.reject(new Error(`runs.run('${key}') worktree must be true or false.`)));
 			}
 			if (params.baseRef !== undefined && (typeof params.baseRef !== "string" || !validGitRef(params.baseRef))) {
-				return respond(Promise.reject(new Error(`runs.run('${key}') baseRef must be a valid Git ref.`)));
+				return respond(Promise.reject(new Error(`runs.run('${key}') ${BASE_REF_VALIDATION_ERROR}`)));
 			}
 			if (params.gate !== undefined && (typeof params.gate !== "string" || !params.gate.trim())) {
 				return respond(Promise.reject(new Error(`runs.run('${key}') gate must be a non-empty command string.`)));
@@ -2183,10 +2245,11 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				const childStopController = new AbortController();
 				childStopControllers.set(key, childStopController);
 				const childSignal = combinedAbortSignal([childController.signal, childStopController.signal]);
-				const resolvedResumeValue = resumeReference
+				const resumeInput = resumeReference ?? (typeof params.resume === "string" && options.resolveResume ? params.resume : undefined);
+				const resolvedResumeValue = resumeInput
 					? await Promise.resolve().then(() => {
 						if (!options.resolveResume) throw new Error("Keyed workflow receipt resume is unavailable in this host.");
-						return options.resolveResume(resumeReference, childSignal);
+						return options.resolveResume(resumeInput, childSignal, typeof params.index === "number" ? params.index : undefined);
 					})
 					: undefined;
 				const resolvedResume = typeof resolvedResumeValue === "string"
@@ -2202,6 +2265,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						: [];
 					resolvedResumeLineage = [...new Set(lineage.length ? lineage : [resolvedResumeId!])];
 					if (resolvedResumeLineage.at(-1) !== resolvedResumeId) resolvedResumeLineage.push(resolvedResumeId!);
+					if (typeof resumeInput === "string") {
+						const predecessor = [...children.values()].find((child) => child.runId === resolvedResumeId);
+						if (predecessor?.continuation && predecessor.continuation.runIds.at(-1) === resolvedResumeId) resolvedResumeLineage = predecessor.continuation.runIds;
+					}
 				}
 				const launchParams = resolvedResumeId ? { ...params, resume: resolvedResumeId } : params;
 				await launchSemaphore.acquire();
@@ -2233,6 +2300,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				const state = normalized.ok ? "completed" : normalized.stopped ? "stopped" : normalized.detached ? "detached" : "failed";
 				trace.push({ operation: "run", key, state, durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), ...(normalized.agent ? { agent: normalized.agent } : {}), ...(normalized.runId ? { runId: normalized.runId } : {}), ...(!normalized.ok ? { error: normalized.error ?? normalized.output } : {}) });
 				traceChanged();
+				notifyChildSettled(key, normalized);
 				return normalized;
 			}, (error: unknown) => {
 				const text = error instanceof Error ? error.message : String(error);
@@ -2242,6 +2310,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				children.set(key, failure);
 				trace.push({ operation: "run", key, state: "failed", durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), error: text });
 				traceChanged();
+				notifyChildSettled(key, failure);
 				return failure;
 			});
 			launches.set(key, { fingerprint, promise, observed: callObserved, ...(generatedLaneKey ? { generatedLaneKey } : {}) });

@@ -42,7 +42,7 @@ import { listExternalJobProviders } from "../api/external-job-provider.ts";
 
 type ManagementAction = "list" | "get" | "models" | "create" | "update" | "delete" | "eject" | "disable" | "enable" | "reset";
 type ManagementScope = "user" | "project";
-type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner };
+type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void };
 
 interface ManagementParams {
 	action?: string;
@@ -348,6 +348,7 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "name")) changed("name");
 	if (hasKey(cfg, "package")) changed("package");
 	if (hasKey(cfg, "description")) changed("description");
+	if (hasKey(cfg, "advertise")) changed("advertise");
 	if (hasKey(cfg, "aliases")) changed("alias", "aliases");
 	if (hasKey(cfg, "systemPrompt")) changed("systemPrompt");
 	if (hasKey(cfg, "runner")) changed("runner");
@@ -415,6 +416,11 @@ function parseTools(raw: string): { tools?: string[]; mcpDirectTools?: string[] 
 }
 
 function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): string | undefined {
+	if (hasKey(cfg, "advertise")) {
+		if (cfg.advertise === "") delete target.advertise;
+		else if (typeof cfg.advertise === "boolean") target.advertise = cfg.advertise;
+		else return "config.advertise must be a boolean or empty string when provided.";
+	}
 	if (hasKey(cfg, "aliases")) {
 		if (cfg.aliases === false || cfg.aliases === "") delete target.aliases;
 		else if (typeof cfg.aliases === "string") {
@@ -1176,6 +1182,7 @@ export function handleCreate(params: ManagementParams, ctx: ManagementContext): 
 	const sw = skillsWarning(ctx.cwd, agent);
 	if (sw) warnings.push(sw);
 	fs.writeFileSync(targetPath, serializeAgent(agent), "utf-8");
+	ctx.onAgentsChanged?.();
 	return result([`Created agent '${runtimeName}' at ${targetPath}.`, ...warnings].join("\n"));
 }
 
@@ -1241,6 +1248,7 @@ export function handleUpdate(params: ManagementParams, ctx: ManagementContext): 
 		updated.filePath = renamed.filePath!;
 	}
 	fs.writeFileSync(updated.filePath, serializeAgent(updated, { preserveFrontmatterFields }), "utf-8");
+	ctx.onAgentsChanged?.();
 	const headline = updated.name === oldName
 		? `Updated agent '${updated.name}' at ${updated.filePath}.`
 		: `Updated agent '${oldName}' to '${updated.name}' at ${updated.filePath}.`;
@@ -1254,6 +1262,7 @@ function handleDelete(params: ManagementParams, ctx: ManagementContext): AgentTo
 	if ("content" in targetOrError) return targetOrError;
 	const target = targetOrError;
 	fs.unlinkSync(target.filePath);
+	ctx.onAgentsChanged?.();
 	return result(`Deleted agent '${target.name}' at ${target.filePath}.`);
 }
 
@@ -1292,6 +1301,7 @@ function handleEject(params: ManagementParams, ctx: ManagementContext): AgentToo
 		return result(`Failed to read source agent at ${source.filePath}: ${message}`, true);
 	}
 	fs.writeFileSync(targetPath, content, "utf-8");
+	ctx.onAgentsChanged?.();
 	return result(`Ejected agent '${runtimeName}' from ${source.source} to ${scope} scope at ${targetPath}. Edit it there to customize; it shadows the bundled ${source.source} agent of the same name.`);
 }
 
@@ -1314,6 +1324,7 @@ function handleDisable(params: ManagementParams, ctx: ManagementContext): AgentT
 	const settingsPath = mergeBuiltinAgentOverride(ctx.cwd, runtimeName, scope, { disabled: true });
 	const after = resolveEffectiveAgent(discoverAgentsAll(ctx.cwd), raw).agent;
 	if (after?.disabled === true) {
+		ctx.onAgentsChanged?.();
 		return result(`Disabled agent '${runtimeName}' via ${scope} settings override at ${settingsPath}. It is now hidden from runtime discovery and { action: "list" }.`);
 	}
 	return result(`Wrote a disabled override for '${runtimeName}' at ${settingsPath}, but the agent is still enabled. A higher-precedence ${after?.override?.scope ?? "project"} override is likely winning. Try agentScope: '${after?.override?.scope ?? "project"}'.`, true);
@@ -1338,6 +1349,7 @@ function handleEnable(params: ManagementParams, ctx: ManagementContext): AgentTo
 	const { path: settingsPath, removed } = removeBuiltinAgentOverrideFields(ctx.cwd, runtimeName, scope, ["disabled"]);
 	const after = resolveEffectiveAgent(discoverAgentsAll(ctx.cwd), raw).agent;
 	if (after && after.disabled !== true) {
+		if (removed) ctx.onAgentsChanged?.();
 		if (removed) return result(`Enabled agent '${runtimeName}' (removed disabled override at ${settingsPath}).`);
 		return result(`Agent '${runtimeName}' is already enabled.`);
 	}
@@ -1385,6 +1397,7 @@ function handleReset(params: ManagementParams, ctx: ManagementContext): AgentToo
 		return result(`Agent '${runtimeName}' has no ${scope} customization to reset.${note} It is at its bundled ${bundled.source} default.`);
 	}
 	lines.push(`Reset agent '${runtimeName}' to its bundled ${bundled.source} default.`);
+	ctx.onAgentsChanged?.();
 	return result(lines.join("\n"));
 }
 

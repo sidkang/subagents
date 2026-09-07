@@ -1,4 +1,4 @@
-import { splitKnownThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
+import { splitKnownThinkingSuffix as splitThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
 import type { Usage } from "../../shared/types.ts";
 import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
@@ -14,9 +14,7 @@ interface ModelAttemptSummary {
 	usage?: Usage;
 }
 
-export function splitThinkingSuffix(model: string): { baseModel: string; thinkingSuffix: string } {
-	return splitKnownThinkingSuffix(model);
-}
+export { splitThinkingSuffix };
 
 /** Aliases apply only to the resolved launch candidate (without its thinking suffix) and the exact raw response ID. */
 export function formatSubagentModelVerificationError(
@@ -38,7 +36,7 @@ export function formatSubagentModelVerificationError(
 		const expectedFullIdLeaf = expectedEntry.fullId.slice(expectedEntry.fullId.lastIndexOf("/") + 1);
 		if (expectedIdLeaf === observedBase || expectedFullIdLeaf === observedBase) return undefined;
 	}
-	return `model_verification_failed: child reported a different model than the launch candidate. Expected '${expectedModel}' but observed '${observedModel}'.`;
+	return `model_verification_failed: native Pi child reported a different model than the launch candidate. Expected '${expectedModel}' but observed '${observedModel}'. If you have independently verified this response ID identifies the requested model, declare the exact mapping in modelResponseAliases in ~/.pi/agent/extensions/subagent/config.json (see docs/configuration.md#modelresponsealiases). Use the resolved provider/model ID without its thinking suffix as the key. This leaves the outgoing request unchanged. Configuration changes affect new independent native runs; resumed native runs retain their launch-time declaration. External CLI adapters do not use this setting.`;
 }
 
 /** Sentinel model value requesting that a subagent inherit the parent session's model. */
@@ -537,6 +535,7 @@ export function buildModelCandidates(
 }
 
 const RETRYABLE_MODEL_FAILURE_PATTERNS = [
+	/^REQUEST_LIMIT_EXCEEDED$/,
 	/rate\s*limit/i,
 	/usage\s*limit/i,
 	/too many requests/i,
@@ -608,8 +607,13 @@ export function isRetryableModelFailureAttempt(input: { error: string | undefine
 	return Boolean(error && input.messages?.some((message) => messageError(message)?.trim() === error));
 }
 
+// Request-shape failures can match broad fallback signals such as "upstream",
+// but do not establish that the model is unhealthy for subsequent requests.
+const REQUEST_SHAPE_FAILURE_PATTERN = /\b(?:bad[ _]request|invalid[ _]argument|invalid_request_error)\b/i;
+
 export function recordRetryableModelFailure(model: string | undefined, error: string | undefined): void {
-	if (!model || !isRetryableModelFailure(error)) return;
+	if (!model || !error || !isRetryableModelFailure(error) || isContextOverflow(error)) return;
+	if (REQUEST_SHAPE_FAILURE_PATTERN.test(error)) return;
 	const { provider, modelId } = parseModelKey(model);
 	recordModelFailure({ modelId, reason: error, ...(provider ? { provider } : {}) });
 }

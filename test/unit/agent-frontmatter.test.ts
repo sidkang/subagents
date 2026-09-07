@@ -385,6 +385,31 @@ body`);
 	}));
 });
 
+describe("agent advertise frontmatter", () => {
+	it("parses and serializes explicit prompt advertisement", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-advertised-agent-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+advertise: true
+---
+body`);
+
+		const worker = discoverAgents(project, "both").agents.find((agent) => agent.name === "worker")!;
+		assert.equal(worker.advertise, true);
+		assert.match(serializeAgent(worker), /^advertise: true$/m);
+	}));
+
+	it("rejects non-boolean advertise values", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-invalid-advertise-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: Worker\nadvertise: yes\n---\nbody");
+
+		assert.match(discoverAgents(project, "project").agentDiagnostics?.[0]?.error ?? "", /invalid advertise frontmatter; expected true or false/);
+	}));
+});
+
 describe("agent aliases", () => {
 	it("parses and serializes agent aliases", () => withTempHome(() => {
 		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-alias-agent-"));
@@ -1862,7 +1887,7 @@ Do work
 		}
 	});
 
-	it("bundled standard agents expose the child-facing supervisor tool with bounded allowlists", () => {
+	it("bundled standard agents keep bounded tool allowlists", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-supervisor-tool-"));
 		const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-supervisor-tool-home-"));
 		tempDirs.push(dir);
@@ -1879,12 +1904,28 @@ Do work
 				delegate: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
 				reviewer: ["read", "grep", "find", "ls", "contact_supervisor"],
 				scout: ["read", "grep", "find", "ls", "bash", "write", "contact_supervisor"],
+				researcher: ["read", "write", "web_search", "fetch_content", "get_search_content", "source_check"],
+				"evidence-auditor": ["read", "web_search", "fetch_content", "get_search_content", "source_check"],
 			};
 			for (const [name, tools] of Object.entries(expectedTools)) {
 				const agent = agents.find((candidate) => candidate.name === name);
 				assert.ok(agent, `${name} builtin should be discovered`);
 				assert.deepEqual(agent?.tools, tools);
 			}
+
+			const auditor = agents.find((candidate) => candidate.name === "evidence-auditor");
+			assert.equal(auditor?.inheritProjectContext, true);
+			assert.equal(auditor?.inheritSkills, false);
+
+			const researcherPrompt = agents.find((candidate) => candidate.name === "researcher")?.systemPrompt ?? "";
+			assert.match(researcherPrompt, /search-result summaries as discovery aids, not final evidence/);
+			assert.match(researcherPrompt, /source_check.*decision-critical or disputed claims/);
+			assert.match(researcherPrompt, /direct evidence, source interpretation, and researcher inference distinctly/);
+			assert.match(researcherPrompt, /Record contradictions.*Record missing evidence/);
+			assert.match(researcherPrompt, /Never invent dates, quotations, citations, or unsupported precision/);
+			assert.match(researcherPrompt, /`source_check` must be registered by the loaded provider before launch/);
+			assert.match(researcherPrompt, /If a registered `source_check` call fails, continue/);
+			assert.match(researcherPrompt, /\*\*Support:\*\* direct evidence \| interpretation\. \*\*Confidence:\*\* high \| medium \| low/);
 		} finally {
 			if (previousHome === undefined) delete process.env.HOME;
 			else process.env.HOME = previousHome;

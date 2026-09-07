@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	formatUnresolvedMcpDirectToolSelectors,
 	resolveMcpDirectToolResolution,
@@ -16,7 +17,7 @@ import {
 import {
 	TEMP_ROOT_DIR,
 	type JsonSchemaObject,
-	type LaunchResolvedChildExtensionsV1,
+	type LaunchResolvedChildExtensions,
 } from "../../shared/types.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
 import { getAgentDir } from "../../shared/utils.ts";
@@ -151,6 +152,13 @@ export interface ResolvePiLaunchToolPlanInput {
 	agentName?: string;
 	permissionRules?: PermissionRules;
 	runtimeSnapshotHost?: McpRuntimeSnapshotHost;
+	/**
+	 * When provided, child tool plans intersect declared builtin tools with
+	 * this set. Tools the agent declares but the host does not provide are
+	 * silently omitted (tracked in `unavailableHostBuiltins`), and agents
+	 * that require unavailable tools fail closed with an explicit error.
+	 */
+	hostAvailableBuiltins?: readonly string[];
 }
 
 export interface PiLaunchToolPlan {
@@ -174,6 +182,8 @@ export interface PiLaunchToolPlan {
 	capabilityAudit?: SubagentCapabilityAudit;
 	/** Non-fatal launch warnings; they do not change behavior. */
 	warnings: string[];
+	/** Builtin tools the agent declared but the host runtime does not provide. */
+	unavailableHostBuiltins: string[];
 }
 
 function extensionIdentifier(value: string): string {
@@ -214,7 +224,7 @@ export function projectLaunchResolvedChildExtensions(
 		| "extensionArgs"
 		| "disableAmbientExtensions"
 	>,
-): LaunchResolvedChildExtensionsV1 {
+): LaunchResolvedChildExtensions {
 	const runtime = boundedExtensionIdentifiers(toolPlan.runtimeExtensions);
 	const configured = boundedExtensionIdentifiers(toolPlan.configuredExtensions);
 	const effective = boundedExtensionIdentifiers(toolPlan.extensionArgs);
@@ -289,6 +299,28 @@ export function resolvePermissionSystemExtension(): string | undefined {
 	return undefined;
 }
 
+/**
+ * Extract the names of builtin tools the host provides. Use this to pass
+ * `hostAvailableBuiltins` to `resolvePiLaunchToolPlan` so child tool plans
+ * intersect declared agent tools with what the host actually supports.
+ *
+ * Returns `undefined` when builtin tool discovery fails or yields nothing,
+ * so callers skip the intersection (fail-safe to allowing all declared tools).
+ * This handles test mocks without proper tool registration and hosts whose
+ * getAllTools() throws before extensions load.
+ */
+export function getHostBuiltinToolNames(pi: Pick<ExtensionAPI, "getAllTools">): string[] | undefined {
+	try {
+		const builtins = pi
+			.getAllTools()
+			.filter((tool) => (tool.sourceInfo as { source?: string } | undefined)?.source === "builtin")
+			.map((tool) => tool.name);
+		return builtins.length > 0 ? builtins : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export function resolvePiLaunchToolPlan(
 	input: ResolvePiLaunchToolPlanInput,
 ): PiLaunchToolPlan {
@@ -300,17 +332,27 @@ export function resolvePiLaunchToolPlan(
 		capabilityCeiling?.allowedTools === undefined
 			? undefined
 			: new Set(capabilityCeiling.allowedTools);
+	const hostAvailableSet =
+		input.hostAvailableBuiltins === undefined
+			? undefined
+			: new Set(input.hostAvailableBuiltins);
 	const requestedBuiltinTools =
 		input.tools?.filter(
 			(tool) =>
 				!(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")),
 		) ?? [];
+	if (input.requireReadTool && hostAvailableSet && !hostAvailableSet.has("read")) {
+		const agentLabel = input.agentName ? ` for agent '${input.agentName}'` : "";
+		throw new Error(
+			`Host runtime does not provide required tool 'read'${agentLabel} for lazy skill loading.`,
+		);
+	}
 	if (input.requireReadTool && allowedToolSet && !allowedToolSet.has("read")) {
 		throw new Error(
 			`Capability ceiling from ${capabilityCeiling?.sources.join(", ") || "unknown source"} excludes required tool 'read' for lazy skill loading.`,
 		);
 	}
-	const declaredBuiltinTools =
+	const ceilingFilteredBuiltinTools =
 		input.tools === undefined
 			? allowedToolSet
 				? [...allowedToolSet]
@@ -322,6 +364,12 @@ export function resolvePiLaunchToolPlan(
 					? ["read", ...requestedBuiltinTools]
 					: requestedBuiltinTools
 				).filter((tool) => !allowedToolSet || allowedToolSet.has(tool));
+	const declaredBuiltinTools = hostAvailableSet
+		? ceilingFilteredBuiltinTools.filter((tool) => hostAvailableSet.has(tool))
+		: ceilingFilteredBuiltinTools;
+	const unavailableHostBuiltins = hostAvailableSet
+		? ceilingFilteredBuiltinTools.filter((tool) => !hostAvailableSet.has(tool))
+		: [];
 	const excludeTools = [...new Set((input.excludeTools ?? []).map((tool) => tool.trim()).filter(Boolean))];
 	const excludedToolSet = new Set(excludeTools);
 	const effectiveDeclaredBuiltinTools = declaredBuiltinTools.filter((tool) => !excludedToolSet.has(tool));
@@ -474,6 +522,7 @@ export function resolvePiLaunchToolPlan(
 								capabilityCeilingAgentRestrictionSources(capabilityCeiling),
 						}
 					: {}),
+				...(unavailableHostBuiltins.length > 0 ? { unavailableHostBuiltins } : {}),
 			} satisfies SubagentCapabilityAudit)
 		: undefined;
 	return {
@@ -495,6 +544,7 @@ export function resolvePiLaunchToolPlan(
 		extensionArgs,
 		disableAmbientExtensions,
 		warnings,
+		unavailableHostBuiltins,
 		...(capabilityAudit ? { capabilityAudit } : {}),
 	};
 }

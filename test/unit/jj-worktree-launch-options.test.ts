@@ -25,11 +25,11 @@ function discard(setup: WorktreeSetup | undefined) {
  if (setup) cleanupWorktrees(setup, { kind: "discard", authorization: { kind: "confirmed" } });
 }
 
-test("JJ baseRef selects one revision and journals the owned identity before returning", () => {
+test("JJ baseRef selects one revision and journals the owned identity before returning", async () => {
  const f = fixture(); let setup: WorktreeSetup | undefined;
  try {
   let journal: WorktreeSetup | undefined;
-  setup = createWorktrees(f.source, "selected-base", 1, { baseDir: f.baseDir, baseRef: f.base, beforeCreate: (value) => { journal = value; } });
+  setup = await createWorktrees(f.source, "selected-base", 1, { baseDir: f.baseDir, baseRef: f.base, beforeCreate: (value) => { journal = value; } });
   assert.equal(setup.baseCommit, f.base);
   assert.equal(journal, setup);
   const lane = setup.worktrees[0]!;
@@ -40,25 +40,25 @@ test("JJ baseRef selects one revision and journals the owned identity before ret
  } finally { discard(setup); rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("JJ rejects invalid baseRef without allocating a workspace", () => {
+test("JJ rejects invalid baseRef without allocating a workspace", async () => {
  const f = fixture();
  try {
   const before = jj(f.source, "workspace", "list");
-  assert.throws(() => createWorktrees(f.source, "invalid-base", 1, { baseDir: f.baseDir, baseRef: "missing-bookmark" }));
+  await assert.rejects(() => createWorktrees(f.source, "invalid-base", 1, { baseDir: f.baseDir, baseRef: "missing-bookmark" }));
   assert.equal(jj(f.source, "workspace", "list"), before);
   assert.ok(!existsSync(f.baseDir));
  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
 for (const mode of ["success", "callback-failure", "hook-failure"]) {
- test(`JJ journals identities before hooks (${mode})`, () => {
+ test(`JJ journals identities before hooks (${mode})`, async () => {
   const f = fixture(); let setup: WorktreeSetup | undefined;
   const marker = join(f.root, "journal"); const invoked = join(f.root, "hook-ran");
   const hook = join(f.root, "hook.sh");
   writeFileSync(hook, `#!/bin/sh\ntest -f '${marker}' || exit 42\ntouch '${invoked}'\n${mode === "hook-failure" ? "exit 23" : "echo '{}'"}\n`);
   chmodSync(hook, 0o755);
   try {
-   const create = () => { setup = createWorktrees(f.source, "journal-first", 2, {
+   const create = async () => { setup = await createWorktrees(f.source, "journal-first", 2, {
     baseDir: f.baseDir, setupHook: { hookPath: hook },
     beforeCreate(value) {
      assert.equal(value.worktrees.length, 2);
@@ -68,17 +68,17 @@ for (const mode of ["success", "callback-failure", "hook-failure"]) {
      writeFileSync(marker, "owned identities recorded");
     },
    }); };
-   if (mode === "success") create(); else assert.throws(create);
+   if (mode === "success") await create(); else await assert.rejects(create);
    assert.equal(existsSync(invoked), mode !== "callback-failure");
    assert.equal(existsSync(marker), mode !== "callback-failure");
   } finally { discard(setup); rmSync(f.root, { recursive: true, force: true }); }
  });
 }
 
-test("upstream cleanup blockers preserve JJ workspace and exact identity", () => {
+test("upstream cleanup blockers preserve JJ workspace and exact identity", async () => {
  const f = fixture(); let setup: WorktreeSetup | undefined;
  try {
-  setup = createWorktrees(f.source, "cleanup-blocker", 1, { baseDir: f.baseDir });
+  setup = await createWorktrees(f.source, "cleanup-blocker", 1, { baseDir: f.baseDir });
   const lane = setup.worktrees[0]!;
   writeFileSync(join(lane.path, "business.txt"), "keep");
   const report = cleanupWorktrees(setup, { kind: "preserve", cleanupBlocker: "child still active" });

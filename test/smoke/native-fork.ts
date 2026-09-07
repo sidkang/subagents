@@ -27,14 +27,14 @@ jj("git", "init", "--colocate");
 writeFileSync(join(source, "base.txt"), "source"); jj("describe", "-m", "base"); jj("new");
 const sourceBefore = jj("log", "-r", "@", "--no-graph", "-T", "commit_id");
 process.env[WORKFLOW_SCRATCH_ROOT_ENV] = "/poison-ambient";
-const setups: ReturnType<typeof createWorktrees>[] = [];
+const setups: Awaited<ReturnType<typeof createWorktrees>>[] = [];
 const sessions: string[] = [];
 let scratchRoot = "";
 try {
  const result = await runWorkflowScriptWithScratch({
   script: 'await runs.all([{key:"a",agent:"worker",task:"a"},{key:"b",agent:"worker",task:"b"}]); return runs.run("c",{agent:"worker",task:"c"});',
   async launch(key) {
-   const setup = createWorktrees(source, `native-${key}`, 1, { baseDir: join(temp, "worktrees") });
+   const setup = await createWorktrees(source, `native-${key}`, 1, { baseDir: join(temp, "worktrees") });
    setups.push(setup);
    const lane = setup.worktrees[0]!;
    const binding = getActiveWorkflowScratchLaunchBinding()!;

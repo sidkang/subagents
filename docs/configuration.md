@@ -48,6 +48,18 @@ Optionally accept exact response model IDs for an exact provider-qualified launc
 
 This is your explicit assertion that the declared response IDs identify the requested model, not proof from model output. It does not rewrite the outgoing model or provider route, authorize fallback models, or bypass verification for other routes. Foreground and background runs capture this declaration for launch and retain it on revival, including when no aliases were declared. Changing config affects new independent runs, not the retained declaration. Without a matching declaration, existing strict verification remains unchanged.
 
+For a native Pi `model_verification_failed` where your proxy accepts `claude-haiku-4-5` but reports `anthropic.claude-haiku-4-5-20251001-v1:0`, independently confirm your proxy's mapping, then configure:
+
+```json
+{
+  "modelResponseAliases": {
+    "YOUR_PROVIDER/claude-haiku-4-5": ["anthropic.claude-haiku-4-5-20251001-v1:0"]
+  }
+}
+```
+
+Replace `YOUR_PROVIDER` with the resolved Pi provider ID. Keep the outgoing model alias unchanged. This native remedy already exists in v0.65.1; it does not infer equivalence from provider prefixes or dates. The built-in external `claude-code` adapter does not invoke this verifier or use this setting. If an external run shows this diagnostic, identify the installed version, resolved runner kind/adapter, and error location before applying a native remedy. Thanks to [sixtus](https://github.com/sixtus) for the concrete request-ID/response-ID example in [#1922](https://github.com/nicobailon/pi-subagents/issues/1922).
+
 ## `modelExclusions`
 
 ```json
@@ -77,6 +89,8 @@ Controls the parent-facing `subagent` tool description registered at startup. Th
 ```
 
 Controls the `subagent` tool result shown inline in chat. The default, `"rich"`, shows live child activity and expands to detailed output. `"summary"` keeps the inline result at one stable row for running, completed, failed, stopped, and paused runs; it does not animate, show elapsed time, preview child output, or change when Pi's expand key is pressed. FleetView remains available for live progress and detailed inspection.
+
+This is one result row **per tool call**, not one panel per run; the call heading remains. Separate `status` calls for the same run remain separate historical transcript entries. Summary mode neither merges those calls nor changes cross-extension ordering. For a compact chat plus one live editor surface, see [Reducing status display noise](observability.md#reducing-status-display-noise).
 
 ## `mainWindowRenderer`
 
@@ -166,7 +180,7 @@ Controls how resolved fork launches prepare the inherited session. The default `
 
 Child-visible spilled items contain only the model summary and a stable `{ batchId, itemId }` recovery ref. Raw bodies and their digests, source entry ids, labels, sizes, and tool metadata go to a private `0600` sidecar next to the child session. This release does not add a recovery command or expose that payload to the child model.
 
-Pruned forks keep the normal `parentSession` link, child cwd alignment, and fork thinking-block sanitization. Missing model or auth, invalid or incomplete summary JSON, budget overflow, recovery validation failure, and raw overflow leakage all stop the launch before child spawn. The extension never falls back to a full fork or refs-only context after a prune failure.
+Pruned forks keep the normal `parentSession` link, child cwd alignment, and fork thinking-block sanitization (signed Anthropic thinking blocks are stripped; the child keeps its requested thinking level). Missing model or auth, invalid or incomplete summary JSON, budget overflow, recovery validation failure, and raw overflow leakage all stop the launch before child spawn. The extension never falls back to a full fork or refs-only context after a prune failure.
 
 ## `fleetView`
 
@@ -420,7 +434,7 @@ Each native worktree leaf is `{dedicatedRoot}/{projectName}/pi-worktree-{runId}-
 { "worktreeProvider": "auto", "worktreeBranchPrefix": "pi-subagents/" }
 ```
 
-Selects the managed worktree allocator: `auto` (the default) uses Worktrunk when its machine-readable interface is available and otherwise falls back to Pi's native Git worktrees; `native` always uses Pi's Git implementation; and `worktrunk` fails closed when Worktrunk is unavailable or incompatible. A configured `worktreeBaseDir` (or `PI_SUBAGENTS_WORKTREE_DIR`) selects native allocation and cannot be combined with explicit `worktrunk`.
+Selects the managed worktree allocator: `auto` (the default) uses Worktrunk when its machine-readable interface is available and otherwise falls back to Pi's native Git worktrees; `native` always uses Pi's Git implementation; and `worktrunk` fails closed when Worktrunk is unavailable or incompatible. On Windows, pi-subagents invokes Worktrunk through `git wt` to avoid Windows Terminal's conflicting `wt.exe` alias. A configured `worktreeBaseDir` (or `PI_SUBAGENTS_WORKTREE_DIR`) selects native allocation and cannot be combined with explicit `worktrunk`.
 
 `worktreeBranchPrefix` is normalized as a Git ref namespace and defaults to `pi-subagents/`. Branch names include readable task/lane identity plus run and fan-out indexes. Pi continues to own setup hooks, launch, handoff/diff evidence, resume, and cleanup; Worktrunk is used only to allocate and report the worktree path.
 
@@ -436,6 +450,10 @@ Set `worktree` to `true` to make managed worktree isolation the default for laun
 ```
 
 The hook runs once per created worktree. Paths must be absolute, `~/...`, or repo-relative; bare command names are rejected.
+
+Setup command waits are nonblocking and cancellable through existing run controls. Existing run deadlines and the hook timeout still apply; there is no new setup timeout or configuration.
+
+Setup commands, including Git hooks, must be finite and await all descendants before reporting success; do not start background services. Exit zero, natural pipe closure, complete bounded output, and valid JSON/path metadata are trusted completion for launch and cleanup—not observed process-tree proof. Violations are unsupported: protection against deleting a worktree with an undisclosed live descendant is not guaranteed. No additional Windows containment guarantee is provided.
 
 stdin is a JSON object with `repoRoot`, `worktreePath`, `agentCwd`, `branch`, `index`, `runId`, and `baseCommit`. stdout must be one JSON object, for example:
 

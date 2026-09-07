@@ -6,6 +6,7 @@
  * observation channel, not a delivery acknowledgement.
  */
 
+import { debuglog } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { buildCompletionKey, markSeenWithTtl } from "./completion-dedupe.ts";
 import {
@@ -34,6 +35,7 @@ export interface SubagentNotifyChildOutput {
 export type SubagentNotifyWatchdogBlocker = Pick<ChildWatchdogWarningSummary, "summary" | "addressed" | "stalemate"> & { agent: string };
 
 export interface SubagentNotifyDetails {
+	workflowReceiptPath?: string;
 	agent: string;
 	status: "completed" | "failed" | "paused" | "stopped";
 	source?: "async" | "foreground";
@@ -50,6 +52,16 @@ export interface SubagentNotifyDetails {
 	/** Present when a durable schedule launched the run. */
 	scheduleOrigin?: ScheduleOrigin;
 	watchdogBlockers?: SubagentNotifyWatchdogBlocker[];
+}
+
+export interface IncrementalChildCompletion {
+	workflowRunId: string;
+	childKey: string;
+	childRunId?: string;
+	outcome: "completed" | "failed" | "paused" | "stopped";
+	outputReference?: string;
+	error?: string;
+	workflowRunning: boolean;
 }
 
 export interface CompletionNotification {
@@ -189,11 +201,17 @@ function structuredOutputText(value: unknown): string | undefined {
 	}
 }
 
+function isDegenerateOutput(text: string): boolean {
+	return !text.trim() || text.trim() === "</think>";
+}
+
 function childInlinePreview(child: CompletionChild): { preview?: string; truncated?: boolean; unavailableReason?: string } {
 	const output = typeof child.output === "string" ? child.output : "";
 	const outputReference = childSavedOutputPath(child);
 	const referenceOnly = Boolean(outputReference && output.trim().startsWith("Output saved to:"));
-	const raw = child.outputState === "absent" || referenceOnly ? structuredOutputText(child.structuredOutput) : output || structuredOutputText(child.structuredOutput);
+	const raw = child.outputState === "absent" || referenceOnly
+		? structuredOutputText(child.structuredOutput)
+		: isDegenerateOutput(output) ? structuredOutputText(child.structuredOutput) ?? output : output;
 	if (!raw?.trim()) {
 		return { unavailableReason: referenceOnly ? "saved output is file-only" : "no safe inline output" };
 	}
@@ -283,6 +301,7 @@ export function formatSingleCompletion(details: SubagentNotifyDetails): string {
 		: undefined;
 	return [
 		`${taskKind} ${details.status}: **${details.agent}**${details.taskInfo ?? ""}`,
+		details.workflowReceiptPath ? `Workflow receipt: ${details.workflowReceiptPath}` : undefined,
 		"",
 		scheduleLine,
 		scheduleLine ? "" : undefined,
@@ -299,11 +318,31 @@ export function formatSingleCompletion(details: SubagentNotifyDetails): string {
 		.join("\n");
 }
 
+export function formatIncrementalChildCompletion(child: IncrementalChildCompletion): string {
+	const statusText = child.outcome === "completed" ? "completed"
+		: child.outcome === "failed" ? "failed"
+			: child.outcome === "paused" ? "paused (needs attention)"
+				: "stopped";
+	const workflowStatus = child.workflowRunning ? "workflow still running" : "workflow finished";
+	return [
+		`Workflow child ${statusText}: **${child.childKey}**`,
+		`Workflow run: ${child.workflowRunId}`,
+		...(child.childRunId ? [`Child run: ${child.childRunId}`] : []),
+		...(child.outputReference ? [`Output: ${child.outputReference}`] : []),
+		...(child.error ? [`Error: ${child.error}`] : []),
+		`Status: ${workflowStatus}`,
+	].join("\n");
+}
+
 export function parseSubagentNotifyContent(content: string): SubagentNotifyDetails | undefined {
 	const lines = content.split("\n");
 	const match = (lines[0] ?? "").match(/^(Background task|Detached foreground task) (completed|failed|paused|stopped): \*\*(.+?)\*\*(?:\s+(\([^)]*\)))?$/);
 	if (!match) return undefined;
-	let body = lines.slice(2);
+	// Only the header slot before the blank separator can carry a receipt.
+	// Identical lines anywhere in model output remain preview text.
+	const receiptHeader = lines[1]?.startsWith("Workflow receipt: ") && lines[2] === "";
+	const workflowReceiptPath = receiptHeader ? lines[1]!.slice("Workflow receipt: ".length) : undefined;
+	let body = lines.slice(receiptHeader ? 3 : 2);
 	// Restore the schedule origin so a re-rendered notice keeps its attribution and
 	// does not fold the line into the result preview.
 	const scheduleMatch = (body[0] ?? "").match(/^Scheduled run from \*\*(.+?)\*\* \(schedule (.+?)\)\.$/);
@@ -359,6 +398,7 @@ export function parseSubagentNotifyContent(content: string): SubagentNotifyDetai
 		...(match[1] === "Detached foreground task" ? { source: "foreground" as const } : {}),
 		...(match[4] ? { taskInfo: match[4] } : {}),
 		...(parsedScheduleOrigin ? { scheduleOrigin: parsedScheduleOrigin } : {}),
+		...(workflowReceiptPath ? { workflowReceiptPath } : {}),
 		resultPreview,
 		...(handoffPath ? { handoffPath } : {}),
 		...(workflowRunId ? { workflowRunId } : {}),
@@ -377,6 +417,7 @@ export function formatGroupedCompletion(details: SubagentNotifyDetails[]): strin
 		if (!detail) continue;
 		const sessionLine = formatSessionLine(detail);
 		blocks.push(`${index + 1}. ${detail.agent}${detail.taskInfo ?? ""}${detail.scheduleOrigin ? ` — scheduled run from ${detail.scheduleOrigin.name ?? detail.scheduleOrigin.id} (schedule ${detail.scheduleOrigin.id})` : ""}`);
+		if (detail.workflowReceiptPath) blocks.push(`Workflow receipt: ${detail.workflowReceiptPath}`);
 		blocks.push(formatResultPreview(detail));
 		blocks.push(...formatWatchdogBlockerLines(detail));
 		if (detail.handoffPath) blocks.push(`Parallel handoff: ${detail.handoffPath}`);
@@ -387,7 +428,31 @@ export function formatGroupedCompletion(details: SubagentNotifyDetails[]): strin
 	return blocks.join("\n").trimEnd();
 }
 
+const notificationDebug = debuglog("pi-subagents-notify");
+type TraceIdentity = Pick<CompletionNotification, "id" | "runId" | "source">;
+type NotificationReason = "disposed" | "missing_session" | "foreground_session_mismatch" | "not_owned"
+	| "intercom_delivered" | "deduped_ttl" | "deduped_pending" | "batch_deferred"
+	| "emit_foreground_session_mismatch" | "emit_not_owned" | "send_accepted" | "send_failed" | "dispose_pending";
+
+// Slice before sanitizing: diagnostic work and each identity are bounded even for
+// malformed result metadata. Never include task/output, paths, or error bodies.
+function traceIdentity(result: TraceIdentity): TraceIdentity {
+	const identity = (value: unknown) => typeof value === "string"
+		? value.slice(0, 128).replace(/[^a-zA-Z0-9_.:-]/g, "_") : undefined;
+	return { id: identity(result.id), runId: identity(result.runId), source: result.source === "foreground" ? "foreground" : "async" };
+}
+
+function traceNotification(reason: NotificationReason, result?: TraceIdentity): void {
+	if (!notificationDebug.enabled) return;
+	try {
+		notificationDebug("%s", JSON.stringify({ reason, ...(result ? traceIdentity(result) : {}) }));
+	} catch {
+		// Diagnostics must never change delivery acknowledgement.
+	}
+}
+
 interface PendingCompletion {
+	trace?: TraceIdentity;
 	key: string;
 	details: SubagentNotifyDetails;
 	sessionId: string;
@@ -448,6 +513,10 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		? result.parallelHandoff as { path?: unknown }
 		: undefined;
 	const handoffPath = typeof parallelHandoff?.path === "string" ? parallelHandoff.path : undefined;
+	const receipt = result.workflowReceipt;
+	const receiptPath = receipt && typeof receipt === "object" && !Array.isArray(receipt)
+		? (receipt as Record<string, unknown>).path : undefined;
+	const workflowReceiptPath = typeof receiptPath === "string" && receiptPath ? receiptPath : undefined;
 	const rawRunId = typeof result.runId === "string" ? result.runId : typeof result.id === "string" ? result.id : undefined;
 	const workflowRunId = (result.mode === "workflow" || agent === "workflow") && rawRunId ? rawRunId : undefined;
 	const directChild = !workflowRunId && result.results?.length === 1 ? result.results[0]! : undefined;
@@ -456,10 +525,17 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		: undefined;
 	const directSummary = summary.trim();
 	const directAgent = typeof directChild?.agent === "string" ? directChild.agent : agent;
+	const directSummaryBody = directAgent && summary.trimStart().startsWith(`${directAgent}:\n`)
+		? summary.trimStart().slice(directAgent.length + 2)
+		: directSummary;
+	const directDegenerateSummary = directChild
+		&& isDegenerateOutput(typeof directChild.output === "string" ? directChild.output : "")
+		&& isDegenerateOutput(directSummaryBody)
+		&& structuredOutputText(directChild.structuredOutput) !== undefined;
 	const directNoOutputSummary = directChild && (!directSummary
 		|| directSummary === "(no output)"
 		|| (directAgent && directSummary === `${directAgent}:\n(no output)`));
-	const resultPreview = directStructuredPreview && directNoOutputSummary
+	const resultPreview = directStructuredPreview && (directNoOutputSummary || directDegenerateSummary)
 		? `Structured output:\n${directStructuredPreview}`
 		: summary;
 	const childRuns = result.results?.flatMap((child) => {
@@ -517,6 +593,7 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		agent,
 		status,
 		...(scheduleOrigin ? { scheduleOrigin } : {}),
+		...(workflowReceiptPath ? { workflowReceiptPath } : {}),
 		...(result.source ? { source: result.source } : {}),
 		...(taskInfo ? { taskInfo } : {}),
 		resultPreview,
@@ -548,8 +625,9 @@ export default function registerSubagentNotify(
 			&& typeof completionOwnerId === "string"
 			&& completionOwnerId === state.completionOwnerId);
 
-	const settle = (items: PendingCompletion[], accepted: boolean) => {
+	const settle = (items: PendingCompletion[], accepted: boolean, reason?: NotificationReason) => {
 		for (const item of items) {
+			if (reason) traceNotification(reason, item.trace);
 			pending.delete(item.key);
 			if (accepted) markSeenWithTtl(seen, item.key, now(), ttlMs);
 			item.resolve(accepted);
@@ -562,10 +640,12 @@ export default function registerSubagentNotify(
 			const owned = item.details.source === "foreground"
 				? item.sessionId === state.currentSessionId
 				: ownsResult(item.sessionId, item.completionOwnerId);
+			if (!owned) traceNotification(item.details.source === "foreground" ? "emit_foreground_session_mismatch" : "emit_not_owned", item.trace);
 			(owned ? accepted : rejected).push(item);
 		}
 		settle(rejected, false);
-		settle(accepted, sendCompletion(pi, accepted));
+		const sent = sendCompletion(pi, accepted);
+		settle(accepted, sent, sent ? "send_accepted" : "send_failed");
 	};
 	const getBatcher = (result: CompletionNotification) => {
 		const key = completionBatchKey(result);
@@ -583,17 +663,35 @@ export default function registerSubagentNotify(
 	};
 
 	const deliver = (result: CompletionNotification): Promise<boolean> => {
-		if (disposed || typeof result.sessionId !== "string") return Promise.resolve(false);
+		if (disposed || typeof result.sessionId !== "string") {
+			traceNotification(disposed ? "disposed" : "missing_session", result);
+			return Promise.resolve(false);
+		}
 		if (result.source === "foreground") {
-			if (result.sessionId !== state.currentSessionId) return Promise.resolve(false);
-		} else if (!ownsResult(result.sessionId, result.completionOwnerId)) return Promise.resolve(false);
-		if (result.intercomDelivered === true) return Promise.resolve(true);
+			if (result.sessionId !== state.currentSessionId) {
+				traceNotification("foreground_session_mismatch", result);
+				return Promise.resolve(false);
+			}
+		} else if (!ownsResult(result.sessionId, result.completionOwnerId)) {
+			traceNotification("not_owned", result);
+			return Promise.resolve(false);
+		}
+		if (result.intercomDelivered === true) {
+			traceNotification("intercom_delivered", result);
+			return Promise.resolve(true);
+		}
 		const key = buildCompletionKey(result, "notify");
 		const seenAt = seen.get(key);
-		if (seenAt !== undefined && now() - seenAt <= ttlMs) return Promise.resolve(true);
+		if (seenAt !== undefined && now() - seenAt <= ttlMs) {
+			traceNotification("deduped_ttl", result);
+			return Promise.resolve(true);
+		}
 		if (seenAt !== undefined) seen.delete(key);
 		const inFlight = pending.get(key);
-		if (inFlight) return inFlight;
+		if (inFlight) {
+			traceNotification("deduped_pending", result);
+			return inFlight;
+		}
 		const details = buildCompletionDetails(result);
 		let resolve!: (accepted: boolean) => void;
 		const completion = new Promise<boolean>((settleCompletion) => { resolve = settleCompletion; });
@@ -606,6 +704,7 @@ export default function registerSubagentNotify(
 			triggerTurn: result.triggerTurn !== false,
 			resolve,
 		};
+		if (notificationDebug.enabled) item.trace = traceIdentity(result);
 		if (details.source === "foreground") {
 			emit([item]);
 			return completion;
@@ -616,6 +715,7 @@ export default function registerSubagentNotify(
 			emit([item]);
 			return completion;
 		}
+		if (batchConfig.enabled) traceNotification("batch_deferred", item.trace);
 		batcher.push(item);
 		return completion;
 	};
@@ -633,7 +733,7 @@ export default function registerSubagentNotify(
 		dispose() {
 			if (disposed) return;
 			disposed = true;
-			for (const batcher of batchers.values()) settle(batcher.dispose(), false);
+			for (const batcher of batchers.values()) settle(batcher.dispose(), false, "dispose_pending");
 			batchers.clear();
 			for (const unsubscribe of [unsubscribeAsync, unsubscribeForeground]) {
 				try {

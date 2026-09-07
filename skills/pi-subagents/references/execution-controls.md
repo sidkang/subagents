@@ -83,10 +83,10 @@ lanes, or a fanout that the parent will consume together.
 ```js
 subagent({
   workflowScript: `
-    const scan = await runs.run("scan", { agent: "scout", task: "Map the target" });
+    const scan = await runs.run("scan", { label: "Map target behavior", agent: "scout", task: "Map the target" });
     const reviews = await runs.all([
-      { key: "correctness", agent: "reviewer", task: "Review correctness: " + scan.output },
-      { key: "tests", agent: "reviewer", task: "Review tests: " + scan.output }
+      { key: "correctness", label: "Review target correctness", agent: "reviewer", task: "Review correctness: " + scan.output },
+      { key: "tests", label: "Review target test coverage", agent: "reviewer", task: "Review tests: " + scan.output }
     ]);
     return reviews.map(result => result.output);
   `
@@ -109,6 +109,7 @@ Terminal async workflows also persist `workflow-receipt.json` beside `status.jso
 
 ```js
 return runs.run("cross-oracle", {
+  label: "Challenge proposed direction",
   resume: { workflowRunId: "<pass-1-workflow-id>", key: "advisor-oracle", latest: true },
   task: "Review the focused challenge packet."
 });
@@ -120,7 +121,8 @@ Keyed resume reads that one exact receipt and revalidates the retained run at la
 
 For a broad plan with a known set of narrow, visible stages per lane, use
 `runs.lanes(...)` inside a `workflowScript`; it is a nested helper, not a
-top-level `subagent` mode. Give each lane and stage a stable key. The first
+top-level `subagent` mode. Give each lane and stage a stable key; give stage
+items a short verb + behavior `label`, preserving explicit user labels. The first
 stage from every lane is launched together, then later stages sequence per lane.
 `resume: "previous"` requires the retained predecessor, and a failed or blocked
 stage blocks only that lane. The returned board exposes lane/stage results for
@@ -258,7 +260,7 @@ A cooperating terminal runtime can register read-only external records through `
 
 ### Scheduled subagent runs
 
-Schedules are durable project records under `.pi/subagents/schedules/`. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit work the user asked for.
+Schedules are durable project records under `.pi/subagents/schedules/`. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit work the user asked for. To keep schedules outside the project repository, set `{ "scheduledRuns": { "storeRoot": "~/.pi/subagent-schedules" } }` in the same config: `storeRoot` accepts an absolute path or a `~/`-prefixed path, and records land under `<storeRoot>/<sha256(path.resolve(cwd)) first 20 hex>/<scheduleId>/`.
 
 ```typescript
 // One-shot reviewer
@@ -326,6 +328,19 @@ subagent({ action: "steer", id: "abc123", message: "Focus on the failing test." 
 ```
 
 The action waits up to three seconds for the child Pi session to accept the correlated user input and returns a request id with `delivered`, `scheduled`, `pending`, `partial`, `recovered`, or `failed` plus per-child states. Indexed pending children return `scheduled` immediately. Only a top-level single-child run may automatically interrupt after a missed acknowledgment and recover after confirmed pause within a further 15 seconds. Recovery preserves the original child contract and only its remaining deadline, turn, and tool budgets. If the session is missing, a budget is exhausted, the pause cannot be confirmed, or replacement launch fails, the source remains paused when pausing succeeded and the action returns the exact failure. Chain, parallel, and nested runs never auto-interrupt; inspect their per-child outcomes and handle failures explicitly. A late acknowledgment is recorded and cannot cancel committed recovery.
+
+Steering supports three delivery modes via the `mode` parameter (`steer` is the default):
+
+- `mode: "steer"` — interrupt the child at the next safe point of its current turn and deliver the message.
+- `mode: "follow_up"` — do not interrupt; queue input through Pi's native follow-up path for the next turn boundary. Eligible completed retained workflow children (single-step runs in state `complete` with a stored session file) receive the message as a revival brief (`queueRevivalBrief`) when they are revived; paused children reject follow-up steering outright. The 20-message queue limit applies to retained revival briefs, not live follow-up input.
+- `mode: "auto"` — same next-safe-point delivery path as `steer`, but without the automatic pause-and-revive recovery after a missed acknowledgment.
+
+```typescript
+subagent({ action: "steer", id: "abc123", mode: "follow_up", message: "After this step, also validate the config file." })
+subagent({ action: "steer", id: "abc123", mode: "auto", message: "Switch to the failing test now." })
+```
+
+Direct input acceptance returns `delivered`, not proof of model compliance. A live follow-up acknowledgment reports `queued`, meaning Pi accepted it into its follow-up queue, not that it was delivered. The runtime does not provide a later correlated live queued-to-delivered receipt.
 
 ## Watchdog
 

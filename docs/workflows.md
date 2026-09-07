@@ -96,17 +96,18 @@ subagent({
 - `toolBudget` becomes the default for each child unless that child supplies a narrower value.
 - `usageBudget` accounts for reported usage across completed workflow children. Once exhausted, it rejects later child launches but does not stop children that are already running.
 - Budget and timeout stops return a structured `terminalOutcome` with `state: "partial"` and reason `budget_exhausted` or `timeout`. Workflow receipts keep settled child evidence for recovery.
+- After an async workflow receipt is successfully published, `workflowReceiptPath` exposes its exact path in wait completion details, completion notifications, and exact status/debug details. Text responses also identify the receipt. Pending runs and failed receipt publications omit the reference; older status records are not backfilled. The reference records publication, not a guarantee against later retention cleanup. Raw result files retain `workflowReceipt: { path, receipt }`.
 
 These controls are opt-in. Avoid tight hard budgets for mutation-capable workers unless the workflow has an explicit checkpoint and handoff path.
 
-The result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, literal `runs.run` and `runs.all` keys, duplicate literal keys in one `runs.all` group, direct keyed access to a known `runs.all` result, and statically clear non-JSON boundary values. Dynamic keys and other runtime-only values are accepted without a warning. Validation does not discover agents, launch children, or create run artifacts.
+The result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, literal `runs.run` and `runs.all` keys and child `baseRef` values, duplicate literal keys in one `runs.all` group, direct keyed access to a known `runs.all` result, and statically clear non-JSON boundary values. Dynamic keys and other runtime-only values are accepted without a warning. Validation does not discover agents, launch children, or create run artifacts.
 
 ```js
 subagent({ workflowScript: `
-  const scan = await runs.run("scan", { agent: "scout", task: "Scan the codebase" });
+  const scan = await runs.run("scan", { label: "Map codebase behavior", agent: "scout", task: "Scan the codebase" });
   const reviews = await runs.all([
-    { key: "correctness", agent: "reviewer", task: "Review correctness: " + scan.output },
-    { key: "tests", agent: "reviewer", task: "Review tests: " + scan.output }
+    { key: "correctness", label: "Review codebase correctness", agent: "reviewer", task: "Review correctness: " + scan.output },
+    { key: "tests", label: "Review test coverage", agent: "reviewer", task: "Review tests: " + scan.output }
   ]);
   return reviews.map(result => result.output);
 ` });
@@ -117,7 +118,7 @@ Keep helper functions portable across Node and Bun. Use top-level `await`, plain
 ```js
 subagent({ workflowScript: `
   function scan() {
-    return runs.run("scan", { agent: "scout", task: "Scan the codebase" });
+    return runs.run("scan", { label: "Map codebase behavior", agent: "scout", task: "Scan the codebase" });
   }
   const result = await scan();
   return result.output;
@@ -128,8 +129,8 @@ Chaining is still supported. The supported form is scripted chaining: await one 
 
 ```js
 subagent({ workflowScript: `
-  const plan = await runs.run("plan", { agent: "scout", task: "Plan the migration" });
-  const patch = await runs.run("patch", { agent: "worker", task: "Implement this plan:\n" + plan.output });
+  const plan = await runs.run("plan", { label: "Plan migration behavior", agent: "scout", task: "Plan the migration" });
+  const patch = await runs.run("patch", { label: "Implement migration behavior", agent: "worker", task: "Implement this plan:\n" + plan.output });
   return patch.output;
 ` });
 ```
@@ -144,16 +145,16 @@ subagent({ workflowScript: `
     {
       key: "api",
       stages: [
-        { key: "writer", agent: "worker", task: "Implement the API change" },
-        { key: "challenge", resume: "previous", task: "Challenge the API implementation" },
-        { key: "review", agent: "reviewer", task: "Review the API lane" }
+        { key: "writer", label: "Implement API behavior", agent: "worker", task: "Implement the API change" },
+        { key: "challenge", label: "Challenge API behavior", resume: "previous", task: "Challenge the API implementation" },
+        { key: "review", label: "Review API behavior", agent: "reviewer", task: "Review the API lane" }
       ]
     },
     {
       key: "ui",
       stages: [
-        { key: "writer", agent: "worker", task: "Implement the UI change" },
-        { key: "review", agent: "reviewer", task: "Review the UI lane" }
+        { key: "writer", label: "Implement UI behavior", agent: "worker", task: "Implement the UI change" },
+        { key: "review", label: "Review UI behavior", agent: "reviewer", task: "Review the UI lane" }
       ]
     }
   ]);
@@ -355,6 +356,8 @@ known, or for explicit emergency hotfix lanes.
 
 For watched same-repo workflows, pass `async:false` only when the parent must block until completion. That blocking mode also shows the live in-chat workflow card. `chatProgress` can force `off` or `live-card` when the automatic policy is not what you want. Blocking workflows default to a 30-minute timeout; async workflows have no default timeout. See the [tool reference](tool-reference.md) for the full parameter list.
 
+Synchronous workflows publish trace and `emit(...)` updates through the tool update callback regardless of `chatProgress`, including RPC/headless and cross-repository runs. These updates include `details.workflow` and `details.workflowChildren`; `chatProgress: "off"` disables the live card, not transport progress. Running foreground child rows additionally expose bounded `activity` (current tool, timing, and counters), plus resolved model/thinking when available, keyed by `childId`. Activity-only updates coalesce over 100 ms; lifecycle updates remain immediate. Activity clears when children settle, and is not persisted for async workflows. Tool names are limited to 256 UTF-8 bytes and each activity object is below 2 KiB (including JSON escaping); arguments and transcripts are not forwarded.
+
 The legacy `/chain`, `/parallel`, and `/run-chain` commands are not registered.
 
 ## Direct commands
@@ -377,9 +380,11 @@ Each child uses the existing worktree lifecycle: it branches from clean HEAD, jo
 
 A top-level `{ workflowScript, worktree: true }` makes isolation the default for every workflow child. An individual child can override that default with `worktree: false`. Keep one writer when parallel writes are not intentionally isolated.
 
-Use `baseRef` to branch managed worktrees from a named commit or branch instead of the default `HEAD`. For example, `{ workflowScript, worktree: true, baseRef: "refs/heads/release" }` applies the release ref to children unless a child supplies its own `baseRef`. The source checkout must still be clean, and the ref must resolve to a commit before any worktree is allocated.
+Use `baseRef` to branch managed worktrees from `HEAD` or a supported named ref such as `refs/heads/release`, `refs/tags/v1`, or `origin/main`. Full 40/64-character commit IDs and revision expressions such as `HEAD~1` are unsupported. For example, `{ workflowScript, worktree: true, baseRef: "refs/heads/release" }` applies the release ref to children unless a child supplies its own `baseRef`. If omitted, the default `HEAD` is resolved at worktree allocation, not when the script is validated or a schedule is created. The source checkout must still be clean, and the ref must resolve to a commit before any worktree is allocated.
 
 Configure the worktree provider, native path layout, base directory, and setup hook in [configuration.md](configuration.md).
+
+Setup waits remain nonblocking and cancellable. Normal cleanup, including detached foreground finalization, waits for the same in-process setup turn rather than retaining worktrees merely because another setup is active. This is not a cross-process lock. Hooks must follow the [finite setup contract](configuration.md#worktreesetuphook).
 
 ### Lane metadata lifecycle
 
@@ -402,11 +407,13 @@ Older runs without lane metadata remain readable and retain their existing
 handoff/cleanup behavior. Missing lane, receipt, or handoff metadata is
 unknown—not eligible for destructive cleanup.
 
-For managed worktree launches, the runner writes the pending handoff and the
-display-only status path/branch from the deterministic setup plan before the
-first `git worktree add`. If setup then fails or is interrupted, that pending
-ownership record remains preserved evidence; cleanup still rechecks the actual
-worktree state before any removal.
+Managed setup records actual allocation attempts in the handoff; only validated
+allocations become cleanup tasks and display-only status paths/branches. On
+cancellation or failure with unknown settlement, it retains actual/attempted
+ownership evidence and artifacts for manual reconciliation, blocking further
+unsafe setup and cleanup in that process. An allocator interrupted before
+reporting its path may leave branch-only diagnostics, never an invented path.
+Inspect the handoff before reconciliation; cleanup still requires fresh checks.
 
 ## Supervisor coordination (child asks parent)
 

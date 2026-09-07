@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { runSetupCommand, type SetupCommandOptions, type SetupCommandResult } from "./worktree-setup-command.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -24,6 +25,8 @@ const WORKTREE_NAMING_COMPONENT_MAX_BYTES = 96;
 const WORKTREE_NAMING_LABEL_MAX_BYTES = 256;
 const WORKTREE_NAMING_BRANCH_MAX_BYTES = 256;
 const WORKTREE_COMMAND_OUTPUT_MAX_BYTES = 128 * 1024;
+const WORKTRUNK_COMMAND = process.platform === "win32" ? "git" : "wt";
+const WORKTRUNK_ARG_PREFIX = process.platform === "win32" ? ["wt"] : [];
 export const MACHINE_DIFF_OPTIONS = ["--no-color", "--no-ext-diff", "--no-textconv", "--default-prefix", "--line-prefix=", "--no-relative"] as const;
 const MACHINE_PATCH_OPTIONS = [...MACHINE_DIFF_OPTIONS, "--binary"] as const;
 const PATCH_VALIDATION_OPTIONS = ["apply", "--check", "--cached", "--reverse", "--binary", "--whitespace=nowarn"] as const;
@@ -136,6 +139,10 @@ interface WorktreeSetupHookConfig {
 }
 
 export interface CreateWorktreesOptions {
+	signal?: AbortSignal;
+	/** Existing absolute run deadline only; setup does not start a child budget. */
+	deadlineAt?: number;
+	onProgress?: (snapshot: WorktreeSetupProgress) => void;
 	agents?: string[];
 	/** Optional stable labels used to make branch identity readable. */
 	labels?: Array<string | undefined>;
@@ -149,8 +156,6 @@ export interface CreateWorktreesOptions {
 	branchPrefix?: string;
 	setupHook?: WorktreeSetupHookConfig;
 	baseDir?: string;
-	/** Called with deterministic ownership metadata before setup hooks and child launch; native reports planned paths before allocation, while Worktrunk reports its returned paths after allocation. */
-	beforeCreate?: (setup: WorktreeSetup) => void;
 }
 
 interface ResolvedWorktreeSetupHook {
@@ -183,11 +188,109 @@ interface GitResult {
 interface RepoState {
 	toplevel: string;
 	cwdRelative: string;
-	sourceCheckout: SourceCheckoutSnapshot;
 	baseCommit: string;
 }
 
 const DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS = 30000;
+
+/** In-memory evidence only. Callers project this into existing handoff diagnostics. */
+export interface WorktreeSetupProgress {
+	setup: WorktreeSetup;
+	attempts: Array<{ index: number; branch: string; path?: string; validated: boolean; command?: WorktreeSetupProgress["command"]; hookCommand?: WorktreeSetupProgress["command"] }>;
+	phase: string;
+	command?: { command: string; args: string[]; pid?: number; processGroupId?: number; result?: Omit<SetupCommandResult, "stdout" | "stderr"> };
+	unknown?: string;
+	cleanup?: WorktreeCleanupReport;
+}
+
+export class WorktreeSetupError extends Error {
+	readonly snapshot: WorktreeSetupProgress;
+	constructor(error: unknown, snapshot: WorktreeSetupProgress) {
+		super(`${error instanceof Error ? error.message : String(error)}${snapshot.unknown ? `; setup settlement unknown: ${snapshot.unknown}; manual reconciliation required` : ""}`, { cause: error });
+		this.name = "WorktreeSetupError";
+		this.snapshot = snapshot;
+	}
+}
+
+let worktreeTurn: Promise<void> = Promise.resolve();
+let setupActive = false;
+let setupPoison: string | undefined;
+
+function assertWorktreeMutationAllowed(): void {
+	if (setupPoison) throw new Error(`Worktree mutation blocked: ${setupPoison}`);
+	if (setupActive) throw new Error("Worktree setup is active; finalization must await withWorktreeTransaction");
+}
+
+/** Later async finalization owners wrap their synchronous diff/cleanup as ONE turn. */
+export async function withWorktreeTransaction<T>(action: () => T | Promise<T>): Promise<T> {
+	const previous = worktreeTurn;
+	let release!: () => void;
+	worktreeTurn = new Promise<void>((resolve) => { release = resolve; });
+	await previous;
+	try {
+		if (setupPoison) throw new Error(`Worktree mutation blocked: ${setupPoison}`);
+		return await action();
+	} finally { release(); }
+}
+
+class SetupTransaction {
+	readonly progress: WorktreeSetupProgress;
+	readonly options: CreateWorktreesOptions;
+	constructor(cwd: string, options: CreateWorktreesOptions) {
+		this.options = options;
+		this.progress = { setup: { cwd, baseCommit: "", worktrees: [] }, attempts: [], phase: "preflight" };
+	}
+	snapshot(): WorktreeSetupProgress {
+		return structuredClone(this.progress);
+	}
+	publish(): void { this.options.onProgress?.(this.snapshot()); }
+	check(): void {
+		if (setupPoison) throw new Error(setupPoison);
+		if (this.options.signal?.aborted) throw new Error("Worktree setup aborted");
+		if (this.options.deadlineAt !== undefined && Date.now() >= this.options.deadlineAt) throw new Error("Worktree setup deadline exceeded");
+	}
+	unknown(error: unknown): void {
+		const reason = error instanceof Error ? error.message : String(error);
+		this.progress.unknown ??= reason;
+		setupPoison ??= reason;
+	}
+	async command(command: string, args: string[], options: SetupCommandOptions = {}): Promise<SetupCommandResult> {
+		this.check();
+		this.progress.command = { command, args };
+		if (this.progress.phase === "allocation") this.progress.attempts.at(-1)!.command = this.progress.command;
+		if (this.progress.phase === "hook") this.progress.attempts.find((attempt) => attempt.path === options.cwd)!.hookCommand = this.progress.command;
+		const result = await runSetupCommand(command, args, {
+			...options, signal: this.options.signal, deadlineAt: this.options.deadlineAt,
+			onSpawn: (process) => { Object.assign(this.progress.command!, process); this.publish(); },
+		});
+		const { stdout: _stdout, stderr: _stderr, ...metadata } = result;
+		this.progress.command.result = metadata;
+		if (result.processTree?.state === "unknown") this.unknown(result.error ?? "Command tree settlement unverified");
+		this.publish();
+		if (result.error) throw result.error;
+		return result;
+	}
+	async git(cwd: string, args: string[], acceptedExitCodes?: readonly number[]): Promise<SetupCommandResult> {
+		return this.command("git", ["-C", cwd, ...args], { acceptedExitCodes });
+	}
+	async gitChecked(cwd: string, args: string[]): Promise<string> {
+		const result = await this.git(cwd, args);
+		return result.stdout;
+	}
+	attempt(index: number, branch: string, worktreePath?: string): void {
+		this.check();
+		this.progress.phase = "allocation";
+		this.progress.command = undefined;
+		this.progress.attempts.push({ index, branch, path: worktreePath, validated: false });
+		this.publish();
+	}
+	validated(worktree: WorktreeInfo): void {
+		this.progress.phase = "validated";
+		Object.assign(this.progress.attempts.at(-1)!, { path: worktree.path, validated: true });
+		this.progress.setup.worktrees.push(worktree);
+		this.publish();
+	}
+}
 
 function runGit(cwd: string, args: string[], env?: NodeJS.ProcessEnv): GitResult {
 	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8", windowsHide: true, shell: false, ...(env ? { env: { ...process.env, ...env } } : {}) });
@@ -216,6 +319,7 @@ export function validateWorktreePatch(worktreePath: string, patchPath: string): 
 }
 
 function currentWorktreePatch(worktreePath: string, baseCommit: string): { patch: string } | { error: string } {
+	assertWorktreeMutationAllowed();
 	let tempDir: string;
 	try {
 		tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-index-"));
@@ -255,38 +359,31 @@ export function validateWorktreePatchRepresentsCurrentWorktree(worktreePath: str
 	return undefined;
 }
 
-function findGitWorktreePath(cwd: string, branch: string): string | undefined {
-	const targetBranch = `branch refs/heads/${branch}`;
-	let currentPath: string | undefined;
-	for (const line of runGitChecked(cwd, ["worktree", "list", "--porcelain"]).split("\n")) {
-		if (line.startsWith("worktree ")) currentPath = line.slice("worktree ".length).trim();
-		else if (line.trim() === targetBranch) return currentPath;
-	}
-	return undefined;
-}
-
-function resolveRepoState(cwd: string, requestedBaseRef: string | undefined): RepoState {
-	const cwdRelative = resolveRepoCwdRelative(cwd);
-	const toplevel = runGitChecked(cwd, ["rev-parse", "--show-toplevel"]).trim();
+async function resolveRepoState(tx: SetupTransaction, cwd: string, requestedBaseRef: string | undefined): Promise<RepoState> {
+	const repoCheck = await tx.git(cwd, ["rev-parse", "--is-inside-work-tree"], [0, 128]);
+	if (repoCheck.status !== 0 || repoCheck.stdout.trim() !== "true") throw new Error("worktree isolation requires a git repository");
+	const rawPrefix = (await tx.gitChecked(cwd, ["rev-parse", "--show-prefix"])).trim();
+	const cwdRelative = rawPrefix ? path.normalize(rawPrefix.replace(/[\\/]+$/, "")) : "";
+	const toplevel = (await tx.gitChecked(cwd, ["rev-parse", "--show-toplevel"])).trim();
 
 	// pi-subagents writes durable runtime state under .pi/subagents/ by default;
 	// that state must not make managed isolation unusable for later runs.
-	const status = runGitChecked(toplevel, ["status", "--porcelain", "--", `:!${PROJECT_SUBAGENTS_RELATIVE_DIR}`]);
+	const status = await tx.gitChecked(toplevel, ["status", "--porcelain", "--", `:!${PROJECT_SUBAGENTS_RELATIVE_DIR}`]);
 	if (status.trim().length > 0) {
 		throw new Error("worktree isolation requires a clean git working tree. Commit or stash changes first.");
 	}
 
-	const sourceHead = runGitChecked(toplevel, ["rev-parse", "HEAD"]).trim();
-	const sourceCheckout = snapshotSourceCheckout(toplevel, sourceHead);
 	const baseRef = normalizeWorktreeBaseRef(requestedBaseRef) ?? DEFAULT_WORKTREE_BASE_REF;
 	let baseCommit: string;
 	try {
-		baseCommit = runGitChecked(toplevel, ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`]).trim();
+		const base = await tx.git(toplevel, ["rev-parse", "--verify", "--end-of-options", `${baseRef}^{commit}`], [0, 128]);
+		if (base.status !== 0) throw new Error(base.stderr.trim() || "ref not found");
+		baseCommit = base.stdout.trim();
 	} catch (error) {
 		throw new Error(`baseRef '${baseRef}' could not be resolved to a commit: ${error instanceof Error ? error.message : String(error)}`, { cause: error instanceof Error ? error : undefined });
 	}
 	if (!baseCommit) throw new Error(`baseRef '${baseRef}' could not be resolved to a commit`);
-	return { toplevel, cwdRelative, sourceCheckout, baseCommit };
+	return { toplevel, cwdRelative, baseCommit };
 }
 
 function normalizeComparableCwd(cwd: string): string {
@@ -375,7 +472,7 @@ function validGitRef(ref: string): boolean {
 /** Normalize and validate a configured worktree base ref without resolving it. */
 export function normalizeWorktreeBaseRef(value: unknown): string | undefined {
 	if (value === undefined) return undefined;
-	if (typeof value !== "string" || !validGitRef(value)) throw new Error("baseRef must be a valid Git ref");
+	if (typeof value !== "string" || !validGitRef(value)) throw new Error("baseRef must be a valid Git ref: use HEAD or a supported named ref (for example, refs/heads/main). Full 40/64-character commit IDs and revision expressions are unsupported.");
 	return value;
 }
 
@@ -454,14 +551,9 @@ interface WorktrunkCapability {
 	reason?: string;
 }
 
-interface SourceCheckoutSnapshot {
-	head: string;
-	branch?: string;
-}
-
 function runWorktrunk(args: string[], cwd?: string): WorktreeCommandResult {
 	try {
-		const result = spawnSync("wt", args, {
+		const result = spawnSync(WORKTRUNK_COMMAND, [...WORKTRUNK_ARG_PREFIX, ...args], {
 			cwd,
 			encoding: "utf-8",
 			windowsHide: true,
@@ -491,18 +583,6 @@ function probeWorktrunk(): WorktrunkCapability {
 	return { available: true };
 }
 
-function snapshotSourceCheckout(toplevel: string, head: string): SourceCheckoutSnapshot {
-	const branch = runGit(toplevel, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
-	const branchName = branch.status === 0 ? branch.stdout.trim() : "";
-	return branchName ? { head, branch: branchName } : { head };
-}
-
-function restoreSourceCheckoutIfWorktrunkSwitchedIt(toplevel: string, createdBranch: string, sourceCheckout: SourceCheckoutSnapshot): void {
-	const current = runGit(toplevel, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
-	if (current.status !== 0 || current.stdout.trim() !== createdBranch) return;
-	runGitChecked(toplevel, sourceCheckout.branch ? ["checkout", sourceCheckout.branch] : ["checkout", "--detach", sourceCheckout.head]);
-}
-
 /** Resolve a requested provider without silently switching after allocation starts. */
 export function resolveWorktreeProvider(requested: WorktreeProvider | undefined, baseDir?: string): ManagedWorktreeProvider {
 	const selection = requested ?? DEFAULT_WORKTREE_PROVIDER;
@@ -515,6 +595,33 @@ export function resolveWorktreeProvider(requested: WorktreeProvider | undefined,
 	const capability = probeWorktrunk();
 	if (capability.available) return "worktrunk";
 	if (selection === "worktrunk") throw new Error(`Worktrunk provider is unavailable: ${capability.reason ?? "unknown capability failure"}`);
+	return "native";
+}
+
+async function resolveSetupProvider(tx: SetupTransaction, requested: WorktreeProvider | undefined, baseDir?: string): Promise<ManagedWorktreeProvider> {
+	const selection = requested ?? DEFAULT_WORKTREE_PROVIDER;
+	if (selection !== "auto" && selection !== "native" && selection !== "worktrunk") throw new Error('worktree provider must be "auto", "native", or "worktrunk"');
+	if (selection === "native") return "native";
+	if (hasConfiguredWorktreeBaseDir(baseDir)) {
+		if (selection === "worktrunk") throw new Error("worktreeProvider='worktrunk' cannot be combined with worktreeBaseDir or PI_SUBAGENTS_WORKTREE_DIR");
+		return "native";
+	}
+	let reason: string | undefined;
+	try {
+		const probeExitCodes = Array.from({ length: 256 }, (_, code) => code);
+		const version = await tx.command(WORKTRUNK_COMMAND, [...WORKTRUNK_ARG_PREFIX, "--version"], { maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES, acceptedExitCodes: probeExitCodes });
+		if (version.status !== 0 || !/\b(?:wt\s+)?v?(\d+\.\d+(?:\.\d+)?)\b/i.test(version.stdout.trim())) reason = "Worktrunk is unavailable or returned an invalid version";
+		else {
+			const help = await tx.command(WORKTRUNK_COMMAND, [...WORKTRUNK_ARG_PREFIX, "switch", "--help"], { maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES, acceptedExitCodes: probeExitCodes });
+			const missing = ["--create", "--base", "--no-cd", "--no-hooks", "--format"].filter((flag) => !`${help.stdout}\n${help.stderr}`.includes(flag));
+			if (help.status !== 0 || missing.length) reason = `Worktrunk switch capability unavailable: ${missing.join(", ")}`;
+		}
+	} catch (error) {
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+		reason = error.message;
+	}
+	if (!reason) return "worktrunk";
+	if (selection === "worktrunk") throw new Error(`Worktrunk provider is unavailable: ${reason}`);
 	return "native";
 }
 
@@ -698,11 +805,6 @@ function normalizeSyntheticPath(worktreePath: string, rawPath: string): string {
 	return path.normalize(relative);
 }
 
-function hasTrackedEntries(worktreePath: string, relativePath: string): boolean {
-	const result = runGit(worktreePath, ["ls-files", "--", relativePath]);
-	return result.status === 0 && result.stdout.trim().length > 0;
-}
-
 function parseWorktreeSetupHookOutput(rawStdout: string): WorktreeSetupHookOutput {
 	const trimmed = rawStdout.trim();
 	if (!trimmed) {
@@ -721,53 +823,49 @@ function parseWorktreeSetupHookOutput(rawStdout: string): WorktreeSetupHookOutpu
 	return parsed as WorktreeSetupHookOutput;
 }
 
-function runWorktreeSetupHook(
+async function runWorktreeSetupHook(
+	tx: SetupTransaction,
 	hook: ResolvedWorktreeSetupHook,
 	input: WorktreeSetupHookInput,
-): string[] {
-	const result = spawnSync(hook.hookPath, [], {
-		windowsHide: true,
-		cwd: input.worktreePath,
-		encoding: "utf-8",
-		input: JSON.stringify(input),
-		timeout: hook.timeoutMs,
-		shell: false,
-	});
+): Promise<string[]> {
+	tx.progress.phase = "hook";
+	let result: SetupCommandResult;
+	try {
+		result = await tx.command(hook.hookPath, [], {
+			cwd: input.worktreePath,
+			input: JSON.stringify(input),
+			hookTimeoutMs: hook.timeoutMs,
+		});
+	} catch (error) {
+		throw new Error(`worktree setup hook failed: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+	}
+	tx.progress.phase = "hook-validation";
 
-	if (result.error) {
-		const code = "code" in result.error ? result.error.code : undefined;
-		if (code === "ETIMEDOUT") {
-			throw new Error(`worktree setup hook timed out after ${hook.timeoutMs}ms`);
+	try {
+		const output = parseWorktreeSetupHookOutput(result.stdout);
+		if (output.syntheticPaths === undefined) return [];
+		if (!Array.isArray(output.syntheticPaths)) {
+			throw new Error("worktree setup hook output field 'syntheticPaths' must be an array of relative paths");
 		}
-		throw new Error(`worktree setup hook failed: ${result.error.message}`);
-	}
-
-	if (result.status !== 0) {
-		const details = result.stderr.trim() || result.stdout.trim() || "no output";
-		throw new Error(`worktree setup hook failed with exit code ${result.status}: ${details}`);
-	}
-
-	const output = parseWorktreeSetupHookOutput(result.stdout);
-	if (output.syntheticPaths === undefined) return [];
-	if (!Array.isArray(output.syntheticPaths)) {
-		throw new Error("worktree setup hook output field 'syntheticPaths' must be an array of relative paths");
-	}
-
-	const uniquePaths = new Set<string>();
-	for (const candidate of output.syntheticPaths) {
-		if (typeof candidate !== "string") {
-			throw new Error("worktree setup hook output field 'syntheticPaths' must contain only strings");
+		const uniquePaths = new Set<string>();
+		for (const candidate of output.syntheticPaths) {
+			if (typeof candidate !== "string") throw new Error("worktree setup hook output field 'syntheticPaths' must contain only strings");
+			const normalizedPath = normalizeSyntheticPath(input.worktreePath, candidate);
+			if ((await tx.gitChecked(input.worktreePath, ["ls-files", "--", normalizedPath])).trim()) {
+				throw new Error(`worktree setup hook cannot mark tracked paths as synthetic: ${normalizedPath}`);
+			}
+			uniquePaths.add(normalizedPath);
 		}
-		const normalizedPath = normalizeSyntheticPath(input.worktreePath, candidate);
-		if (hasTrackedEntries(input.worktreePath, normalizedPath)) {
-			throw new Error(`worktree setup hook cannot mark tracked paths as synthetic: ${normalizedPath}`);
-		}
-		uniquePaths.add(normalizedPath);
+		return [...uniquePaths];
+	} catch (error) {
+		// Semantic rejection occurs after exit: retain uncertainty, never signal an old PID.
+		tx.unknown(error);
+		throw error;
 	}
-	return [...uniquePaths];
 }
 
-function finalizeCreatedWorktree(
+async function finalizeCreatedWorktree(
+	tx: SetupTransaction,
 	toplevel: string,
 	cwdRelative: string,
 	runId: string,
@@ -775,38 +873,23 @@ function finalizeCreatedWorktree(
 	setupHook: ResolvedWorktreeSetupHook | undefined,
 	agent: string | undefined,
 	worktree: WorktreeInfo,
-): WorktreeInfo {
+): Promise<WorktreeInfo> {
 	const agentCwd = cwdRelative ? path.join(worktree.path, cwdRelative) : worktree.path;
-	try {
-		const nodeModulesLinked = linkNodeModulesIfPresent(toplevel, worktree.path);
-		const syntheticPaths = nodeModulesLinked ? ["node_modules"] : [];
-		if (setupHook) {
-			const hookSyntheticPaths = runWorktreeSetupHook(setupHook, {
-				version: 1,
-				repoRoot: toplevel,
-				worktreePath: worktree.path,
-				agentCwd,
-				branch: worktree.branch,
-				index: worktree.index,
-				runId,
-				baseCommit,
-				agent,
-			});
-			syntheticPaths.push(...hookSyntheticPaths);
-		}
-		return { ...worktree, agentCwd, nodeModulesLinked, syntheticPaths };
-	} catch (error) {
-		try { runGitChecked(toplevel, ["worktree", "remove", "--force", worktree.path]); } catch {
-			// Best-effort rollback; preserve the original setup failure.
-		}
-		try { runGitChecked(toplevel, ["branch", "-D", worktree.branch]); } catch {
-			// Best-effort rollback; preserve the original setup failure.
-		}
-		throw error;
+	tx.check();
+	const nodeModulesLinked = linkNodeModulesIfPresent(toplevel, worktree.path);
+	const syntheticPaths = nodeModulesLinked ? ["node_modules"] : [];
+	if (setupHook) {
+		const hookSyntheticPaths = await runWorktreeSetupHook(tx, setupHook, {
+			version: 1, repoRoot: toplevel, worktreePath: worktree.path, agentCwd,
+			branch: worktree.branch, index: worktree.index, runId, baseCommit, agent,
+		});
+		syntheticPaths.push(...hookSyntheticPaths);
 	}
+	return { ...worktree, agentCwd, nodeModulesLinked, syntheticPaths };
 }
 
-function createNativeWorktree(
+async function createNativeWorktree(
+	tx: SetupTransaction,
 	toplevel: string,
 	cwdRelative: string,
 	runId: string,
@@ -818,17 +901,20 @@ function createNativeWorktree(
 	labels: Array<string | undefined> | undefined,
 	tasks: Array<string | undefined> | undefined,
 	branchPrefix: string | undefined,
-): WorktreeInfo {
+): Promise<WorktreeInfo> {
 	const naming = buildWorktreeNaming({ runId, index, agent, label: labels?.[index], task: tasks?.[index], branchPrefix });
 	const worktreePath = buildNativeWorktreePath(dedicatedRoot, toplevel, runId, index);
 	assertSafeWorktreeLocation(worktreePath, toplevel, dedicatedRoot);
+	// Absence is required before claiming any partial artifacts from this attempt.
+	const branch = await tx.git(toplevel, ["show-ref", "--verify", "--quiet", `refs/heads/${naming.requestedBranch}`], [0, 1]);
+	let pathExists = false;
+	try { fs.lstatSync(worktreePath); pathExists = true; }
+	catch (error) { if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error; }
+	if (branch.status !== 1 || pathExists) throw new Error(`worktree path or branch already exists: ${worktreePath}, ${naming.requestedBranch}`);
+	tx.attempt(index, naming.requestedBranch, worktreePath);
 	ensureProjectWorktreeDir(dedicatedRoot, toplevel);
-	const add = runGit(toplevel, ["worktree", "add", worktreePath, "-b", naming.requestedBranch, baseCommit]);
-	if (add.status !== 0) {
-		const message = add.stderr.trim() || add.stdout.trim() || `failed to create worktree ${worktreePath}`;
-		throw new Error(message);
-	}
-	return finalizeCreatedWorktree(toplevel, cwdRelative, runId, baseCommit, setupHook, agent, {
+	await tx.git(toplevel, ["worktree", "add", worktreePath, "-b", naming.requestedBranch, baseCommit]);
+	const worktree: WorktreeInfo = {
 		path: worktreePath,
 		agentCwd: worktreePath,
 		branch: naming.requestedBranch,
@@ -837,7 +923,9 @@ function createNativeWorktree(
 		syntheticPaths: [],
 		provider: "native",
 		naming,
-	});
+	};
+	tx.validated(worktree);
+	return finalizeCreatedWorktree(tx, toplevel, cwdRelative, runId, baseCommit, setupHook, agent, worktree);
 }
 
 interface WorktrunkSwitchOutput {
@@ -862,37 +950,30 @@ function parseWorktrunkSwitchOutput(rawStdout: string): WorktrunkSwitchOutput {
 	return parsed as WorktrunkSwitchOutput;
 }
 
-function createWorktrunkWorktree(
+async function createWorktrunkWorktree(
+	tx: SetupTransaction,
 	toplevel: string,
 	cwdRelative: string,
 	runId: string,
 	index: number,
 	baseCommit: string,
-	sourceCheckout: SourceCheckoutSnapshot,
 	agents: string[] | undefined,
 	labels: Array<string | undefined> | undefined,
 	tasks: Array<string | undefined> | undefined,
 	branchPrefix: string | undefined,
-): WorktreeInfo {
+): Promise<WorktreeInfo> {
 	const naming = buildWorktreeNaming({ runId, index, agent: agents?.[index], label: labels?.[index], task: tasks?.[index], branchPrefix });
 	const args = ["-C", toplevel, "switch", "--create", naming.requestedBranch, "--base", baseCommit, "--no-cd", "--no-hooks", "--format", "json"];
-	const result = runWorktrunk(args, toplevel);
-	if (result.status !== 0) {
-		const message = result.error?.message || result.stderr.trim() || result.stdout.trim() || "Worktrunk provisioning failed";
-		throw new Error(`Worktrunk provisioning failed: ${message}`);
-	}
-	let createdAllocation = false;
-	let returnedPath: string | undefined;
+	tx.attempt(index, naming.requestedBranch);
+	const result = await tx.command(WORKTRUNK_COMMAND, [...WORKTRUNK_ARG_PREFIX, ...args], { cwd: toplevel, maxBuffer: WORKTREE_COMMAND_OUTPUT_MAX_BYTES });
+	tx.progress.phase = "validation";
 	try {
 		const output = parseWorktrunkSwitchOutput(result.stdout);
-		createdAllocation = output.action === "created" && output.created_branch === true;
-		if (typeof output.path === "string" && path.isAbsolute(output.path)) returnedPath = path.resolve(output.path);
-		if (!createdAllocation || output.branch !== naming.requestedBranch || output.base_branch !== baseCommit) {
+		if (output.action !== "created" || output.created_branch !== true || output.branch !== naming.requestedBranch || output.base_branch !== baseCommit) {
 			throw new Error("Worktrunk provisioning returned inconsistent creation metadata");
 		}
 		if (typeof output.path !== "string" || !path.isAbsolute(output.path)) throw new Error("Worktrunk provisioning returned a non-absolute worktree path");
-		const worktreePathCandidate = returnedPath;
-		if (!worktreePathCandidate) throw new Error("Worktrunk provisioning returned a non-absolute worktree path");
+		const worktreePathCandidate = path.resolve(output.path);
 		let stat: fs.Stats;
 		try {
 			stat = fs.lstatSync(worktreePathCandidate);
@@ -902,16 +983,16 @@ function createWorktrunkWorktree(
 		if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Worktrunk provisioning returned a path that is not a real directory");
 		const worktreePath = normalizeComparableCwd(worktreePathCandidate);
 		if (worktreePath === normalizeComparableCwd(toplevel)) throw new Error("Worktrunk provisioning returned the source checkout path");
-		const sourceCommonDirRaw = runGitChecked(toplevel, ["rev-parse", "--git-common-dir"]).trim();
-		const returnedCommonDirRaw = runGitChecked(worktreePath, ["rev-parse", "--git-common-dir"]).trim();
+		const sourceCommonDirRaw = (await tx.gitChecked(toplevel, ["rev-parse", "--git-common-dir"])).trim();
+		const returnedCommonDirRaw = (await tx.gitChecked(worktreePath, ["rev-parse", "--git-common-dir"])).trim();
 		const sourceCommonDir = normalizeComparableCwd(path.isAbsolute(sourceCommonDirRaw) ? sourceCommonDirRaw : path.resolve(toplevel, sourceCommonDirRaw));
 		const returnedCommonDir = normalizeComparableCwd(path.isAbsolute(returnedCommonDirRaw) ? returnedCommonDirRaw : path.resolve(worktreePath, returnedCommonDirRaw));
 		if (returnedCommonDir !== sourceCommonDir) throw new Error("Worktrunk provisioning returned a worktree for a different repository");
-		const returnedBranch = runGitChecked(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]).trim();
+		const returnedBranch = (await tx.gitChecked(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"])).trim();
 		if (returnedBranch !== naming.requestedBranch) throw new Error("Worktrunk provisioning returned a worktree on a different branch");
-		const returnedHead = runGitChecked(worktreePath, ["rev-parse", "HEAD"]).trim();
+		const returnedHead = (await tx.gitChecked(worktreePath, ["rev-parse", "HEAD"])).trim();
 		if (returnedHead !== baseCommit) throw new Error("Worktrunk provisioning returned a worktree at a different base commit");
-		return {
+		const worktree: WorktreeInfo = {
 			path: worktreePath,
 			agentCwd: cwdRelative ? path.join(worktreePath, cwdRelative) : worktreePath,
 			branch: naming.requestedBranch,
@@ -921,35 +1002,16 @@ function createWorktrunkWorktree(
 			provider: "worktrunk",
 			naming,
 		};
+		tx.validated(worktree);
+		return worktree;
 	} catch (error) {
-		if (createdAllocation) {
-			try { restoreSourceCheckoutIfWorktrunkSwitchedIt(toplevel, naming.requestedBranch, sourceCheckout); } catch {
-				// Best-effort rollback; preserve the validation failure.
-			}
-			try {
-				const listedPath = findGitWorktreePath(toplevel, naming.requestedBranch);
-				const candidates = [listedPath, returnedPath].filter((candidate, candidateIndex, all): candidate is string => Boolean(candidate) && all.indexOf(candidate) === candidateIndex);
-				for (const candidate of candidates) {
-					if (normalizeComparableCwd(candidate) === normalizeComparableCwd(toplevel)) continue;
-					try {
-						runGitChecked(toplevel, ["worktree", "remove", "--force", candidate]);
-						break;
-					} catch {
-						// Try another provider-reported/listed path before giving up.
-					}
-				}
-			} catch {
-				// Best-effort rollback; preserve the validation failure.
-			}
-			try { runGitChecked(toplevel, ["branch", "-D", naming.requestedBranch]); } catch {
-				// Best-effort rollback; preserve the validation failure.
-			}
-		}
+		tx.unknown(error);
 		throw error;
 	}
 }
 
 function removeSyntheticPath(worktree: WorktreeInfo, syntheticPath: string): void {
+	assertWorktreeMutationAllowed();
 	const resolved = path.resolve(worktree.path, syntheticPath);
 	const relative = path.relative(worktree.path, resolved);
 	if (!relative || relative === "." || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
@@ -1214,42 +1276,97 @@ function hasWorktreeChanges(diff: WorktreeDiff): boolean {
 	return diff.filesChanged > 0 || diff.insertions > 0 || diff.deletions > 0 || diff.diffStat.trim().length > 0;
 }
 
-export function createWorktrees(cwd: string, runId: string, count: number, options?: CreateWorktreesOptions): WorktreeSetup {
+async function compensateSetup(tx: SetupTransaction): Promise<WorktreeCleanupReport> {
+	const { setup, attempts } = tx.progress;
+	const report: WorktreeCleanupReport = { state: "partial", tasks: [], pruned: false, errors: [] };
+	tx.progress.cleanup = report;
+	tx.progress.phase = "rollback";
+	// Cancellation stops allocation, not accounting. Compensation has ONLY the
+	// remaining original absolute deadline; it does not reuse the launch signal.
+	const git = async (args: string[], acceptedExitCodes: readonly number[] = [0]) => {
+		if (setupPoison) throw new Error(setupPoison);
+		tx.progress.command = { command: "git", args: ["-C", setup.cwd, ...args] };
+		const result = await runSetupCommand("git", tx.progress.command.args, {
+			deadlineAt: tx.options.deadlineAt, acceptedExitCodes,
+			onSpawn: (process) => { Object.assign(tx.progress.command!, process); tx.publish(); },
+		});
+		const { stdout: _stdout, stderr: _stderr, ...metadata } = result;
+		tx.progress.command.result = metadata;
+		if (result.processTree?.state === "unknown") tx.unknown(result.error ?? "Rollback command settlement unverified");
+		tx.publish();
+		if (result.error || result.status === null || !acceptedExitCodes.includes(result.status)) throw result.error ?? new Error(result.stderr.trim() || "Rollback command failed");
+		return result;
+	};
+	for (const attempt of [...attempts].reverse()) {
+		if (!attempt.path) {
+			tx.unknown(`Allocation path unconfirmed for branch ${attempt.branch}`);
+			report.errors!.push(tx.progress.unknown!);
+			continue;
+		}
+		const known = setup.worktrees.find((worktree) => worktree.index === attempt.index);
+		const task: WorktreeCleanupTask = { index: attempt.index, path: attempt.path, branch: attempt.branch,
+			provider: known?.provider ?? "native", naming: known?.naming, worktreeRemoved: false, branchRemoved: false };
+		report.tasks.push(task);
+		try {
+			if (normalizeComparableCwd(attempt.path) === normalizeComparableCwd(setup.cwd)) throw new Error("Refusing source-checkout removal");
+			if (attempt.validated) {
+				await git(["worktree", "remove", "--force", attempt.path]);
+				task.worktreeRemoved = true;
+			} else {
+				// Native attempts were absent before mutation. Reconcile only exact
+				// registered path/branch identity; never recursively delete a guessed leaf.
+				const listed = (await git(["worktree", "list", "--porcelain"])).stdout;
+				const entry = listed.split("\n\n").find((block) => block.split("\n").includes(`worktree ${attempt.path}`));
+				if (entry) {
+					if (!entry.split("\n").includes(`branch refs/heads/${attempt.branch}`)) {
+						tx.unknown("Partial allocation ownership mismatch");
+						throw new Error(tx.progress.unknown);
+					}
+					await git(["worktree", "remove", "--force", attempt.path]);
+				} else if (fs.existsSync(attempt.path)) {
+					tx.unknown("Unregistered partial allocation retained");
+					throw new Error(tx.progress.unknown);
+				}
+				task.worktreeRemoved = true;
+			}
+			const branch = await git(["show-ref", "--verify", "--quiet", `refs/heads/${attempt.branch}`], [0, 1]);
+			if (branch.status === 0) await git(["branch", "-D", attempt.branch]);
+			task.branchRemoved = true;
+		} catch (error) {
+			task.preserved = true;
+			task.errors = [error instanceof Error ? error.message : String(error)];
+		}
+	}
+	try {
+		if (attempts.length > 0) { await git(["worktree", "prune"]); report.pruned = true; }
+	} catch (error) { report.errors!.push(error instanceof Error ? error.message : String(error)); }
+	if (tx.progress.unknown) report.errors!.push(tx.progress.unknown);
+	report.tasks.sort((a, b) => a.index - b.index);
+	if (!setupPoison && (report.pruned || attempts.length === 0) && report.tasks.every((task) => task.worktreeRemoved && task.branchRemoved) && !report.errors!.length) report.state = "complete";
+	return report;
+}
+
+async function allocateWorktrees(tx: SetupTransaction, cwd: string, runId: string, count: number): Promise<WorktreeSetup> {
+	const options = tx.options;
+	tx.check();
 	if (!Number.isSafeInteger(count) || count < 0) throw new Error("worktree count must be a non-negative integer");
 	if (isJjWorktreeCwd(cwd)) {
 		return createJjWorktrees(cwd, runId, count, options);
 	}
-	const repo = resolveRepoState(cwd, options?.baseRef);
+	const repo = await resolveRepoState(tx, cwd, options?.baseRef);
+	tx.progress.setup.cwd = repo.toplevel;
+	tx.progress.setup.baseCommit = repo.baseCommit;
 	const setupHook = resolveWorktreeSetupHook(repo.toplevel, options?.setupHook);
-	const provider = resolveWorktreeProvider(options?.provider, options?.baseDir);
+	const provider = await resolveSetupProvider(tx, options?.provider, options?.baseDir);
 	const branchPrefix = normalizeWorktreeBranchPrefix(options?.branchPrefix);
 	const dedicatedRoot = provider === "native" ? resolveWorktreeDedicatedRoot(options?.baseDir, repo.toplevel) : undefined;
-	const worktrees: WorktreeInfo[] = [];
+	const worktrees = tx.progress.setup.worktrees;
 
 	try {
 		if (provider === "native") {
-			const plannedSetup: WorktreeSetup = {
-				cwd: repo.toplevel,
-				baseCommit: repo.baseCommit,
-				worktrees: Array.from({ length: count }, (_, index) => {
-					const naming = buildWorktreeNaming({ runId, index, agent: options?.agents?.[index], label: options?.labels?.[index], task: options?.tasks?.[index], branchPrefix });
-					const worktreePath = buildNativeWorktreePath(dedicatedRoot!, repo.toplevel, runId, index);
-					assertSafeWorktreeLocation(worktreePath, repo.toplevel, dedicatedRoot!);
-					return {
-						path: worktreePath,
-						agentCwd: repo.cwdRelative ? path.join(worktreePath, repo.cwdRelative) : worktreePath,
-						branch: naming.requestedBranch,
-						index,
-						nodeModulesLinked: false,
-						syntheticPaths: [],
-						provider: "native",
-						naming,
-					};
-				}),
-			};
-			options?.beforeCreate?.(plannedSetup);
 			for (let index = 0; index < count; index++) {
-				worktrees.push(createNativeWorktree(
+				worktrees[index] = await createNativeWorktree(
+					tx,
 					repo.toplevel,
 					repo.cwdRelative,
 					runId,
@@ -1261,28 +1378,26 @@ export function createWorktrees(cwd: string, runId: string, count: number, optio
 					options?.labels,
 					options?.tasks,
 					branchPrefix,
-				));
+				);
 			}
 		} else {
 			for (let index = 0; index < count; index++) {
-				worktrees.push(createWorktrunkWorktree(
+				await createWorktrunkWorktree(
+					tx,
 					repo.toplevel,
 					repo.cwdRelative,
 					runId,
 					index,
 					repo.baseCommit,
-					repo.sourceCheckout,
 					options?.agents,
 					options?.labels,
 					options?.tasks,
 					branchPrefix,
-				));
+				);
 			}
-			// Worktrunk determines its path only after creation. Journal the exact
-			// returned ownership before Pi runs setup hooks or launches a child.
-			options?.beforeCreate?.({ cwd: repo.toplevel, baseCommit: repo.baseCommit, worktrees: [...worktrees] });
 			for (let index = 0; index < worktrees.length; index++) {
-				worktrees[index] = finalizeCreatedWorktree(
+				worktrees[index] = await finalizeCreatedWorktree(
+					tx,
 					repo.toplevel,
 					repo.cwdRelative,
 					runId,
@@ -1293,23 +1408,37 @@ export function createWorktrees(cwd: string, runId: string, count: number, optio
 				);
 			}
 		}
+		tx.check();
+		tx.progress.phase = "ready";
+		tx.publish();
+		tx.check();
+		return tx.progress.setup;
 	} catch (error) {
-		cleanupWorktrees({
-			cwd: repo.toplevel,
-			worktrees,
-			baseCommit: repo.baseCommit,
-		}, { kind: "setup-rollback" });
+		await compensateSetup(tx);
 		throw error;
 	}
+}
 
-	return {
-		cwd: repo.toplevel,
-		worktrees,
-		baseCommit: repo.baseCommit,
-	};
+export async function createWorktrees(cwd: string, runId: string, count: number, options: CreateWorktreesOptions = {}): Promise<WorktreeSetup> {
+	const tx = new SetupTransaction(cwd, options);
+	try {
+		return await withWorktreeTransaction(async () => {
+			setupActive = true;
+			try { return await allocateWorktrees(tx, cwd, runId, count); }
+			finally { setupActive = false; }
+		});
+	} catch (error) {
+		if (setupPoison) tx.progress.unknown ??= setupPoison;
+		tx.progress.cleanup ??= { state: tx.progress.unknown ? "partial" : "complete", tasks: [], pruned: false, errors: tx.progress.unknown ? [tx.progress.unknown] : [] };
+		try { tx.publish(); } catch (publicationError) {
+			tx.progress.cleanup?.errors?.push(`Recovery publication failed: ${String(publicationError)}`);
+		}
+		throw new WorktreeSetupError(error, tx.snapshot());
+	}
 }
 
 export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: string): WorktreeDiff[] {
+	assertWorktreeMutationAllowed();
 	if ((setup as { backend?: string }).backend === "jj" || setup.worktrees.some((wt) => (wt as { backend?: string }).backend === "jj")) {
 		return diffJjWorktrees(setup, agents, diffsDir);
 	}
@@ -1342,6 +1471,7 @@ export function cleanupWorktrees(
 	setup: WorktreeSetup,
 	intent: WorktreeCleanupIntent = { kind: "preserve", ...(setup.capturedDiffs ? { capturedDiffs: setup.capturedDiffs } : {}) },
 ): WorktreeCleanupReport {
+	assertWorktreeMutationAllowed();
 	if ((setup as { backend?: string }).backend === "jj" || setup.worktrees.some((wt) => (wt as { backend?: string }).backend === "jj")) {
 		return cleanupJjWorktrees(setup, intent);
 	}

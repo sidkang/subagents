@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { resolvePiLaunchToolPlan } from "../../src/runs/shared/child-tool-plan.ts";
+import { getHostBuiltinToolNames, resolvePiLaunchToolPlan } from "../../src/runs/shared/child-tool-plan.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 import { MCP_RUNTIME_SNAPSHOT_EVENT, MCP_RUNTIME_SNAPSHOT_VERSION, type McpRuntimeSnapshotHost } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
 
 /** A parent whose pi-mcp-adapter answers snapshot requests for one runtime-only server. */
@@ -29,5 +30,159 @@ describe("child tool plan", () => {
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("child tool plan host builtin intersection", () => {
+	it("intersects declared tools with host-available builtins", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", "grep", "find", "ls", "bash"],
+			hostAvailableBuiltins: ["ipython", "bash"],
+		});
+		assert.deepEqual(plan.declaredBuiltinTools, ["bash"]);
+		assert.deepEqual(plan.unavailableHostBuiltins, ["read", "grep", "find", "ls"]);
+		assert.deepEqual(plan.effectiveToolAllowlist, ["bash"]);
+	});
+
+	it("keeps all tools when host provides them", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", "grep", "bash"],
+			hostAvailableBuiltins: ["read", "grep", "bash", "write", "find"],
+		});
+		assert.deepEqual(plan.declaredBuiltinTools, ["read", "grep", "bash"]);
+		assert.deepEqual(plan.unavailableHostBuiltins, []);
+	});
+
+	it("works without hostAvailableBuiltins (standard Pi hosts)", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", "grep", "find", "ls"],
+		});
+		assert.deepEqual(plan.declaredBuiltinTools, ["read", "grep", "find", "ls"]);
+		assert.deepEqual(plan.unavailableHostBuiltins, []);
+	});
+
+	it("fails when requireReadTool is true but host does not provide read", () => {
+		assert.throws(
+			() => resolvePiLaunchToolPlan({
+				tools: ["bash"],
+				requireReadTool: true,
+				hostAvailableBuiltins: ["ipython", "bash"],
+				agentName: "oracle",
+			}),
+			/Host runtime does not provide required tool 'read' for agent 'oracle'/,
+		);
+		assert.throws(
+			() => resolvePiLaunchToolPlan({
+				tools: ["bash"],
+				requireReadTool: true,
+				hostAvailableBuiltins: ["bash"],
+			}),
+			/Host runtime does not provide required tool 'read'/,
+		);
+	});
+
+	it("includes unavailableHostBuiltins in capability audit", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", "bash"],
+			hostAvailableBuiltins: ["bash"],
+			capabilityCeiling: {
+				version: 1,
+				allowedTools: ["read", "bash"],
+				denyExtensions: false,
+				sources: ["test"],
+			},
+		});
+		assert.deepEqual(plan.capabilityAudit?.unavailableHostBuiltins, ["read"]);
+	});
+
+	it("respects both capability ceiling and host availability", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", "grep", "bash", "write"],
+			hostAvailableBuiltins: ["read", "grep", "bash"],
+			capabilityCeiling: {
+				version: 1,
+				allowedTools: ["read", "bash"],
+				denyExtensions: false,
+				sources: ["test"],
+			},
+		});
+		assert.deepEqual(plan.declaredBuiltinTools, ["read", "bash"]);
+		assert.deepEqual(plan.unavailableHostBuiltins, []);
+	});
+
+	it("tracks tools removed by host even when ceiling allows them", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: ["read", "grep", "bash"],
+			hostAvailableBuiltins: ["bash"],
+			capabilityCeiling: {
+				version: 1,
+				allowedTools: ["read", "grep", "bash"],
+				denyExtensions: false,
+				sources: ["test"],
+			},
+		});
+		assert.deepEqual(plan.declaredBuiltinTools, ["bash"]);
+		assert.deepEqual(plan.unavailableHostBuiltins, ["read", "grep"]);
+	});
+});
+
+describe("production launch path supplies hostAvailableBuiltins", () => {
+	it("buildInProcessChildLaunch passes hostAvailableBuiltins to tool plan resolution", () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-launch-builtins-"));
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = cwd;
+		try {
+			const launch = buildInProcessChildLaunch({
+				host: "runner",
+				cwd,
+				childAgentName: "test-agent",
+				childIndex: 0,
+				sessionEnabled: false,
+				inheritProjectContext: false,
+				inheritGlobalContext: false,
+				inheritSkills: false,
+				tools: ["read", "grep", "bash"],
+				hostAvailableBuiltins: ["ipython", "bash"],
+			});
+			assert.deepEqual(launch.toolPlan.declaredBuiltinTools, ["bash"]);
+			assert.deepEqual(launch.toolPlan.unavailableHostBuiltins, ["read", "grep"]);
+			assert.deepEqual(launch.toolPlan.effectiveToolAllowlist, ["bash"]);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			fs.rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("getHostBuiltinToolNames extracts builtin tools from ExtensionAPI", () => {
+		const mockPi = {
+			getAllTools: () => [
+				{ name: "read", sourceInfo: { source: "builtin" } },
+				{ name: "bash", sourceInfo: { source: "builtin" } },
+				{ name: "custom-tool", sourceInfo: { source: "extension", path: "/ext/tool.ts" } },
+				{ name: "mcp-tool", sourceInfo: { source: "mcp" } },
+			],
+		};
+		const builtins = getHostBuiltinToolNames(mockPi);
+		assert.deepEqual(builtins, ["read", "bash"]);
+	});
+
+	it("getHostBuiltinToolNames returns undefined on failure or empty results", () => {
+		const throwingPi = {
+			getAllTools: () => { throw new Error("Not available"); },
+		};
+		assert.equal(getHostBuiltinToolNames(throwingPi), undefined);
+
+		const emptyPi = {
+			getAllTools: () => [],
+		};
+		assert.equal(getHostBuiltinToolNames(emptyPi), undefined);
+
+		const noBuiltinsPi = {
+			getAllTools: () => [
+				{ name: "custom-tool", sourceInfo: { source: "extension" } },
+			],
+		};
+		assert.equal(getHostBuiltinToolNames(noBuiltinsPi), undefined);
 	});
 });

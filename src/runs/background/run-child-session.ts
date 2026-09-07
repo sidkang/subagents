@@ -8,7 +8,7 @@
 import type { Message } from "@earendil-works/pi-ai";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
 import { extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
-import type { EffectsProjection, RuntimeAcknowledgedChildExtensionsV1, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
+import type { EffectsProjection, RuntimeAcknowledgedChildExtensions, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
 import {
 	acceptChildWatchdogEvent,
 	applyChildWatchdogMessage,
@@ -22,9 +22,10 @@ import { projectChildLifecycle, type ChildLifecycleAction, type ChildLifecycleSt
 import { formatSubagentModelVerificationError } from "../shared/model-fallback.ts";
 import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
-import type { InProcessChildLaunch } from "../shared/child-launch.ts";
+import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
 import { projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
+import { getReadonlySessionEvidence, requestReadonlySessionEvidence, type SettledReadonlyEvidence } from "../shared/readonly-session-evidence.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
 
 export interface ChildEventContext {
@@ -95,6 +96,16 @@ export interface RunChildSessionInput {
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string }>;
 	modelResponseAliases?: Record<string, string[]>;
 	mutationTools?: readonly string[];
+	/** Internal guarded continuation handoff; never part of persisted results. */
+	readonlyContinuation?: { source: ChildSession; expected: SettledReadonlyEvidence; modelId: string };
+	collectReadonlyEvidence?: boolean;
+	canContinue?: () => boolean;
+}
+
+const settledChildren = new WeakMap<RunChildSessionResult, ChildSession>();
+export function getSettledReadonlyChild(result: RunChildSessionResult): ChildSession | undefined {
+	const child = settledChildren.get(result);
+	return child && getReadonlySessionEvidence(child) ? child : undefined;
 }
 
 export interface RunChildSessionResult {
@@ -123,7 +134,7 @@ export interface RunChildSessionResult {
 	toolBudget?: ToolBudgetState;
 	toolBudgetBlocked?: boolean;
 	structuredOutput?: unknown;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	abortRecoveryDiagnostic?: string;
 	effects?: EffectsProjection;
 }
@@ -323,6 +334,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		}
 		const applyChildLifecycle = (action: ChildLifecycleAction): void => {
 			if (action === "cancel-drain") {
+				cleanTerminalAssistantStopReceived = false;
+				agentSettledReceived = false;
 				clearFinalDrainTimers();
 				clearWatchdogTailTimer();
 				return;
@@ -474,6 +487,10 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					}
 				}
 				if (event.message.errorMessage) assistantError = event.message.errorMessage;
+				else if (hasToolCall && event.message.stopReason === "toolUse") {
+					// A recovered request can finish via a terminating tool, without a text stop.
+					assistantError = undefined;
+				}
 				const eventUsage = event.message.usage;
 				if (eventUsage) {
 					usage.turns++;
@@ -533,29 +550,33 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				: interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal)
 					? 0
 					: finalError || promptError !== undefined ? 1 : 0;
-			void closed.then(() => resolve(omitUndefined({
-				exitCode,
-				messages,
-				usage,
-				toolCount,
-				durationMs: Date.now() - startedAt,
-				model,
-				error: stopped ? stopMessage() : timedOut ? (error ?? timeoutMessage()) : interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal) ? undefined : finalError,
-				finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage() : error ?? timeoutMessage()) : finalOutput,
-				outputState: finalOutput.trim() ? "present" : "absent",
-				interrupted: interrupted || undefined,
-				timedOut: timedOut || undefined,
-				stopped: stopped || undefined,
-				observedMutationAttempt,
-				structuredOutputToolInvoked,
-				structuredOutputMessageStartIndex,
-				watchdog: childWatchdogState,
-				sessionFile: session?.sessionFile,
-				currentTool,
-				currentToolArgs,
-				currentPath,
-				afterCompactionSettlement: afterCompactionSettlement || undefined,
-			})));
+			void closed.then(() => {
+				const result: RunChildSessionResult = omitUndefined({
+					exitCode,
+					messages,
+					usage,
+					toolCount,
+					durationMs: Date.now() - startedAt,
+					model,
+					error: stopped ? stopMessage() : timedOut ? (error ?? timeoutMessage()) : interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal) ? undefined : finalError,
+					finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage() : error ?? timeoutMessage()) : finalOutput,
+					outputState: finalOutput.trim() ? "present" : "absent",
+					interrupted: interrupted || undefined,
+					timedOut: timedOut || undefined,
+					stopped: stopped || undefined,
+					observedMutationAttempt,
+					structuredOutputToolInvoked,
+					structuredOutputMessageStartIndex,
+					watchdog: childWatchdogState,
+					sessionFile: session?.sessionFile,
+					currentTool,
+					currentToolArgs,
+					currentPath,
+					afterCompactionSettlement: afterCompactionSettlement || undefined,
+				});
+				if (session && !forced && !forcedTermination && !interrupted && !timedOut && !stopped && getReadonlySessionEvidence(session)) settledChildren.set(result, session);
+				resolve(result);
+			});
 		};
 
 		input.registerInterrupt?.(() => {
@@ -575,17 +596,25 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 
 		void (async () => {
 			try {
-				const created = await input.factory.create({
-					...input.launch.session,
-					onExtensionError: (extensionError) => {
-						input.transcriptWriter?.writeStderrLine(`Extension error (${extensionError.extensionPath}, ${extensionError.event}): ${extensionError.error instanceof Error ? extensionError.error.message : String(extensionError.error)}`);
-					},
-				});
+				const continuation = input.readonlyContinuation;
+				const checkContinuation = () => {
+					if (!continuation) return;
+					if (interrupted || timedOut || stopped || input.canContinue?.() !== true
+						|| (input.runDeadlineAt !== undefined && Date.now() >= input.runDeadlineAt)
+						|| getReadonlySessionEvidence(continuation.source) !== continuation.expected
+						|| continuation.source.detached || continuation.source.shutDown) throw new Error("Read-only continuation handoff vetoed");
+				};
+				checkContinuation();
+				const createInput = createReportedChildSessionInput(input.launch, input.transcriptWriter);
+				if (input.collectReadonlyEvidence || continuation) requestReadonlySessionEvidence(createInput, continuation?.expected);
+				const created = await input.factory.create(createInput);
 				if (settled) {
 					void created.dispose();
 					return;
 				}
 				session = created;
+				checkContinuation();
+				if (continuation && (created.modelId !== continuation.modelId || input.launch.capture.completionIntentContext?.()?.model?.api !== continuation.expected.api)) throw new Error("Read-only continuation model changed");
 				unsubscribe = created.subscribe(processEvent);
 				input.registerWatchdogStatus?.((event) => processEvent(event as unknown as ChildSessionEvent));
 				input.registerSteer?.(async (request) => {
@@ -602,6 +631,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 						: { state: "delivered", deliveryStatus: "delivered", message: "Pi accepted the steering input." };
 				});
 				if (interrupted || timedOut || stopped) abortChild();
+				checkContinuation();
 				await created.prompt(input.prompt);
 				promptSettled = true;
 				settle(undefined);

@@ -77,13 +77,14 @@ The extension ships with agents you can use immediately:
 | Agent | Use it when you want... |
 |-------|--------------------------|
 | `scout` | Fast local codebase recon: relevant files, entry points, data flow, risks. |
-| `researcher` | Web/docs research with sources and a concise research brief. |
+| `researcher` | Web/docs research with sources and a concise research brief. Requires [pi-web-access in the child](docs/agents.md#web-research-prerequisites). |
+| `evidence-auditor` | Independently checks whether important research claims are supported by their sources. Requires [pi-web-access in the child](docs/agents.md#web-research-prerequisites). |
 | `worker` | Implementation work. Edits files, validates, escalates unapproved decisions instead of guessing. |
 | `reviewer` | Code review and small fixes against the task/plan, tests, edge cases, and simplicity. |
 | `oracle` | A second opinion before acting. Challenges assumptions without editing. |
 | `delegate` | A lightweight general delegate that behaves close to the parent session. |
 
-Rule of thumb: `scout` before you understand the code, `researcher` before you trust external facts, `worker` to implement, `reviewer` to check, and `oracle` when the decision itself feels risky.
+Rule of thumb: `scout` before you understand the code, `researcher` before you trust external facts, `evidence-auditor` before you rely on important research, `worker` to implement, `reviewer` to check, and `oracle` when the decision itself feels risky.
 
 ## Common workflows
 
@@ -143,6 +144,6 @@ The full reference lives in `docs/`:
 | [Observability](./docs/observability.md) | FleetView, the fleet inspector, lifecycle artifacts, events, logs, session sharing. |
 | [Missions and schedules](./docs/missions.md) | Durable mission records, delivery receipts, timed and recurring runs. |
 | [Configuration](./docs/configuration.md) | Every `config.json` key and environment variable. |
-| [Extension API](./docs/extension-api.md) | The RPC, delegation API, preflight, capability ceilings, background-work providers, Herdr integration. |
+| [Extension API](./docs/extension-api.md) | The RPC, delegation API, preflight, capability ceilings, trusted workflow resources, background-work providers, Herdr integration. |
 | [Fork changes](./docs/fork-changes.md) | Current fork contract: JJ worktrees, Workflow Scratch, and rebase checkpoints. |
 | [Fork validation](./docs/fork-validation.md) | Retained validation contract, focused test map, and superseded architecture evidence. |

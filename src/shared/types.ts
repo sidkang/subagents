@@ -47,14 +47,14 @@ export type HostStepMonitorKind = "command" | "ci" | "gate";
 export type HostStepState = "pending" | "running" | "done" | "cancelled" | "error";
 export type HostStepVerdict = "pass" | "fail" | "inconclusive";
 
-export interface HostStepFreshnessV1 {
+export interface HostStepFreshness {
 	expectedRef: string;
 	observedRef?: string;
 	stale?: boolean;
 }
 
 /** Bounded, provider-agnostic status for a host-owned workflow monitor. */
-export interface HostStepNodeV1 {
+export interface HostStepNode {
 	version: 1;
 	kind: "host-step";
 	/** Explicit monitor category; never inferred from labels or commands. */
@@ -68,7 +68,7 @@ export interface HostStepNodeV1 {
 	reasonCode?: string;
 	detail?: string;
 	target?: string;
-	freshness?: HostStepFreshnessV1;
+	freshness?: HostStepFreshness;
 	reportPath?: string;
 	exitCode?: number | null;
 	updatedAt: number;
@@ -97,7 +97,7 @@ export interface WorkflowGraphNode {
 	structured?: boolean;
 	acceptanceStatus?: AcceptanceLedgerStatus;
 	error?: string;
-	hostStep?: HostStepNodeV1;
+	hostStep?: HostStepNode;
 }
 
 export interface WorkflowGraphSnapshot {
@@ -112,7 +112,7 @@ export type WorkflowPreflightCoverage = "complete" | "partial";
 export type WorkflowPreflightMode = "mutation" | "review" | "scout" | "gate";
 
 /** Bounded, display-only lane hints supplied alongside a workflowScript launch. */
-export interface WorkflowPreflightLaneV1 {
+export interface WorkflowPreflightLane {
 	key: string;
 	mode?: WorkflowPreflightMode;
 	decision?: string;
@@ -122,10 +122,10 @@ export interface WorkflowPreflightLaneV1 {
 }
 
 /** Versioned, display-only workflow launch plan; it never grants launch authority. */
-export interface WorkflowPreflightV1 {
+export interface WorkflowPreflight {
 	version: 1;
 	coverage: WorkflowPreflightCoverage;
-	lanes: WorkflowPreflightLaneV1[];
+	lanes: WorkflowPreflightLane[];
 }
 
 export type WorkflowReceiptState = "complete" | "failed" | "paused" | "stopped";
@@ -149,7 +149,7 @@ export interface WorkflowRecoveryAction {
  * Permission/policy extensions can use it to distinguish resolved content from
  * raw workflow scripts. This audit projection never grants execution authority.
  */
-export interface WorkflowResourceProvenanceV1 {
+export interface WorkflowResourceProvenance {
 	kind: "workflow";
 	name: string;
 	version: number;
@@ -174,7 +174,20 @@ export interface WorkflowLaneMetadata {
 	outputPaths?: string[];
 }
 
-export interface WorkflowChildSummaryV1 {
+/** Bounded foreground activity; excludes tool arguments and transcript content. */
+export interface WorkflowChildActivity {
+	currentTool?: string;
+	currentToolStartedAt?: number;
+	lastActivityAt?: number;
+	durationMs?: number;
+	toolCount?: number;
+	turnCount?: number;
+	tokens?: number;
+	inputTokens?: number;
+	outputTokens?: number;
+}
+
+export interface WorkflowChildSummary {
 	version: 1;
 	parentToolCallId: string;
 	workflowRunId: string;
@@ -188,6 +201,8 @@ export interface WorkflowChildSummaryV1 {
 		sessionName?: string;
 		model?: string;
 		thinking?: string;
+		/** Present only while a synchronous foreground child is running. */
+		activity?: WorkflowChildActivity;
 		state: "pending" | "running" | "completed" | "failed" | "paused" | "stopped" | "rejected" | "detached";
 	}>;
 }
@@ -215,9 +230,9 @@ export interface WorkflowReceipt {
 	state: WorkflowReceiptState;
 	createdAt: number;
 	entries: Record<string, WorkflowReceiptEntry>;
-	resource?: WorkflowResourceProvenanceV1;
-	hostSteps?: HostStepNodeV1[];
-	workflowChildren?: WorkflowChildSummaryV1;
+	resource?: WorkflowResourceProvenance;
+	hostSteps?: HostStepNode[];
+	workflowChildren?: WorkflowChildSummary;
 	workflowResolution?: WorkflowTerminalResolution;
 	terminalOutcome?: WorkflowTerminalOutcome;
 	recovery?: WorkflowRecoveryAction[];
@@ -630,7 +645,7 @@ export type ProcessTerminalReason =
 	| "proof-write-failed"
 	| "stale-repair";
 
-export interface RunnerProcessInstanceExitV1 {
+export interface RunnerProcessInstanceExit {
 	processInstanceId: string;
 	kind: "runner";
 	closeObservedAt: number;
@@ -638,7 +653,7 @@ export interface RunnerProcessInstanceExitV1 {
 	signal: string | null;
 }
 
-export type ProcessTreeTerminalV1 =
+export type ProcessTreeTerminal =
 	| {
 		state: "observed";
 		mechanism: "posix-process-group";
@@ -651,26 +666,26 @@ export type ProcessTreeTerminalV1 =
 		diagnostic?: string;
 	};
 
-export interface PiWriterProcessInstanceExitV1 {
+export interface PiWriterProcessInstanceExit {
 	processInstanceId: string;
 	kind: "pi-writer";
 	attempt: number;
 	closeObservedAt: number;
 	exitCode: number | null;
 	signal: string | null;
-	processTree: ProcessTreeTerminalV1;
+	processTree: ProcessTreeTerminal;
 }
 
-export type ProcessInstanceExitV1 = RunnerProcessInstanceExitV1 | PiWriterProcessInstanceExitV1;
+export type ProcessInstanceExit = RunnerProcessInstanceExit | PiWriterProcessInstanceExit;
 
-export interface CanonicalSessionTerminalV1 {
+export interface CanonicalSessionTerminal {
 	canonicalSessionId: string;
 	leaseDisposition: "released" | "not-held";
 	freeAtObservation: true;
 	canonicalSessionLeaseReleased?: true;
 }
 
-interface ProcessTerminalBaseV1 {
+interface ProcessTerminalBase {
 	version: 1;
 	runId: string;
 	childIndex?: number;
@@ -680,15 +695,15 @@ interface ProcessTerminalBaseV1 {
 	resumeDisposition?: "resumable" | "non-resumable" | "unavailable";
 }
 
-export type ProcessTerminalV1 =
-	| (ProcessTerminalBaseV1 & { state: "pending" | "not-started" })
-	| (ProcessTerminalBaseV1 & {
+export type ProcessTerminal =
+	| (ProcessTerminalBase & { state: "pending" | "not-started" })
+	| (ProcessTerminalBase & {
 		state: "observed";
 		observedAt: number;
-		instances: ProcessInstanceExitV1[];
-		canonicalSession?: CanonicalSessionTerminalV1;
+		instances: ProcessInstanceExit[];
+		canonicalSession?: CanonicalSessionTerminal;
 	})
-	| (ProcessTerminalBaseV1 & {
+	| (ProcessTerminalBase & {
 		state: "unknown";
 		reason: ProcessTerminalReason;
 		diagnostic?: string;
@@ -837,7 +852,7 @@ export interface SteeringRecoveryDescriptor {
 	maxSubagentDepth: number;
 	maxOutput?: MaxOutputConfig;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
 	share: boolean;
 	sessionDir?: string;
 	artifactsDir?: string;
@@ -1169,7 +1184,7 @@ export interface AcceptanceLedger {
 	};
 }
 
-export interface LaunchResolvedChildExtensionsV1 {
+export interface LaunchResolvedChildExtensions {
 	version: 1;
 	/** This is parent-resolved launch intent, not child-runtime acknowledgement that extensions loaded. */
 	source: "launch-resolved";
@@ -1184,7 +1199,7 @@ export interface LaunchResolvedChildExtensionsV1 {
 	};
 }
 
-export interface RuntimeAcknowledgedChildExtensionsV1 {
+export interface RuntimeAcknowledgedChildExtensions {
 	version: 1;
 	/** Best-effort child-runtime registration acknowledgement, not extension health. */
 	source: "child-runtime";
@@ -1287,8 +1302,8 @@ export interface SingleResult {
 	acceptance?: AcceptanceLedger;
 	agentContract?: AgentContract;
 	launchContractDigest?: string;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	execution?: ExecutionProjection;
 	review?: ReviewProjection;
 	effects?: EffectsProjection;
@@ -1346,6 +1361,7 @@ export interface WaitCompletionChild {
  */
 export interface WaitCompletion {
 	runId: string;
+	workflowReceiptPath?: string;
 	agent?: string;
 	mode?: string;
 	state?: string;
@@ -1353,7 +1369,7 @@ export interface WaitCompletion {
 	/** Versioned bounded output archive retained with the durable completion replay. */
 	archivePath?: string;
 	results?: WaitCompletionChild[];
-	workflowChildren?: WorkflowChildSummaryV1;
+	workflowChildren?: WorkflowChildSummary;
 }
 
 export interface AgentCapabilitiesSnapshot {
@@ -1379,13 +1395,14 @@ export interface AgentCapabilityRow {
 
 export interface Details {
 	mode: SubagentResultMode | "management";
+	workflowReceiptPath?: string;
 	runId?: string;
 	/** Host tool-call id retained when it differs from the internal run id. */
 	toolCallId?: string;
 	/** Run-level context summary. "mixed" when children resolved to different modes. */
 	context?: "fresh" | "fork" | "mixed";
 	results: SingleResult[];
-	workflowChildren?: WorkflowChildSummaryV1;
+	workflowChildren?: WorkflowChildSummary;
 	/**
 	 * Terminal completion payloads for runs this bg_wait call observed
 	 * finishing. Async completions travel as result files that are consumed and
@@ -1428,7 +1445,7 @@ export interface Details {
 	currentStepIndex?: number;   // 0-indexed current step (for running chains)
 	workflowGraph?: WorkflowGraphSnapshot;
 	/** Validated, display-only fanout plan supplied with a workflow launch. */
-	preflight?: WorkflowPreflightV1;
+	preflight?: WorkflowPreflight;
 	preflightWarnings?: string[];
 	outputs?: ChainOutputMap;
 	// Aggregated child usage across all agents in the run
@@ -1444,11 +1461,11 @@ export interface Details {
 	capabilityAudit?: SubagentCapabilityAudit;
 	parallelHandoff?: ParallelHandoffReference;
 	lifecycleStatus?: {
-		processTerminal?: ProcessTerminalV1;
+		processTerminal?: ProcessTerminal;
 	};
 	launchContractDigest?: string;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	/** Original launch contract whose persisted session is being revived. */
 	sourceLaunchContractDigest?: string;
 	/** Durable mission attached to this run, when mission mode was explicitly used. */
@@ -1459,7 +1476,7 @@ export interface Details {
 	mission?: MissionRecord;
 	workflow?: {
 		value?: unknown;
-		resource?: WorkflowResourceProvenanceV1;
+		resource?: WorkflowResourceProvenance;
 		preflightWarnings?: string[];
 		trace: Array<{
 			operation: "run" | "status" | "steer" | "host";
@@ -1572,9 +1589,9 @@ export interface NestedStepSummary {
 	wrapUpRequested?: boolean;
 	toolBudget?: ToolBudgetState;
 	toolBudgetBlocked?: boolean;
-	processTerminal?: ProcessTerminalV1;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	processTerminal?: ProcessTerminal;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
 	children?: NestedRunSummary[];
@@ -1592,9 +1609,9 @@ export interface NestedRunSummary extends NestedRunAddress {
 	controlInbox?: string;
 	capabilityToken?: string;
 	mode?: SubagentRunMode;
-	processTerminal?: ProcessTerminalV1;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	processTerminal?: ProcessTerminal;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
 	state: NestedRunState;
@@ -1662,10 +1679,10 @@ export interface AsyncStartedEvent {
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	workflowGraph?: WorkflowGraphSnapshot;
-	preflight?: WorkflowPreflightV1;
+	preflight?: WorkflowPreflight;
 	launchContractDigest?: string;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	usageBudget?: UsageBudgetState;
 	timeoutMs?: number;
 	deadlineAt?: number;
@@ -1786,6 +1803,8 @@ export interface ExternalProcessStatus {
 }
 
 export interface AsyncStatus {
+	/** Exact reference returned by successful current workflow receipt publication. */
+	workflowReceiptPath?: string;
 	lifecycleArtifactVersion?: SubagentLifecycleArtifactVersion;
 	runId: string;
 	/** Parent Pi process/window that owns local completion delivery. */
@@ -1830,17 +1849,17 @@ export interface AsyncStatus {
 	pendingAppends?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	workflowGraph?: WorkflowGraphSnapshot;
-	preflight?: WorkflowPreflightV1;
-	processTerminal?: ProcessTerminalV1;
+	preflight?: WorkflowPreflight;
+	processTerminal?: ProcessTerminal;
 	runFanoutBudget?: RunFanoutBudgetSnapshot;
 	runFanoutBudgetDescriptor?: RunFanoutBudgetDescriptor;
 	launchContractDigest?: string;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
 	workflow?: Details["workflow"];
-	workflowChildren?: WorkflowChildSummaryV1;
+	workflowChildren?: WorkflowChildSummary;
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
 	lane?: WorkflowLaneMetadata;
@@ -1926,13 +1945,13 @@ export interface AsyncStatus {
 		acceptance?: AcceptanceLedger;
 		agentContract?: AgentContract;
 		launchContractDigest?: string;
-		launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-		runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+		launchResolvedExtensions?: LaunchResolvedChildExtensions;
+		runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 		execution?: ExecutionProjection;
 		review?: ReviewProjection;
 		effects?: EffectsProjection;
 		watchdog?: ChildWatchdogProgress;
-		processTerminal?: ProcessTerminalV1;
+		processTerminal?: ProcessTerminal;
 		capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 		capabilityAudit?: SubagentCapabilityAudit;
 	}>;
@@ -1982,11 +2001,11 @@ export interface AsyncJobState {
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	/** Bounded host-owned CI/gate nodes loaded from the workflow status graph. */
-	hostSteps?: HostStepNodeV1[];
+	hostSteps?: HostStepNode[];
 	/** Full bounded workflow plan, including not-yet-materialized stages. */
 	workflowGraph?: WorkflowGraphSnapshot;
 	steps?: AsyncJobStep[];
-	preflight?: WorkflowPreflightV1;
+	preflight?: WorkflowPreflight;
 	stepsTotal?: number;
 	runningSteps?: number;
 	completedSteps?: number;
@@ -2015,7 +2034,7 @@ export interface AsyncJobState {
 	parentWorkflowRunId?: string;
 	workflowKey?: string;
 	workflow?: Details["workflow"];
-	workflowChildren?: WorkflowChildSummaryV1;
+	workflowChildren?: WorkflowChildSummary;
 	lane?: WorkflowLaneMetadata;
 }
 
@@ -2064,8 +2083,8 @@ export interface ForegroundResumeChild {
 	launchContractDigest?: string;
 	/** Private retained launch authority. Never project into status or result output. */
 	extensionBindings?: ExtensionBindings;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	execution?: ExecutionProjection;
 	review?: ReviewProjection;
 	effects?: EffectsProjection;
@@ -2192,6 +2211,8 @@ export interface ActiveAsyncCapacitySnapshot {
 export interface SubagentState {
 	baseCwd: string;
 	currentSessionId: string | null;
+	/** Exact SDK runtime session ID for supervisor ownership; never a session file path. */
+	supervisorOwnerSessionId?: string | null;
 	/** Session for which active status projections were restored successfully. */
 	statusProjectionSessionId?: string | null;
 	/** Reload-stable identity for this parent Pi process/window. */
@@ -2378,7 +2399,7 @@ export interface RunSyncOptions {
 	/** Internal foreground receipt proposal; returns true only when the outer waiter accepted it. */
 	onDetachReceipt?: (result: SingleResult) => boolean;
 	/** Authoritative terminal result, emitted only after the full detached run finalizes. */
-	onDetachedExit?: (result: SingleResult) => void;
+	onDetachedExit?: (result: SingleResult) => void | Promise<void>;
 	controlConfig?: ResolvedControlConfig;
 	intercomSessionName?: string;
 	orchestratorIntercomTarget?: string;
@@ -2424,6 +2445,8 @@ export interface RunSyncOptions {
 	preferredModelProvider?: string;
 	/** Parent Pi event host used to snapshot runtime-registered MCP servers before child launch. */
 	runtimeSnapshotHost?: import("../runs/shared/mcp-direct-tool-allowlist.ts").McpRuntimeSnapshotHost;
+	/** Builtin tool names the host runtime provides; used to intersect agent-declared tools. */
+	hostAvailableBuiltins?: readonly string[];
 	/** Optional subagent model-scope enforcement for fallback candidates */
 	modelScope?: ModelScopeRule | ModelScopeRule[];
 	/** Skills to make available (overrides agent default if provided) */

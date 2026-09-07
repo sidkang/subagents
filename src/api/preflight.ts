@@ -80,6 +80,8 @@ export interface SubagentLaunchContractInput {
 	nestedRootRunId?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Builtin tool names the host runtime provides; used to intersect agent-declared tools. */
+	hostAvailableBuiltins?: readonly string[];
 }
 
 export interface SubagentLaunchContractAgentCandidate {
@@ -288,7 +290,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	}
 	const context = resolveLaunchContractContext(input, agent);
 	if (context === "fork") {
-		diagnostics.push({ code: "host_required", severity: "host-required", message: "Exact fork session branching and fork-thinking downgrade checks require Pi host session and model-registry snapshots." });
+		diagnostics.push({ code: "host_required", severity: "host-required", message: "Exact fork session branching requires Pi host session snapshots." });
 	}
 	const effectiveCapabilityCeiling = intersectSubagentCapabilityCeilings(input.capabilityCeiling, input.inheritedCapabilityCeiling);
 	const restrictionMessage = capabilityCeilingAgentRestrictionMessage(agent.name, effectiveCapabilityCeiling);
@@ -371,6 +373,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			capabilityCeiling: effectiveCapabilityCeiling,
 			agentName: agent.name,
 			permissionRules,
+			hostAvailableBuiltins: input.hostAvailableBuiltins,
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);

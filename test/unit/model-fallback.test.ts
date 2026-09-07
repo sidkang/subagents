@@ -13,7 +13,7 @@ import {
 	resolveModelCandidate,
 	resolveSubagentModelOverride,
 } from "../../src/runs/shared/model-fallback.ts";
-import { clearExclusions, recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
+import { clearExclusions, findModelExclusion, getExcludedCount, recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
 import { resolveModelScopesForAgent } from "../../src/runs/shared/model-scope.ts";
 
 beforeEach(() => clearExclusions());
@@ -30,10 +30,15 @@ describe("model fallback helpers", () => {
 	});
 
 	it("fails verification when the child reports an unregistered different model", () => {
-		assert.match(
-			formatSubagentModelVerificationError("openai/gpt-5-mini:high", "unknown-provider/wrong-model", availableModels) ?? "",
-			/model_verification_failed/,
-		);
+		const error = formatSubagentModelVerificationError("openai/gpt-5-mini:high", "unknown-provider/wrong-model", availableModels) ?? "";
+		assert.match(error, /model_verification_failed: native Pi child/);
+		assert.match(error, /Expected 'openai\/gpt-5-mini:high' but observed 'unknown-provider\/wrong-model'/);
+		assert.match(error, /independently verified/);
+		assert.match(error, /modelResponseAliases in ~\/\.pi\/agent\/extensions\/subagent\/config\.json/);
+		assert.match(error, /docs\/configuration\.md#modelresponsealiases/);
+		assert.match(error, /resolved provider\/model ID without its thinking suffix/);
+		assert.match(error, /outgoing request unchanged/);
+		assert.match(error, /Configuration changes affect new independent native runs; resumed native runs retain their launch-time declaration\. External CLI adapters do not use this setting\./);
 	});
 
 	it("accepts child-reported bare model ids for the expected registry entry", () => {
@@ -87,20 +92,21 @@ describe("model fallback helpers", () => {
 	});
 
 	it("accepts exact response aliases only for the resolved candidate route", () => {
-		const route = "databricks-bedrock/ias-claude-opus-5";
-		const registry = [{ provider: "databricks-bedrock", id: "ias-claude-opus-5", fullId: route }];
-		const aliases = { [route]: ["claude-opus-5"] };
-		const candidate = resolveModelCandidate("ias-claude-opus-5:high", registry)!;
+		const route = "litellm/claude-haiku-4-5";
+		const responseId = "anthropic.claude-haiku-4-5-20251001-v1:0";
+		const registry = [{ provider: "litellm", id: "claude-haiku-4-5", fullId: route }];
+		const aliases = { [route]: [responseId] };
+		const candidate = resolveModelCandidate("claude-haiku-4-5:high", registry)!;
 		assert.equal(candidate, `${route}:high`);
-		assert.equal(formatSubagentModelVerificationError(candidate, "claude-opus-5", registry, aliases), undefined);
-		for (const expected of ["other-provider/ias-claude-opus-5", "databricks-bedrock/other-route", "ias-claude-opus-5"]) {
-			assert.match(formatSubagentModelVerificationError(expected, "claude-opus-5", registry, aliases) ?? "", /model_verification_failed/);
+		assert.equal(formatSubagentModelVerificationError(candidate, responseId, registry, aliases), undefined);
+		for (const expected of ["other-provider/claude-haiku-4-5", "litellm/other-route", "claude-haiku-4-5"]) {
+			assert.match(formatSubagentModelVerificationError(expected, responseId, registry, aliases) ?? "", /model_verification_failed/);
 		}
-		for (const observed of ["wrong-provider/claude-opus-5", "claude-opus-4", "opus-5", "Claude-Opus-5", "claude-opus-5:high"]) {
+		for (const observed of [`wrong-provider/${responseId}`, "anthropic.claude-haiku-4-5-20251002-v1:0", "claude-sonnet-4", responseId.toUpperCase(), `${responseId}:high`]) {
 			assert.match(formatSubagentModelVerificationError(candidate, observed, registry, aliases) ?? "", /model_verification_failed/);
 		}
 		for (const map of [undefined, {}, { [route]: [] }]) {
-			assert.match(formatSubagentModelVerificationError(candidate, "claude-opus-5", registry, map) ?? "", /model_verification_failed/);
+			assert.match(formatSubagentModelVerificationError(candidate, responseId, registry, map) ?? "", /model_verification_failed/);
 		}
 		assert.equal(formatSubagentModelVerificationError(candidate, "response:high", registry, { [route]: ["response:high"] }), undefined);
 		assert.match(formatSubagentModelVerificationError(candidate, "response", registry, { [route]: ["response:high"] }) ?? "", /model_verification_failed/);
@@ -202,6 +208,60 @@ describe("model fallback helpers", () => {
 			buildModelCandidates("gpt-5-mini", ["anthropic/claude-sonnet-4"], availableModels),
 			["openai/gpt-5-mini", "anthropic/claude-sonnet-4"],
 		);
+	});
+
+	it("does not cache context overflow even when upstream makes it retryable", () => {
+		const error = "upstream: maximum context length exceeded";
+		assert.equal(isRetryableModelFailure(error), true);
+		assert.equal(isContextOverflow(error), true);
+		recordRetryableModelFailure("openai/gpt-5-mini", error);
+		assert.equal(getExcludedCount(), 0);
+	});
+
+	it("does not cache the reported Databricks tool-message request error (issue #1955)", () => {
+		const model = "databricks/databricks-kimi-k3";
+		const error = 'Databricks error: {"error_code":"BAD_REQUEST","message":"{\\"error\\":\\"Upstream error: INVALID_ARGUMENT: Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, or match a preceding assistant tool_call by order.\\"}"}';
+		assert.equal(isRetryableModelFailure(error), true);
+		const messages = [{ role: "assistant", errorMessage: error }];
+		assert.equal(isRetryableModelFailureAttempt({ error, messages, toolCount: 0 }), true);
+		assert.equal(isRetryableModelFailureAttempt({ error, messages, toolCount: 1 }), false);
+		recordRetryableModelFailure(model, error);
+		assert.equal(findModelExclusion(model), undefined);
+		assert.equal(getExcludedCount(), 0);
+		assert.deepEqual(buildModelCandidates(model, undefined, undefined), [model]);
+	});
+
+	it("does not cache request-shape errors despite retryable upstream prose", () => {
+		for (const error of [
+			"Bad Request: upstream rejected the request",
+			"BAD_REQUEST: upstream rejected the request",
+			"INVALID_ARGUMENT: upstream rejected the request",
+			"invalid_request_error: upstream rejected the request",
+		]) {
+			assert.equal(isRetryableModelFailure(error), true, error);
+			recordRetryableModelFailure("openai/gpt-5-mini", error);
+			assert.equal(getExcludedCount(), 0, error);
+		}
+	});
+
+	it("still caches rate limits that mention numeric request quotas", () => {
+		const error = "rate limit exceeded: 400 requests per minute";
+		recordRetryableModelFailure("openai/gpt-5-mini", error);
+		assert.equal(findModelExclusion("openai/gpt-5-mini")?.reason, error);
+		assert.equal(getExcludedCount(), 1);
+	});
+
+	it("still caches raw request limits and per-minute input-token rate quotas", () => {
+		for (const error of [
+			"REQUEST_LIMIT_EXCEEDED",
+			'{"error_code":"REQUEST_LIMIT_EXCEEDED","message":"REQUEST_LIMIT_EXCEEDED: Exceeded workspace input tokens per minute rate limit for <model>."}',
+		]) {
+			clearExclusions();
+			assert.equal(isContextOverflow(error), false);
+			recordRetryableModelFailure("openai/gpt-5-mini", error);
+			assert.equal(findModelExclusion("openai/gpt-5-mini")?.reason, error);
+			assert.equal(getExcludedCount(), 1);
+		}
 	});
 
 	it("applies the current provider preference to fallback candidates too", () => {
@@ -449,6 +509,13 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("bash failed (exit 1): command not found"), false);
 		assert.equal(isRetryableModelFailure("read failed (exit 1): no such file or directory"), false);
 		assert.equal(isRetryableModelFailure(undefined), false);
+	});
+
+	it("recognizes only the exact raw request-limit code without broadening limit families", () => {
+		assert.equal(isRetryableModelFailure("REQUEST_LIMIT_EXCEEDED"), true);
+		for (const error of ["TOKEN_LIMIT_EXCEEDED", "INPUT_LIMIT_EXCEEDED", "OUTPUT_LIMIT_EXCEEDED", "RESOURCE_EXHAUSTED", "NOT_REQUEST_LIMIT_EXCEEDED", "REQUEST_LIMIT_EXCEEDED_OTHER", "400"]) {
+			assert.equal(isRetryableModelFailure(error), false, error);
+		}
 	});
 
 	it("does not treat network-flavored tool failures as retryable model failures", () => {

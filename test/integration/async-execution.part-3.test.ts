@@ -11,6 +11,8 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { childSessionFactoryModule, setChildSessionFactoryModule } from "../../src/runs/shared/child-session.ts";
 import { createEventBus, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir } from "../support/helpers.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
@@ -22,7 +24,7 @@ import {
 	createSubagentExecutor, escapeRegExp, createRepo, writePackageSkill,
 	waitForAsyncResultFile, waitForAsyncEvent, waitForAsyncState, waitForMockPiCall,
 	readLastMockPiArgs, readMockPiArgs, readMockPiArgsMatching, tempDir, mockPi,
-	makeAsyncExecutor, readAsyncPayload,
+	makeAsyncExecutor, readAsyncPayload, observeSharedCwdRunner,
 } from "../support/async-execution-fixture.ts";
 
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
@@ -240,6 +242,51 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.success, false);
 		assert.match(payload.results[0]?.error ?? "", /ended during 'bash' tool execution before the tool completed/);
 	});
+
+	for (const terminal of [
+		{ name: "empty text stop", content: [{ type: "text", text: "" }], stopReason: "stop", error: /no output.*empty response/i },
+		{ name: "tool-call-only stop", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "README.md" } }], stopReason: "toolUse", error: /grep failed.*Path not found/i },
+		{ name: "empty text length limit", content: [{ type: "text", text: "" }], stopReason: "length", error: /grep failed.*Path not found/i },
+	]) {
+		it(`background diagnoses ${terminal.name} after an exploratory tool error`, { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			mockPi.onCall({
+				stdoutRaw: [
+					events.toolResult("grep", "Path not found", true),
+					events.toolResult("read", "recovered file contents"),
+					{
+						type: "message_end",
+						message: {
+							role: "assistant",
+							content: terminal.content,
+							model: "openai/gpt-5-mini",
+							stopReason: terminal.stopReason,
+							usage: { input: 0, output: 4, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } },
+						},
+					},
+				].map((event) => JSON.stringify(event)).join("\n"),
+				exitCode: 0,
+			});
+			const id = `async-terminal-diagnosis-${Date.now().toString(36)}`;
+			executeAsyncSingle(id, {
+				agent: "worker",
+				task: "Do work",
+				agentConfig: makeAgent("worker", { model: "openai/gpt-5-mini" }),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false,
+				maxSubagentDepth: 2,
+			});
+
+			const resultPath = await waitForAsyncResultFile(id);
+			const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, false);
+			assert.equal(payload.exitCode, 1);
+			assert.match(payload.results[0]?.error ?? "", terminal.error);
+			assert.equal(payload.results[0]?.output, "");
+			const status = await waitForAsyncState(id, (candidate) => candidate.state === "failed");
+			assert.match(status.steps?.[0]?.error ?? "", terminal.error);
+		});
+	}
 
 	it("background runs prefer empty-output fallback over an earlier tool error", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({
@@ -663,6 +710,119 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.results[0].success, false);
 	});
 
+	it("background completion intent uses disposed child model services before publishing evidence", { timeout: 60_000, skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async (t) => {
+		const reviewTask = 'Review the proposal "Implement the approved fixes" and report whether its reasoning is sound.';
+		const factoryPath = path.join(tempDir, "intent-factory.mjs");
+		const tracePath = path.join(tempDir, "intent-trace.jsonl");
+		const casePath = path.join(tempDir, "intent-case.json");
+		fs.writeFileSync(factoryPath, `
+import fs from "node:fs";
+import assert from "node:assert/strict";
+import { createDefaultChildSessionFactory } from ${JSON.stringify(new URL("../../src/runs/shared/child-session.ts", import.meta.url).href)};
+import { createAssistantMessageEventStream, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+const scenario = JSON.parse(fs.readFileSync(${JSON.stringify(casePath)}, "utf8"));
+const trace = event => fs.appendFileSync(${JSON.stringify(tracePath)}, event + "\\n");
+export default function() {
+  let disposed = false;
+  const model = { provider: "intent-test", id: "child-attempt", api: "intent-test-api" };
+  const runtime = { apiKey: "fixture-key" };
+  const registry = {
+    runtime,
+    async getApiKeyAndHeaders() {
+      trace("auth");
+      assert.ok(disposed, "auth after child disposal");
+      return { ok: true, apiKey: this.runtime.apiKey, headers: { "x-intent-test": "fixture-header" } };
+    },
+    getRegisteredProviderConfig() { return { api: model.api, streamSimple(selected, context, options) {
+      trace("stream");
+      assert.ok(disposed, "stream after child disposal");
+      assert.equal(selected.provider + "/" + selected.id, "intent-test/child-attempt");
+      assert.equal(options.apiKey, "fixture-key");
+      assert.equal(options.headers["x-intent-test"], "fixture-header");
+      const decided = context.messages.some(message => message.role === "toolResult");
+      const message = !decided
+        ? fauxAssistantMessage(fauxToolCall("task_mutation_decision", { classification: scenario.classification ?? "read_only", confidence: "high", reason: "Scripted task intent." }), { stopReason: "toolUse" })
+        : fauxAssistantMessage("Review findings: the proposal is sound.", { stopReason: "stop" });
+      const stream = createAssistantMessageEventStream();
+      queueMicrotask(() => stream.push({ type: "done", reason: message.stopReason, message }));
+      return stream;
+    } }; },
+  };
+  // Existing SDK seam: production factory/hooks, scripted child/model services.
+  return createDefaultChildSessionFactory({ loadPiCodingAgent: async () => ({
+    ModelRuntime: { create: async () => runtime },
+    SettingsManager: { create: () => ({}) },
+    SessionManager: { inMemory: () => ({}) },
+    DefaultResourceLoader: class {
+      loaded = false;
+      handlers = [];
+      constructor(options) { this.options = options; }
+      async reload() {
+        const pi = { on: (event, handler) => this.handlers.push({ event, handler }), registerTool() {}, events: { on() { return () => {}; }, emit() {} } };
+        for (const hook of this.options.extensionFactories) hook.factory(pi);
+      }
+    },
+    resolveCliModel: ({ cliModel }) => { assert.equal(cliModel, "intent-test/child-attempt"); return { model }; },
+    createAgentSession: async ({ resourceLoader, model }) => {
+      const ctx = Proxy.revocable({ model, modelRegistry: registry }, {});
+      let listener;
+      const messages = [];
+      return { session: {
+        model, messages, sessionId: "intent-child",
+        async bindExtensions() { for (const { event, handler } of resourceLoader.handlers) if (event === "session_start") await handler({ type: event }, ctx.proxy); },
+        extensionRunner: { hasHandlers: () => false },
+        subscribe(next) { listener = next; return () => {}; },
+        async prompt() {
+          const message = fauxAssistantMessage("Review findings: the proposal is sound.", { stopReason: "stop" }); messages.push(message); listener({ type: "message_end", message });
+        },
+        async abort() {}, async steer() {}, async followUp() {},
+        dispose() { disposed = true; ctx.revoke(); },
+      } };
+    },
+  }) });
+}
+`);
+		setChildSessionFactoryModule(factoryPath);
+		t.after(() => setChildSessionFactoryModule(fileURLToPath(new URL("../support/runner-child-session-factory.ts", import.meta.url))));
+		for (const scenario of [
+			{ name: "review-rescue", task: reviewTask, success: true, effect: "not-applicable", calls: true },
+			{ name: "implementation", task: "Implement the approved fixes", classification: "implementation", success: false, effect: "missing", calls: true },
+			{ name: "ordinary", task: "Summarize the proposal", success: true, effect: "not-applicable", calls: false },
+		]) {
+			fs.writeFileSync(casePath, JSON.stringify(scenario));
+			fs.writeFileSync(tracePath, "");
+			const id = `async-intent-${scenario.name}-${Date.now().toString(36)}`;
+			const outputPath = path.join(tempDir, `${id}.md`);
+			const launched = executeAsyncSingle(id, {
+				agent: "worker", task: scenario.task,
+				agentConfig: makeAgent("worker", { model: "intent-test/child-attempt" }),
+				output: outputPath,
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, maxSubagentDepth: 2,
+			});
+			assert.notEqual(launched.isError, true, `${scenario.name}: ${JSON.stringify(launched)}`);
+			const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id), "utf8"));
+			await waitForAsyncEvent(id, "subagent.run.process_terminal");
+			assert.equal(payload.success, scenario.success, `${scenario.name}: ${JSON.stringify(payload)}`);
+			assert.equal(payload.results[0].effects?.fileMutation?.status, scenario.effect, scenario.name);
+			const trace = fs.readFileSync(tracePath, "utf8");
+			assert.equal(trace.includes("auth"), scenario.calls, scenario.name);
+			assert.equal(trace.includes("stream"), scenario.calls, scenario.name);
+			if (!scenario.success) assert.match(payload.results[0].modelAttempts[0].error, /completed without making edits/, scenario.name);
+			if (scenario.name === "review-rescue") {
+				assert.equal(payload.results[0].effects.fileMutation.resolvedBy, "llm-intent-arbiter");
+				assert.equal(payload.results[0].effects.fileMutation.expected, true);
+				assert.equal(payload.results[0].modelAttempts[0].success, true);
+				assert.equal(payload.results[0].modelAttempts[0].error, undefined);
+				assert.match(fs.readFileSync(outputPath, "utf8"), /Review findings: the proposal is sound/);
+				const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf8"));
+				assert.equal(status.state, "complete");
+				assert.doesNotMatch(fs.readFileSync(path.join(ASYNC_DIR, id, "events.jsonl"), "utf8"), /"reason":"completion_guard"|completed without making edits/);
+			}
+		}
+	});
+
 	it("background implementation runs fail when no mutation attempt occurred", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "I’ll do that now and report back after implementing." });
 
@@ -717,7 +877,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.doesNotMatch(eventsText, /Interrupt:/);
 	});
 
-	it("does not use shared-cwd sibling tracked edits as parallel completion-guard proof", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("does not use shared-cwd sibling tracked edits as parallel completion-guard proof", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async (t) => {
 		mockPi.onCall({
 			matchArgIncludes: "Edit tracked file",
 			delay: 50,
@@ -735,8 +895,35 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const repo = createRepo("pi-subagents-shared-cwd-mutation-guard-");
 		const id = `async-parallel-shared-cwd-mutation-${Date.now().toString(36)}`;
 		let runnerStarted = false;
+		const observer = observeSharedCwdRunner(id);
+		const originalFactoryModule = childSessionFactoryModule();
+		const failures: unknown[] = [];
+		const reportFailure = () => observer.reportFailure((message) => t.diagnostic(message));
 		try {
-			const launch = executeAsyncChain(id, {
+			assert.ok(originalFactoryModule, "expected the installed scripted runner factory");
+			const factoryPath = path.join(tempDir, "shared-cwd-exit-phases.mjs");
+			fs.writeFileSync(factoryPath, `
+import { writeSync } from "node:fs";
+import createFactory from ${JSON.stringify(pathToFileURL(originalFactoryModule).href)};
+export default function() {
+  const factory = createFactory();
+  let invocation = 0;
+  const mark = (phase, call) => writeSync(process.stderr.fd, "#1906 phase=" + phase + " invocation=" + call + " ts=" + Date.now() + " pid=" + process.pid + "\\n");
+  process.once("exit", () => mark("exit", 0));
+  return {
+    create(...args) { return factory.create(...args); },
+    async dispose() {
+      const call = ++invocation;
+      mark("dispose-entry", call);
+      const result = await factory.dispose();
+      mark("dispose-return", call);
+      return result;
+    },
+  };
+}
+`);
+			setChildSessionFactoryModule(factoryPath);
+			const launch = observer.launch(() => executeAsyncChain(id, {
 				chain: [{
 					parallel: [
 						{ agent: "first", task: "Edit tracked file" },
@@ -746,24 +933,50 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				}],
 				resultMode: "parallel",
 				agents: [makeAgent("first"), makeAgent("second")],
-				ctx: { pi: { events: { emit() {} } }, cwd: repo, currentSessionId: "session-1" },
+				ctx: { pi: { events: { emit: observer.emit } }, cwd: repo, currentSessionId: "session-1" },
 				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 				shareEnabled: false,
 				maxSubagentDepth: 2,
-			});
+			}));
 			runnerStarted = !launch.isError;
 
 			const payload = await readAsyncPayload(id);
+			observer.marks.payloadReadAt = Date.now();
 			assert.equal(payload.results[0]?.success, true);
 			assert.equal(payload.results[0]?.effects?.fileMutation?.status, "observed");
 			assert.equal(payload.results[1]?.success, false);
 			assert.equal(payload.results[1]?.effects?.fileMutation?.status, "missing");
 			assert.equal(payload.results[1]?.effects?.fileMutation?.attempted, false);
 			assert.match(payload.results[1]?.error ?? "", /completed without making edits/);
+			observer.marks.assertionsCompletedAt = Date.now();
+		} catch (error) {
+			failures.push(error);
 		} finally {
-			if (runnerStarted) await waitForAsyncEvent(id, "subagent.run.process_terminal");
-			fs.rmSync(repo, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+			try {
+				if (runnerStarted) {
+					observer.marks.waitStartedAt = Date.now();
+					try { await waitForAsyncEvent(id, "subagent.run.process_terminal"); }
+					finally { observer.marks.waitFinishedAt = Date.now(); }
+				}
+				if (failures.length) reportFailure();
+				fs.rmSync(repo, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+				// Validate channel support/correlation without reading artifacts on success.
+				const summary = observer.summary();
+				t.diagnostic(`#1906 observer ${JSON.stringify(summary)}`);
+				if (runnerStarted) {
+					assert.equal(summary.correlatedProcesses, 1, "diagnostic channel must capture the started-event runner PID");
+					for (const type of ["spawn", "exit", "close"]) assert.ok(summary.processEvents.flat().some((event) => (event as { type: string }).type === type), `diagnostic runner ${type} must be observed`);
+				}
+			} catch (error) {
+				failures.push(error);
+				reportFailure();
+			} finally {
+				setChildSessionFactoryModule(originalFactoryModule);
+				observer.dispose();
+			}
 		}
+		if (failures.length === 1) throw failures[0];
+		if (failures.length > 1) throw new AggregateError(failures, "Primary execution and cleanup/diagnostic failures", { cause: failures[0] });
 	});
 
 	it("background implementation challenges keep explicit no-change reports successful", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -818,7 +1031,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.doesNotMatch(eventsText, /"reason":"completion_guard"/);
 	});
 
-	it("agent contract v1 keeps async acceptance and file-mutation effects separate from execution", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+	it("agent contract keeps async acceptance and file-mutation effects separate from execution", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "I’ll do that now and report back after implementing.\n```acceptance-report\n{\"criteriaSatisfied\":[{\"id\":\"criterion-1\",\"status\":\"not-satisfied\",\"evidence\":\"no proof\"}]}\n```" });
 		const id = `async-v1-separate-${Date.now().toString(36)}`;
 

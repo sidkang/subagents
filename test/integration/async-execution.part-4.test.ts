@@ -9,9 +9,16 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { once } from "node:events";
+import { createServer, type Socket } from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createEventBus, events, makeAgent, removeTempDir } from "../support/helpers.ts";
+import { fileURLToPath } from "node:url";
+import { setChildSessionFactoryModule } from "../../src/runs/shared/child-session.ts";
+import { createEventBus, createTempDir, events, makeAgent, removeTempDir } from "../support/helpers.ts";
+import { deliverInterruptRequest, deliverStopRequest } from "../../src/runs/background/control-channel.ts";
+import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
 import { waitForSubagents } from "../../src/runs/background/subagent-wait.ts";
 import type { AsyncResultPayload, AsyncStatusPayload } from "../support/async-execution-fixture.ts";
 import {
@@ -24,6 +31,285 @@ import {
 
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
 	installAsyncExecutionHooks();
+
+	it("coalesces ordinary background status while publishing per-child activity transitions", { timeout: 30_000, skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async (t) => {
+		const id = `async-coalescing-${Date.now().toString(36)}`;
+		const statusPath = path.join(ASYNC_DIR, id, "status.json");
+		const reportPath = path.join(tempDir, `${id}-report.json`);
+		const factoryPath = path.join(tempDir, `${id}-factory.mjs`);
+		// Exercise the detached production runner through its child-session boundary.
+		// Only external time and successful filesystem publications are instrumented.
+		fs.writeFileSync(factoryPath, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { mock } from "node:test";
+const statusPath = ${JSON.stringify(statusPath)};
+const reportPath = ${JSON.stringify(reportPath)};
+const children = [];
+const report = { samples: [], transitions: [], terminal: [] };
+process.once("exit", () => {
+  fs.writeFileSync(reportPath + ".tmp", JSON.stringify(report));
+  fs.renameSync(reportPath + ".tmp", reportPath);
+});
+let writes = 0, bytes = 0, replayed = false, finished = false;
+const read = () => JSON.parse(fs.readFileSync(statusPath, "utf8"));
+const rename = fs.renameSync;
+fs.renameSync = function(source, target) {
+  rename.call(this, source, target);
+  if (target === statusPath) {
+    writes++;
+    bytes += fs.statSync(target).size;
+    if (replayed && !finished && read().state !== "running") {
+      finished = true;
+      queueMicrotask(() => {
+        report.terminal.push(read());
+        mock.timers.tick(100);
+        report.terminal.push(read());
+        mock.timers.reset();
+      });
+    }
+  }
+};
+syncBuiltinESMExports();
+function replay() {
+  mock.timers.enable({ apis: ["Date", "setTimeout"], now: Date.now() });
+  const emit = (index, event) => children[index].listener(event);
+  const stream = () => emit(1, { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x" } });
+  const transition = (index, event) => {
+    const before = writes;
+    emit(index, event);
+    report.transitions.push({ writes: writes - before, status: read() });
+  };
+  const sample = (state) => {
+    const beforeWrites = writes, beforeBytes = bytes;
+    for (let i = 0; i < 1000; i++) { stream(); mock.timers.tick(10); }
+    mock.timers.tick(100);
+    report.samples.push({ state, writes: writes - beforeWrites, bytes: bytes - beforeBytes, now: Date.now(), status: read() });
+  };
+  const start = { type: "tool_execution_start", toolName: "contact_supervisor", toolCallId: "decision", args: { reason: "need_decision", message: "Choose" } };
+  const end = { type: "tool_execution_end", toolName: "contact_supervisor", toolCallId: "decision" };
+  sample("unset");
+  transition(1, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "working" }], stopReason: "tool_use" } });
+  sample("active_long_running");
+  transition(0, start);
+  sample("needs_attention");
+  transition(1, start); // Aggregate attention is unchanged by either sibling transition.
+  transition(1, end);
+  transition(0, end);
+  const beforePending = writes;
+  stream(); // Leave an ordinary update pending when both children fail.
+  report.pendingWrites = writes - beforePending;
+  replayed = true;
+  for (const child of children) child.reject(new Error("scripted terminal failure"));
+}
+export default function() {
+  return {
+    async create() {
+      const child = {};
+      children.push(child);
+      return {
+        sessionId: "coalescing-" + children.length, sessionFile: undefined, modelId: undefined, messages: [],
+        subscribe(listener) { child.listener = listener; return () => {}; },
+        prompt() { return new Promise((resolve, reject) => { child.reject = reject; if (children.length === 2 && children.every(c => c.reject)) replay(); }); },
+        async steer() {}, async followUp() {}, async abort() {}, async dispose() {},
+      };
+    },
+    async dispose() {},
+  };
+}
+`);
+		const reportReady = new Promise<void>((resolve) => {
+			// libuv compares expanded event paths against the watched directory (Windows 8.3 aliases differ).
+			const watcher = fs.watch(fs.realpathSync.native(tempDir), () => {
+				if (fs.existsSync(reportPath)) resolve();
+			});
+			t.after(() => watcher.close());
+		});
+		setChildSessionFactoryModule(factoryPath);
+		t.after(() => setChildSessionFactoryModule(fileURLToPath(new URL("../support/runner-child-session-factory.ts", import.meta.url))));
+		const launched = executeAsyncChain(id, {
+			chain: [{ parallel: [{ agent: "worker", task: "A" }, { agent: "worker", task: "B" }] }],
+			agents: [makeAgent("worker")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			controlConfig: { enabled: true, needsAttentionAfterMs: 999_999, activeNoticeAfterTurns: 1, activeNoticeAfterMs: 999_999, activeNoticeAfterTokens: 999_999, failedToolAttemptsBeforeAttention: 3, notifyOn: ["active_long_running", "needs_attention"], notifyChannels: ["event", "async"] },
+		});
+		assert.notEqual(launched.isError, true);
+		await reportReady;
+		const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+		t.diagnostic(JSON.stringify(report.samples.map(({ state, writes, bytes }: { state: string; writes: number; bytes: number }) => ({ state, writes, bytes }))));
+		assert.deepEqual(report.samples.map((sample: { writes: number }) => sample.writes), [100, 100, 100]);
+		for (const sample of report.samples) {
+			assert.equal(sample.status.lastActivityAt, sample.now - 110);
+			assert.equal(sample.status.steps[1].lastActivityAt, sample.now - 110);
+		}
+		assert.deepEqual(report.transitions.map((entry: { writes: number }) => entry.writes), [1, 1, 1, 1, 1]);
+		assert.deepEqual(report.transitions.map((entry: { status: AsyncStatusPayload }) => entry.status.steps?.map(step => step.activityState)), [
+			[undefined, "active_long_running"], ["needs_attention", "active_long_running"],
+			["needs_attention", "needs_attention"], ["needs_attention", "active_long_running"], [undefined, "active_long_running"],
+		]);
+		assert.equal(report.samples[2].status.steps[1].turnCount, 1);
+		assert.equal(report.transitions[2].status.activityState, "needs_attention");
+		assert.equal(report.transitions[3].status.activityState, "needs_attention");
+		assert.equal(report.pendingWrites, 0);
+		assert.equal(report.terminal[0].state, "failed");
+		assert.deepEqual(report.terminal[1], report.terminal[0]);
+	});
+
+	for (const mode of ["success", "stop", "pause", "deadline", "failure-before-JSON"] as const) {
+		it(`background setup lifecycle: ${mode}`, { skip: !isAsyncAvailable() || process.platform === "win32" ? "requires real POSIX setup executable" : undefined, timeout: 25_000 }, async (t) => {
+			const repo = createRepo("pi-background-setup-");
+			const baseDir = createTempDir();
+			const id = `async-setup-${mode}-${Date.now().toString(36)}`;
+			const asyncDir = path.join(ASYNC_DIR, id);
+			const marker = path.join(repo, ".git", "child-launched");
+			const allocatorFailure = mode === "failure-before-JSON";
+			const oldPath = process.env.PATH;
+			const server = createServer();
+			server.listen(0, "127.0.0.1");
+			await once(server, "listening");
+			const { port } = server.address() as { port: number };
+			const hook = path.join(baseDir, allocatorFailure ? "wt" : "setup-hook.cjs");
+			fs.writeFileSync(hook, `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args.includes('--version')) { console.log('wt v0.75.0'); process.exit(0); }
+if (args.includes('--help')) { console.log('--create --base --no-cd --no-hooks --format'); process.exit(0); }
+if (${allocatorFailure}) require('node:child_process').execFileSync('git', ['branch', args[args.indexOf('--create') + 1]], { cwd: ${JSON.stringify(repo)} });
+const socket = require('node:net').connect(${port}, '127.0.0.1', () => socket.write('ready'));
+socket.on('data', data => {
+ if (data.toString() === 'release') { socket.end(); if (${allocatorFailure}) process.exitCode = 1; else console.log('{}'); }
+});
+setTimeout(() => process.exit(90), 15000).unref();
+`, { mode: 0o755 });
+			if (allocatorFailure) process.env.PATH = `${baseDir}${path.delimiter}${oldPath}`;
+			const bus = createEventBus();
+			let closed = false;
+			const terminal = new Promise<unknown>((resolve) => bus.on(SUBAGENT_PROCESS_TERMINAL_EVENT, (proof) => { closed = true; resolve(proof); }));
+			let socket: Socket | undefined;
+			let started = false;
+			try {
+				mockPi.onCall({ output: "finite setup completed", writeFiles: [{ path: marker, content: "launched" }] });
+				const connection = once(server, "connection", { signal: AbortSignal.timeout(20_000) });
+				const receipt = executeAsyncChain(id, {
+					chain: [{ agent: "worker", task: "Do work", worktree: true }],
+					agents: [makeAgent("worker", { completionGuard: false })],
+					ctx: { pi: { events: bus }, cwd: repo, currentSessionId: "session-1" },
+					artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+					shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2, acceptance: false,
+					...(allocatorFailure ? { worktreeProvider: "worktrunk" } : { worktreeProvider: "native", worktreeBaseDir: path.join(baseDir, "trees"), worktreeSetupHook: hook }),
+					...(mode === "deadline" ? { timeoutMs: 4_000 } : {}),
+				});
+				assert.equal(receipt.isError, undefined, receipt.content[0]?.text);
+				started = true;
+				[socket] = await Promise.race([connection, terminal.then((proof) => { throw new Error(`Runner closed before setup ready: ${JSON.stringify(proof)}`); })]) as [Socket];
+				assert.equal((await once(socket, "data"))[0].toString(), "ready");
+				const held = await waitForAsyncState(id, (status) => Boolean(status.parallelHandoff));
+				assert.equal(closed, false);
+				assert.equal(mockPi.callCount(), 0);
+				assert.equal(fs.existsSync(marker), false);
+				if (mode === "stop") deliverStopRequest({ asyncDir, source: "test" });
+				else if (mode === "pause") deliverInterruptRequest({ asyncDir, source: "test" });
+				else if (mode !== "deadline") socket.write("release");
+				const payload = await readAsyncPayload(id);
+				const proof = await terminal;
+				const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8"));
+				const expected = mode === "success" ? "complete" : mode === "stop" ? "stopped" : mode === "pause" ? "paused" : "failed";
+				if (payload.state !== expected || status.state !== expected || status.steps?.[0]?.status !== expected) {
+					// Failure-only, bounded projections: never print prompts, output, paths or raw stderr.
+					const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" ? value as Record<string, unknown> : {};
+					const token = (value: unknown) => typeof value === "string" && /^[a-z_-]{1,64}$/i.test(value) ? value : undefined;
+					const errors = (value: unknown) => {
+						const text = typeof value === "string" ? value.slice(0, 8192) : "";
+						return { present: Boolean(text), kinds: [
+							"EPIPE", "ENOENT", "EACCES", "ENOSPC", "ETIMEDOUT", "ABORT_ERR", "ENOBUFS",
+							"setup aborted", "setup deadline", "setup settlement unknown", "process tree settlement",
+							"empty stdout", "invalid JSON", "hook failed", "manual reconciliation required",
+							"not a git repository", "index.lock", "already exists", "Failed to write result",
+							"No model", "model not found", "completion", "acceptance",
+						].filter((kind) => text.toLowerCase().includes(kind.toLowerCase())), exitCode: text.match(/exit (?:code |status )?(-?\d+)/i)?.[1] };
+					};
+					const project = (value: unknown) => {
+						const item = record(value);
+						return { state: token(item.state), status: token(item.status), reason: token(item.reason),
+							exitCode: typeof item.exitCode === "number" ? item.exitCode : undefined,
+							success: typeof item.success === "boolean" ? item.success : undefined,
+							timedOut: item.timedOut === true, stopped: item.stopped === true, error: errors(item.error) };
+					};
+					let cleanup: unknown;
+					try {
+						const handoffPath = held.parallelHandoff?.path;
+						if (handoffPath && fs.statSync(handoffPath).size <= 65_536) {
+							const handoff = JSON.parse(fs.readFileSync(handoffPath, "utf8"));
+							cleanup = (handoff.groups ?? []).slice(0, 2).map((group: { cleanup?: { state?: string; pruned?: boolean; tasks?: unknown[]; errors?: string[] } }) => ({
+								state: token(group.cleanup?.state), pruned: group.cleanup?.pruned,
+								taskCount: group.cleanup?.tasks?.length, errors: group.cleanup?.errors?.slice(0, 4).map(errors),
+							}));
+						}
+					} catch (error) { cleanup = { readError: token(record(error).code) }; }
+					t.diagnostic(JSON.stringify({ mode, expected, mockCalls: mockPi.callCount(), markerPresent: fs.existsSync(marker),
+						result: project(payload), status: project(status), steps: (status.steps ?? []).slice(0, 2).map(project),
+						children: (payload.results ?? []).slice(0, 2).map(project), cleanup, processTerminal: project(proof) }));
+				}
+				assert.equal(payload.state, expected);
+				assert.equal(status.state, expected);
+				assert.equal(status.steps[0].status, expected);
+				assert.equal(payload.success, mode === "success");
+				assert.equal(mockPi.callCount(), mode === "success" ? 1 : 0);
+				assert.equal(fs.existsSync(marker), mode === "success");
+				assert.ok(held.parallelHandoff?.path);
+				const handoff = JSON.parse(fs.readFileSync(held.parallelHandoff.path, "utf8"));
+				const group = handoff.groups[0];
+				if (allocatorFailure) {
+					assert.equal(status.steps[0].worktreePath, undefined);
+					assert.equal(status.steps[0].branch, undefined);
+					assert.deepEqual(group.cleanup.tasks, []);
+					assert.deepEqual(group.children, []);
+					assert.equal(group.cleanup.state, "partial");
+					assert.equal(group.cleanup.pruned, false);
+					assert.match(group.cleanup.errors.join("\n"), /manual reconciliation required/);
+					const attempt = group.cleanup.errors.find((entry: string) => entry.startsWith("Allocation attempt "));
+					const evidence = JSON.parse(attempt.slice("Allocation attempt ".length));
+					assert.equal(evidence.path, null);
+					assert.equal(evidence.validated, false);
+					assert.equal(evidence.command.status, 1);
+					assert.equal(evidence.command.processTree, "unknown");
+					assert.equal(execFileSync("git", ["branch", "--list", evidence.branch], { cwd: repo, encoding: "utf8" }).trim(), evidence.branch);
+					const persisted = JSON.parse(fs.readFileSync(path.join(asyncDir, "process-terminal.json"), "utf8"));
+					assert.equal(persisted.state, "unknown");
+					assert.equal(persisted.reason, "process-tree-unverified");
+					assert.deepEqual(proof, persisted, "actual runner close must not promote setup unknown with zero child writers");
+					const candidate = JSON.parse(fs.readFileSync(path.join(asyncDir, "process-terminal-candidate.json"), "utf8"));
+					assert.deepEqual(Object.values(candidate.writers).flat(), []);
+					assert.deepEqual(Object.values(candidate.expectedWriters), [0]);
+				} else if (mode === "deadline") {
+					assert.equal(payload.timedOut, true);
+					assert.equal(status.timedOut, true);
+					assert.ok(payload.deadlineAt! <= Date.now());
+					assert.equal(group.cleanup.pruned, false);
+					assert.equal(group.cleanup.tasks[0].preserved, true);
+					assert.equal(fs.existsSync(group.cleanup.tasks[0].path), true);
+				} else {
+					assert.equal(group.cleanup.state, "complete");
+					assert.equal(group.cleanup.tasks.length, 1);
+					assert.equal(group.cleanup.tasks[0].worktreeRemoved, true);
+					assert.equal(group.cleanup.tasks[0].branchRemoved, true);
+					assert.equal(fs.existsSync(group.cleanup.tasks[0].path), false);
+					assert.equal(execFileSync("git", ["branch", "--list", group.cleanup.tasks[0].branch], { cwd: repo, encoding: "utf8" }).trim(), "");
+				}
+			} finally {
+				socket?.end("release");
+				if (started && !closed) { deliverStopRequest({ asyncDir, source: "test-cleanup" }); await terminal; }
+				socket?.destroy();
+				await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+				if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+				removeTempDir(baseDir);
+				removeTempDir(repo);
+			}
+		});
+	}
 
 	it("does not start child work when initial async status cannot be written", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		const id = `async-status-write-fail-${Date.now().toString(36)}`;
@@ -300,6 +586,50 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			const check = child.acceptance?.runtimeChecks?.find((entry) => entry.id === "watchdog-blocker");
 			assert.equal(check?.status, "failed");
 			assert.match(check?.message ?? "", /Unresolved watchdog blocker/);
+		});
+	});
+
+	for (const type of ["turn_start", "agent_start", "auto_retry_start"]) {
+		it(`background keeps resumed work alive after ${type}`, { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+			const id = `async-resumed-${type}-${Date.now().toString(36)}`;
+			mockPi.onCall({
+				steps: [
+					{ jsonl: [events.assistantMessage("before continuation"), { type }] },
+					// Queued steering/follow-up work is allowed to outlive the old final-stop grace.
+					{ delay: 1400, jsonl: [events.assistantMessage("after continuation")] },
+				],
+			});
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Do work", agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+			});
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.success, true, payload.results[0]?.error);
+			assert.equal(payload.results[0]?.output, "after continuation");
+		});
+	}
+
+	it("background ignores stale watchdog completion after resumed work", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		await withIsolatedWatchdogSettings(tempDir, async () => {
+			writeWatchdogSettings(tempDir);
+			const id = `async-resumed-watchdog-${Date.now().toString(36)}`;
+			mockPi.onCall({
+				steps: [
+					{ jsonl: [events.assistantMessage("before continuation"), { type: "turn_start" }, childWatchdogStatus(id, "idle", 1)] },
+					{ delay: 1400, jsonl: [events.assistantMessage("after continuation")] },
+				],
+			});
+			executeAsyncSingle(id, {
+				agent: "worker", task: "Do work", agentConfig: makeAgent("worker"),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+			});
+			const payload = await readAsyncPayload(id);
+			assert.equal(payload.success, true, payload.results[0]?.error);
+			assert.equal(payload.results[0]?.output, "after continuation");
 		});
 	});
 

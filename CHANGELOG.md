@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.66.0+sid.1]
+
+### Fork changes
+- Sync upstream `main` through `56f247ac` (`0.66.0` plus current unreleased fixes), including Pi 0.85.1-compatible background peer alias selection.
+- Retain per-child JJ workspace isolation, Workflow Scratch native-session mounts, delegation `sessionFile` projection, and the fork's conservative terminal-event handling.
+
 ## [0.65.1+sid.1]
 
 ### Fork changes
@@ -10,6 +16,82 @@
 - Replace obsolete CLI-launch scratch tests with native launch and workflow fan-in tests.
 
 ## [Unreleased]
+
+### Added
+- Add default-off, main-only watchdog questions and task-continuity reviews from bounded delivered orchestration evidence (#2010).
+- Add the built-in `evidence-auditor` for independently reviewing important research claims and source support. Thanks to [@Muskos](https://github.com/Muskos) for #2023.
+- Notify the parent as individual async workflow children finish, without waiting for all siblings (#2027). Each child completion delivers a compact notification with the workflow run ID, child key, exact child run ID, outcome, and output reference while the workflow remains running.
+
+### Changed
+- Forked children keep their requested thinking level after signed Anthropic thinking blocks are stripped from the inherited transcript; fork context no longer forces thinking off for Anthropic-backed children. Requires a Pi host on 0.85.0 or newer, which recovers from signed-thinking mismatches on the transport. Thanks to [@hank-warren](https://github.com/hank-warren) for #2021.
+- Simplify watchdog clarification to a visible question and native orchestrator continuation; remove the reply action, exchange tracking, deadlines and mandatory follow-up reviews.
+- Document task-derived behavior labels for workflow launches in the built-in pi-subagents skill, including reviews and retained follow-ups.
+
+### Fixed
+- Intersect agent frontmatter `tools:` with host-available builtins before spawning children, so hosts with restricted tool menus (e.g. Prime Agent's `ipython`-only set) reject unavailable tools at launch instead of after spawn. Thanks to [@BioInfo](https://github.com/BioInfo) for #2034.
+- Redirect `@earendil-works/pi-tui` via module hooks in background runners alongside `pi-server`, avoiding MODULE_NOT_FOUND in unusual installation layouts where the package exists in the alias map but cannot be found through standard node_modules resolution (#2020). Thanks to [@kroediger](https://github.com/kroediger).
+- Prevent stale final-drain timers from aborting resumed native foreground and background child work. Thanks to [@harche](https://github.com/harche) for #2025.
+- Avoid requiring chord aliases on pre-0.85 Pi hosts while keeping required host runtime aliases fail-closed (#2026). Thanks to [@samuela](https://github.com/samuela).
+- Invoke Worktrunk through `git wt` on Windows to avoid Windows Terminal's conflicting `wt.exe` alias. Thanks to [@Zethu5](https://github.com/Zethu5) for #2033.
+- Defer completion-only failures while background runs are paused, without waiving completion requirements. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #2022.
+- Show exact recorded async child IDs in workflow status and actionable child steering guidance when an owned workflow has no foreground route, without treating queued messages as consumed (#2011).
+- Bound transcript previews by individual line size and total rendered body size, preserving recent context and full artifact references. Thanks to [@rtbe](https://github.com/rtbe) for #2015.
+- Await a bounded, offline model registry refresh before opening `/subagents` model and thinking pickers, and warn on refresh failures. Thanks to [@ianbmacdonald](https://github.com/ianbmacdonald) for #2008.
+
+## [0.66.0] - 2026-09-06
+
+### Highlights
+- Background results and completion notifications arrive more reliably, including after storage problems.
+- Steering and supervisor replies reach the right run, with clearer guidance when a reply is needed first.
+- Read-only tasks can continue after a rate limit on a compatible fallback model without starting over.
+- Live progress, transcripts, and stable status displays make ongoing work easier to follow.
+- Custom agents can opt into discovery, and trusted extensions can provide named workflows.
+
+### Added
+- Let agents appear in the parent prompt with `advertise: true`. Thanks to [@nwalke](https://github.com/nwalke) for #1972.
+- Allow one read-only continuation after an HTTP 429 rate limit on a compatible fallback model from the same configured provider. Keep the session without replaying the task, within existing recovery, time, and budget limits (#1936). Thanks to [@peedrr](https://github.com/peedrr).
+- Add targeted source checks and clearer evidence, confidence, and uncertainty reporting to researcher responses (#1932). Thanks to [@Muskos](https://github.com/Muskos).
+- Let trusted extensions register session-scoped named workflows with validated arguments and permission to run specific host commands (#1907).
+- Add opt-in completion notification diagnostics with `NODE_DEBUG=pi-subagents-notify` (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest) for the report and diagnostic sessions.
+
+### Changed
+- Explain model-verification failures and how to configure exact `modelResponseAliases` (#1922). Thanks to [@sixtus](https://github.com/sixtus).
+- Clarify when startup fallback and read-only rate-limit continuation are supported (#1936). Thanks to [@peedrr](https://github.com/peedrr).
+- Document steering delivery modes and `scheduledRuns.storeRoot` (#1933). Thanks to [@G0-0000](https://github.com/G0-0000).
+- Remove generation suffixes from developer-facing types and helpers without changing request shapes, saved formats, or behavior (#1913).
+
+### Fixed
+- Deliver background results and completion notices reliably after early failures, delayed publication, or storage-capacity recovery. Save results before reporting successful completion, without adding idle polling (#1981). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Keep completion requirements intact when child sessions compact their context (#1996). Thanks to [@Zsbyqx20](https://github.com/Zsbyqx20).
+- Correct supervisor action names and reply and steering guidance. Thanks to [@rtbe](https://github.com/rtbe) for #2002.
+- Require an explicit answer to a pending supervisor question before steering or following up on a single background run; include the request ID in the response (#1980). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Detect supervisor questions when background or scheduled workflows start, including after earlier work finishes, while keeping macOS idle polling disabled (#1977). Thanks to [@brandonmwest](https://github.com/brandonmwest) and [@youlikemodernart](https://github.com/youlikemodernart) for #1220 and #1228.
+- Queue steering for workflows owned by another runtime without incorrectly claiming delivery or taking over the run (#1978). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Find supervisor questions without a UI, keep notification failures from interrupting discovery, and require explicit answers (#1975, #1982). Thanks to [@brandonmwest](https://github.com/brandonmwest).
+- Deliver background workflow steering to the intended child and report requests that cannot be delivered before shutdown (#1976, #1983). Thanks to [@brandonmwest](https://github.com/brandonmwest) for the diagnosis, reproduction, implementation, and tests.
+- Leave the prompt runtime inactive when it is not configured. Thanks to [@lertian](https://github.com/lertian) for #1973.
+- Return `invalid_state` instead of queuing stop requests that cannot reach a live workflow (#1965).
+- Retain unreadable stop requests for retry, reject invalid workflow arguments even when validation returns an empty error message, and preserve worktree timeout details.
+- Show live tool activity, timing, model, effort, and counters for foreground workflow children without forwarding full transcripts (#1964).
+- Allow `action: "status", view: "transcript"` to inspect live foreground child output on demand (#1963).
+- Keep the background status widget in place during progress updates (#1931). Thanks to [@DraconDev](https://github.com/DraconDev).
+- Recognize `REQUEST_LIMIT_EXCEEDED` rate limits and avoid excluding healthy models because of invalid requests or context overflow (#1955, #1957). Thanks to [@slyons-vamp](https://github.com/slyons-vamp).
+- Wait for resumed workflow results to be saved before reporting them missing on Windows (#1906).
+- Send foreground workflow progress to RPC, headless, and cross-repository hosts even when the live chat card is off (#1951). Thanks to [@yanqianglu](https://github.com/yanqianglu).
+- Resolve undici from the official npm registry for npm 12 compatibility (#1935). Thanks to [@chem](https://github.com/chem).
+- Fix background launches on stable Pi 0.85.1 without experimental packages, while retaining Pi 0.85.0 support (#1944). Thanks to [@geril07](https://github.com/geril07).
+- Include the saved workflow receipt path in wait results, notifications, and status and debug responses (#1938).
+- Show structured output in completion notices when text is blank or contains only a closing think-tag (#1945). Thanks to [@npfedwards](https://github.com/npfedwards).
+- Validate workflow `baseRef` values before execution and clarify supported refs (#1934, #1937). Thanks to [@jeanduplessis](https://github.com/jeanduplessis).
+- Make boolean tool options compatible with restricted Gemini schema converters without changing which values are accepted (#1950). Thanks to [@Biaogo94](https://github.com/Biaogo94).
+- Keep Fleet runs in start-time order instead of reshuffling them as activity changes (#1923, #1924). Thanks to [@expoli](https://github.com/expoli).
+- Preserve links to previous runs when continuing a workflow by its string ID (#1920).
+- Clear recovered errors after successful tool use or structured output (#1919). Thanks to [@Jonathanm10](https://github.com/Jonathanm10).
+- Report empty final responses as empty-output failures instead of blaming earlier tool errors (#1921).
+- Avoid missing-edit failures for successful read-only background tasks misclassified as implementation work (#1911). Thanks to [@yanqianglu](https://github.com/yanqianglu).
+- Batch background streaming updates while showing child activity changes immediately (#1901).
+- Honor new output paths on workflow follow-ups without overwriting the original report (#1903).
+- Keep worktree setup responsive and cancellable, and preserve uncertain allocations for manual inspection (#1902).
 
 ## [0.65.1] - 2026-09-04
 
