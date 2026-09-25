@@ -16,10 +16,17 @@ function fileBarrier(file: string): Promise<void> {
 	return new Promise((resolve, reject) => {
 		// libuv on Windows compares long event paths against this watch path; expand TEMP's 8.3 aliases.
 		const watcher = fs.watch(fs.realpathSync.native(path.dirname(file)), check);
-		const deadline = setTimeout(() => { watcher.close(); reject(new Error(`Missing barrier: ${file}`)); }, 15_000);
+		// Filesystem watch notifications can be lost under parallel test load.
+		const poll = setInterval(check, 25);
+		const deadline = setTimeout(() => {
+			clearInterval(poll);
+			watcher.close();
+			reject(new Error(`Missing barrier: ${file}`));
+		}, 15_000);
 		function check() {
 			if (!fs.existsSync(file)) return;
 			clearTimeout(deadline);
+			clearInterval(poll);
 			watcher.close();
 			resolve();
 		}
