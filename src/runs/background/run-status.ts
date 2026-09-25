@@ -16,6 +16,7 @@ import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts
 import { normalizeExternalCliRunnerStatus } from "../shared/external-cli-contract.ts";
 import { resolveSubagentResultStatus } from "../../intercom/result-intercom.ts";
 import { readProcessTerminal, sanitizeProcessTerminal } from "./process-terminal.ts";
+import { readWorkflowTerminalProof } from "./workflow-terminal-proof.ts";
 import { formatWaitSubscriptions } from "./wait-subscriptions.ts";
 import { resolveAsyncRunLocation } from "./async-resume.ts";
 import { resolveSubagentRunId } from "./run-id-resolver.ts";
@@ -570,6 +571,12 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 
 			const workflowReturnPreview = status.workflow?.value !== undefined ? formatWorkflowJsonPreview(status.workflow.value, 240) : undefined;
 			const workflowEmitPreview = status.workflow?.emits.length ? formatWorkflowJsonPreview(status.workflow.emits.at(-1), 240) : undefined;
+			const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
+			if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
+			const workflowTerminalProof = workflowChildren
+				? readWorkflowTerminalProof(asyncDir, status.steps, workflowChildren, validHostStepNodes(status.workflowGraph).length, status.endedAt ?? status.lastUpdate ?? status.startedAt)
+				: undefined;
+			const workflowChildrenByKey = new Map(workflowChildren?.children.map((child) => [child.childId, child]));
 			const lines = [
 				`Run: ${status.runId}`,
 				status.toolCallId ? `Tool call: ${status.toolCallId}` : undefined,
@@ -615,7 +622,8 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			let hasExternalJobFollowUpHint = false;
 			for (const [index, step] of (status.steps ?? []).entries()) {
 				const stepActivityText = step.status === "running" ? formatActivityLabel(step.lastActivityAt, step.activityState) : undefined;
-				const modelThinking = formatModelThinking(step.model, step.thinking);
+				const workflowChild = step.workflowKey ? workflowChildrenByKey.get(step.workflowKey) : undefined;
+				const modelThinking = formatModelThinking(step.model ?? workflowChild?.model, step.thinking ?? workflowChild?.thinking);
 				const modelText = modelThinking ? ` (${modelThinking})` : "";
 				const steeringText = formatSteeringSummary(step);
 				const steeringSuffix = steeringText ? `, steering: ${steeringText}` : "";
@@ -705,9 +713,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			if (fs.existsSync(logPath)) lines.push(`Log: ${logPath}`);
 			if (fs.existsSync(eventsPath)) lines.push(`Events: ${eventsPath}`);
 
-			const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
-			if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [], ...(status.workflowReceiptPath ? { workflowReceiptPath: status.workflowReceiptPath } : {}), ...(status.preflight ? { preflight: status.preflight } : {}), ...(status.workflow?.preflightWarnings?.length ? { preflightWarnings: status.workflow.preflightWarnings } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(workflowTerminalProof ? { workflowTerminalProof } : {}), ...(runFanoutBudget ? { runFanoutBudget } : {}), ...(processTerminal ? { lifecycleStatus: { processTerminal } } : {}) } };
 		}
 	}
 

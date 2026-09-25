@@ -67,6 +67,10 @@ describe("watchdog settings", () => {
 		assert.equal(resolveWatchdogConfig(tempProject, { session: { children: { clarification: true } } }).ok, false);
 	});
 
+	it("rejects removed fallbackModels settings", () => {
+		assert.equal(resolveWatchdogConfig(tempProject, { session: { main: { fallbackModels: ["model/a"] } } }).ok, false);
+	});
+
 	it("lets root enabled opt the main watchdog in while children stay default-off", () => {
 		writeJson(userSettingsPath(), {
 			subagents: {

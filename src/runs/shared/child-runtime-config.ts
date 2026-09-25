@@ -1,4 +1,4 @@
-import type { JsonSchemaObject, ResolvedToolBudget, RunFanoutBudgetDescriptor } from "../../shared/types.ts";
+import type { JsonSchemaObject, ResolvedToolBudget, RunFanoutBudgetDescriptor, SubagentState } from "../../shared/types.ts";
 import type { ThinkingLevel } from "../../shared/model-info.ts";
 import type { NestedPathEntry } from "./nested-path.ts";
 import type { PermissionRules } from "./permissions.ts";
@@ -6,6 +6,7 @@ import type { ChildWatchdogConfig, ChildWatchdogStatusEvent } from "../../watchd
 import type { ResolvedWaitToolConfig } from "../background/wait-config.ts";
 import type { ChildToolDiagnostic } from "./tool-availability.ts";
 import type { ResolvedSubagentCapabilityCeiling } from "./capability-ceiling.ts";
+import type { RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 /**
  * Set in processes that host child sessions (the async runner). The extension
@@ -38,6 +39,8 @@ export interface ChildPermissions {
 export interface ChildStructuredOutput {
 	schema: JsonSchemaObject;
 	acceptanceReport?: "optional" | "required";
+	/** Authoritative child-local state set only after validated capture succeeds. */
+	terminalState?: { captured: boolean };
 	/** Receives the validated value; `acceptanceReport` is undefined when the child omitted it. */
 	capture: (value: unknown, acceptanceReport: unknown | undefined) => void;
 }
@@ -57,6 +60,7 @@ export interface ChildSupervisorMetadata {
  * that hosts the child session builds it and passes it to the hooks directly.
  */
 export interface ChildRuntimeConfig {
+	cwd?: string;
 	runId?: string;
 	agent?: string;
 	childIndex?: number;
@@ -75,6 +79,8 @@ export interface ChildRuntimeConfig {
 	depth: number;
 	maxDepth?: number;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Immutable root-parent host policy propagated to nested native launches. */
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	thinkingCeiling?: ThinkingLevel;
 	inheritProjectContext?: boolean;
 	inheritGlobalContext?: boolean;
@@ -86,6 +92,10 @@ export interface ChildRuntimeConfig {
 	/** Receives child watchdog status events. */
 	watchdogStatus?: (event: ChildWatchdogStatusEvent) => void;
 	waitTool: ResolvedWaitToolConfig;
+	runtimeState?: SubagentState;
+	holdFinalDrain?: (held: boolean) => void;
+	/** Installation-local downward owner-channel barrier; never inherited or serialized into descendants. */
+	hasPendingSupervisorRequest?: () => boolean;
 	structuredOutput?: ChildStructuredOutput;
 	requiredTools?: string[];
 	mcpDirectTools?: string[];

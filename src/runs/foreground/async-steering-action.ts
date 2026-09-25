@@ -3,12 +3,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import type { AsyncStatus, Details, SubagentState, ToolBudgetConfig } from "../../shared/types.ts";
+import type { AsyncStatus, Details, SteerActionResult, SubagentState, ToolBudgetConfig } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { deliverInterruptRequest, queueRevivalBrief, requestAsyncSteer, type SteerDeliveryMode, type SteerRequest } from "../background/control-channel.ts";
 import { resolveAsyncResumeTarget } from "../background/async-resume.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
 import { actionResultFromSteeringStatus, claimSteeringRecovery, createSteeringStatus, recordSteeringRequest, remainingSteeringRecoveryLimits, steeringReceipt, updateSteeringTarget, waitForSteeringAction } from "../background/steering.ts";
+
+function steerTargetsAccepted(result: Pick<SteerActionResult, "targets"> | undefined): boolean {
+	const targets = result?.targets ?? [];
+	return targets.length > 0 && targets.every((target) => target.state === "queued" || target.state === "delivered");
+}
 
 export function canQueueRetainedAsyncFollowUp(status: AsyncStatus, index?: number): boolean {
 	const steps = status.steps ?? [];
@@ -170,9 +175,11 @@ export async function steerAsyncRun(input: {
 	}
 	const finalStatus = readStatus(asyncDir);
 	const finalResult = finalStatus?.steering ? actionResultFromSteeringStatus(finalStatus.steering, status.runId, requestId) : undefined;
-	if (finalResult?.state === "delivered") {
-		return { content: [{ type: "text", text: steeringReceipt(input.message, `Steering delivered for async run ${status.runId} (request ${requestId}).`) }], details: { mode: "management", results: [], steering: finalResult } };
-	}
+	const acceptedReply = (accepted: SteerActionResult): AgentToolResult<Details> => {
+		const acceptedState = accepted.state === "delivered" ? "delivered" : "queued";
+		return { content: [{ type: "text", text: steeringReceipt(input.message, `Steering ${acceptedState} for async run ${status.runId} (request ${requestId}).`) }], details: { mode: "management", results: [], steering: accepted } };
+	};
+	if (finalResult && steerTargetsAccepted(finalResult)) return acceptedReply(finalResult);
 	const running = (finalStatus?.steps ?? status.steps ?? []).filter((step) => step.status === "running");
 	const recoveryAllowed = (input.mode ?? "steer") === "steer" && status.mode === "single" && status.isNested !== true && running.length === 1 && Boolean(finalStatus?.steering) && (input.index === undefined || input.index === 0);
 	if (recoveryAllowed && finalResult?.state !== "scheduled" && input.recover) {
@@ -186,17 +193,21 @@ export async function steerAsyncRun(input: {
 		try {
 			const latest = readStatus(asyncDir);
 			const latestResult = latest?.steering ? actionResultFromSteeringStatus(latest.steering, status.runId, requestId) : undefined;
-			if (latestResult?.state === "delivered") return { content: [{ type: "text", text: steeringReceipt(input.message, `Steering delivered for async run ${status.runId} (request ${requestId}).`) }], details: { mode: "management", results: [], steering: latestResult } };
+			if (latestResult && steerTargetsAccepted(latestResult)) return acceptedReply(latestResult);
 			const committedAt = Date.now();
 			input.onBeforeRecoveryClaim?.(requestId, committedAt);
 			const { claimPath, markerPath } = claimSteeringRecovery(asyncDir, { requestId, sourceRunId: status.runId, committedAt });
 			input.onRecoveryCommitted?.(requestId, committedAt);
 			const preCommitStatus = readStatus(asyncDir);
 			const preCommitResult = preCommitStatus?.steering ? actionResultFromSteeringStatus(preCommitStatus.steering, status.runId, requestId) : undefined;
-			if (preCommitResult?.state === "delivered" && preCommitResult.targets.every((target) => target.deliveredAt !== undefined && target.deliveredAt <= committedAt)) {
+			if (
+				preCommitResult
+				&& preCommitResult.targets.length > 0
+				&& preCommitResult.targets.every((target) => target.state === "queued" || (target.deliveredAt !== undefined && target.deliveredAt <= committedAt))
+			) {
 				fs.rmSync(markerPath, { force: true });
 				fs.rmSync(claimPath, { force: true });
-				return { content: [{ type: "text", text: steeringReceipt(input.message, `Steering delivered for async run ${status.runId} (request ${requestId}).`) }], details: { mode: "management", results: [], steering: preCommitResult } };
+				return acceptedReply(preCommitResult);
 			}
 			try {
 				deliverInterruptRequest({ asyncDir, source: "steering-recovery" });

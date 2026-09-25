@@ -2,11 +2,11 @@
 
 > **仓库：** `sidkang/subagents`
 >
-> **Fork version:** `0.65.1+sid.1`
+> **Fork version:** `0.71.0+sid.1`
 >
-> **Upstream version:** `0.65.1`
+> **Upstream version:** `0.71.0`（含截至 `2e9c51ba` 的 main 提交）
 >
-> **Upstream base:** `83be9c3de2cde1553c0269f383efc1eb1194dc8b`
+> **Upstream base:** `2e9c51ba`
 >
 > **验证：** [`fork-validation.md`](./fork-validation.md)
 
@@ -149,7 +149,7 @@ M2 只包裹现有 `launch`。上游已删除 `patchMissionObjective`；不得�
 
 - 只吞 Pi 的 stale-extension-context error；其他 emit error 继续抛。
 - 不把旧 session 事件转给 replacement context；磁盘 proof 是权威记录。
-- 0.65.1 上游使用宽匹配并只记录其他错误；fork 保留 Pi 明确错误前缀匹配及其他错误传播。上游语义等价时删除此差异，不叠第二层。
+- fork 保留 Pi 明确错误前缀匹配及其他错误传播。上游语义等价时删除此差异，不叠第二层。
 
 ## 5. 非目标
 

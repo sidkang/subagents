@@ -2,11 +2,11 @@
 
 `pi-subagents` reads optional JSON config from `~/.pi/agent/extensions/subagent/config.json`. This page lists every key, plus the environment variables and the settings-file keys that affect config resolution.
 
-Settings-level keys (`subagents.defaultModel`, `defaultProvider`, `defaultThinking`, `defaultExtensions`, `agentOverrides`, `agentScanDirs`, `modelScope`, `disableThinking`, `disableBuiltins`, watchdog settings) live in Pi settings files, not this config file. `modelScope.agents.<name>` adds per-agent restrictions, and `allow: ["inherit"]` permits the current parent model. See [models.md](models.md), [agents.md](agents.md), and [watchdog.md](watchdog.md).
+Settings-level keys (`subagents.defaultModel`, `defaultProvider`, `defaultThinking`, `defaultExtensions`, `defaultSubagentOnlyExtensions`, `agentOverrides`, `machines`, `agentScanDirs`, `agentExcludeDirs`, `modelScope`, `disableThinking`, `disableBuiltins`, watchdog settings) live in Pi settings files, not this config file. `modelScope.agents.<name>` adds per-agent restrictions, and `allow: ["inherit"]` permits the current parent model. See [models.md](models.md), [agents.md](agents.md), and [watchdog.md](watchdog.md).
 
 ## Project root resolution (settings)
 
-By default, project settings resolve from the nearest parent directory that contains `.pi` or `.agents`, preserving existing nested-project behavior. In monorepos or git worktrees where an incidental nested `.pi` directory should not shadow the repository-level config, set this in the repository root `.pi/settings.json`:
+By default, project settings resolve from the nearest parent directory that contains `.pi` or `.agents`, preserving existing nested-project behavior. Discovery stops at the user home directory, including when the home is reached through a filesystem alias such as a symlink or Windows junction, so home-level `.pi` and `.agents` remain user configuration rather than project configuration. In monorepos or git worktrees where an incidental nested `.pi` directory should not shadow the repository-level config, set this in the repository root `.pi/settings.json`:
 
 ```json
 {
@@ -32,6 +32,22 @@ Add recursive user or project agent roots with `subagents.agentScanDirs` in Pi s
 
 Entries support `~` expansion. A single `*` path segment expands one directory level, so package-like folders can each expose an `agents/` directory. Missing directories are ignored. Fixed user/project agent directories still win over same-name agents from scan roots.
 
+## Excluded agent directories (settings)
+
+Prune directory subtrees from recursive agent-definition discovery with `subagents.agentExcludeDirs`:
+
+```json
+{
+  "subagents": {
+    "agentExcludeDirs": ["~/.agents/plugins", "../.agents/plugins"]
+  }
+}
+```
+
+Entries are literal directory paths (no globs), supporting `~` and absolute paths. Relative paths resolve from the directory containing their settings file: the user agent config directory for user settings, or the project config directory (normally `.pi/`) for project settings. Thus `../.agents/plugins` in project `.pi/settings.json` excludes the project's legacy plugin subtree without excluding ordinary `.agents/*.md` agents.
+
+User and nearest-project exclusions are combined for every discovery scope, including all-source diagnostics. They apply before traversal and definition reads; explicit scan roots, environment roots, and installed packages cannot re-include an excluded tree. Normalized and real-path containment also excludes symlink aliases without matching sibling directory prefixes. Settings changes invalidate cached discovery. Excluded agent trees are not fingerprinted; chain discovery keeps its own unchanged watches when it shares a directory. Skills, chains, and the extension's bundled builtin snapshot are outside this setting's scope.
+
 ## `modelResponseAliases`
 
 In `~/.pi/agent/extensions/subagent/config.json` (top-level, not under `subagents`):
@@ -44,9 +60,9 @@ In `~/.pi/agent/extensions/subagent/config.json` (top-level, not under `subagent
 }
 ```
 
-Optionally accept exact response model IDs for an exact provider-qualified launch candidate. Keys use the resolved `provider/model` ID without its thinking suffix, including for fallback attempts; values are arrays of non-empty response ID strings. Alias matching is exact and case-sensitive, with no fuzzy or suffix matching. Empty arrays add no accepted IDs; malformed declarations fail config loading.
+Optionally accept exact response model IDs for an exact provider-qualified launch. Keys use the resolved `provider/model` ID without its thinking suffix; values are arrays of non-empty response ID strings. Alias matching is exact and case-sensitive, with no fuzzy or suffix matching. Empty arrays add no accepted IDs; malformed declarations fail config loading.
 
-This is your explicit assertion that the declared response IDs identify the requested model, not proof from model output. It does not rewrite the outgoing model or provider route, authorize fallback models, or bypass verification for other routes. Foreground and background runs capture this declaration for launch and retain it on revival, including when no aliases were declared. Changing config affects new independent runs, not the retained declaration. Without a matching declaration, existing strict verification remains unchanged.
+This is your explicit assertion that the declared response IDs identify the requested model, not proof from model output. It does not rewrite the outgoing model or provider route, or bypass verification for other routes. Foreground and background runs capture this declaration for launch and retain it on revival, including when no aliases were declared. Changing config affects new independent runs, not the retained declaration. Without a matching declaration, existing strict verification remains unchanged.
 
 For a native Pi `model_verification_failed` where your proxy accepts `claude-haiku-4-5` but reports `anthropic.claude-haiku-4-5-20251001-v1:0`, independently confirm your proxy's mapping, then configure:
 
@@ -60,17 +76,11 @@ For a native Pi `model_verification_failed` where your proxy accepts `claude-hai
 
 Replace `YOUR_PROVIDER` with the resolved Pi provider ID. Keep the outgoing model alias unchanged. This native remedy already exists in v0.65.1; it does not infer equivalence from provider prefixes or dates. The built-in external `claude-code` adapter does not invoke this verifier or use this setting. If an external run shows this diagnostic, identify the installed version, resolved runner kind/adapter, and error location before applying a native remedy. Thanks to [sixtus](https://github.com/sixtus) for the concrete request-ID/response-ID example in [#1922](https://github.com/nicobailon/pi-subagents/issues/1922).
 
-## `modelExclusions`
+## Tool activation lifecycle
 
-```json
-{
-  "modelExclusions": {
-    "defaultTtlMs": 300000
-  }
-}
-```
+On Pi 0.86.1 or newer, a fresh unrestricted parent starts with `subagents_enable`, `bg_wait`, and `subagent_supervisor` active while `subagent` stays registered but inactive. Calling `subagents_enable({})` preserves unrelated active tools and exposes `subagent` on the next model request. It does not launch a child or infer authority from prompt keywords.
 
-Controls the duration, in milliseconds, for model exclusions. The default is `86400000` (24 hours), and the maximum is `8000000000000000` so generated expiry timestamps remain valid JavaScript dates. The extension applies this value when it starts or reloads. A lower configured value shortens active cached exclusions from their original `recordedAt`; it never extends an existing expiry. Authentication-related exclusions are ignored when Pi's `auth.json` was modified after the exclusion was recorded; other exclusion types are unaffected. Launches also warn when a candidate is skipped, including the cached reason and expiry. `PI_MODEL_EXCLUSIONS_PATH` changes the exclusion-store path but does not change this TTL.
+The recorded native `subagent` selection is restored on resume, reload, and tree navigation, so an activated session stays activated and a cold session stays cold. Older history without tool-selection records keeps eager `subagent` availability. If Pi's allowlist or exclusions remove the loader, the extension does not hide `subagent`; if they remove `subagent`, the loader reports it unavailable. Hosts older than the verified dynamic-tool baseline keep eager behavior and log one compatibility warning.
 
 ## `toolDescriptionMode`
 
@@ -78,7 +88,7 @@ Controls the duration, in milliseconds, for model exclusions. The default is `86
 { "toolDescriptionMode": "compact" }
 ```
 
-Controls the parent-facing `subagent` tool description registered at startup. The default registers split prompt metadata: a short tool description plus `promptSnippet` and `promptGuidelines`. Set `"full"` to register the complete description as one tool description, or `"compact"` to keep the execution modes, async/`bg_wait` guidance, child-safety boundary, management/action split, one-writer review guidance, and artifact/status essentials with less prompt bloat.
+Controls the parent-facing `subagent` tool description registered at startup. The default registers the compact execution/safety description plus separate `promptSnippet` and `promptGuidelines`. That metadata explains use after operator-authorized delegation; it does not route ordinary work to children or independently authorize delegation. Explicit `"compact"` uses the same description without that extra metadata; `"full"` adds workflow and management detail, also without split metadata. All modes retain the same flat parameter schema. Extended examples and recipes are available on demand through `action:"guide"` and the bundled pi-subagents skill; full mode is not an exhaustive manual. Count the separate default metadata as well as the tool definition when comparing prompt footprints.
 
 `custom` reads `subagent-tool-description.md` from the project config directory, then from `~/.pi/agent/subagent-tool-description.md`. Missing, empty, unreadable, or oversized custom files fall back to the full description. Custom templates may use `{{fullDescription}}`, `{{compactDescription}}`, `{{safetyGuidance}}`, `{{agentDir}}`, and `{{projectConfigDir}}`; the safety guidance is always present so custom prose cannot remove the runtime guardrails. Restart Pi after changing the mode or custom file.
 
@@ -261,7 +271,9 @@ Forces depth-0 internal single, parallel, and chain runs into background mode an
 { "timeoutMs": 3600000 }
 ```
 
-Global default runtime deadline, in milliseconds, for subagent runs. It replaces the built-in 30-minute backstop for foreground launches (single, parallel, chain, and workflowScript) and plain single-agent async runs whenever no call-level `timeoutMs`/`maxRuntimeMs` applies. For single-agent launches, selected agent frontmatter `timeoutMs` still wins. This only moves the *default*. Expiring this run-level deadline is terminal and does not trigger `fallbackModels`; only provider/model failures reported before the deadline can fall back.
+Global default runtime deadline, in milliseconds, for subagent runs. It replaces the built-in 30-minute backstop for foreground launches (single, parallel, chain, and workflowScript) and plain single-agent async runs whenever no call-level `timeoutMs`/`maxRuntimeMs` applies. For single-agent launches, selected agent frontmatter `timeoutMs` still wins. This only moves the *default*. Expiring this run-level deadline is terminal.
+
+This deadline bounds the whole run. The wait for a single model response is bounded separately by Pi's `httpIdleTimeoutMs` setting (default 300000; `0` disables it), which Pi applies both as the SDK request timeout and as the undici header/body idle timeout. Detached async runners read the same setting from `~/.pi/agent/settings.json` and the project `.pi/settings.json` for their own HTTP dispatcher, so a local model that queues or prefills for longer than five minutes needs `httpIdleTimeoutMs` raised or disabled in Pi settings, plus a `timeoutMs` long enough for the run.
 
 Use it when foreground orchestration or plain async single-agent runs need a longer default than 30 minutes. It does not set async composite top-level deadlines, and it does not replace async fan-out child deadlines.
 
@@ -278,6 +290,16 @@ Optional hard per-tool-call deadline in milliseconds. When configured, a child t
 Without a configured value, Pi still applies a five-minute hard timeout to known-fast built-in tools: `read`, `grep`, `find`, `ls`, `edit`, `write`, and `structured_output`. Long-running tools such as `bash`, custom tools, and MCP tools do not get a hard default. They get the normal open-tool attention notice after `activeNoticeAfterMs` and remain bounded by the run-level deadline.
 
 The tool timer tracks each active `toolCallId` separately and never extends the run-level deadline: when the remaining run budget is shorter, the ordinary run-level timeout wins. `contact_supervisor`, `intercom`, and `bg_wait` are exempt because their legitimate purpose can be to wait for a human, supervisor, or background run. Use hard tool timeouts only for wedge protection; an elapsed timeout is not a mutation-safe boundary. Configured values must be positive integers no greater than `2147483647`; invalid or out-of-range values are rejected with a visible error rather than silently ignored.
+
+## `checkpointBeforeDeadlineMs`
+
+```json
+{ "checkpointBeforeDeadlineMs": 300000 }
+```
+
+Global default for the async single-agent `checkpointBeforeDeadlineMs` launch option. When an async single-agent run has a run-level deadline, the runner issues a best-effort "checkpoint and stop" steer to the child this many milliseconds before that deadline: finish the current tool call, report changed files, build/test state, remaining work, and commit/PR state, and start no new work. The steer uses the normal steering lifecycle at the child's next tool boundary, so its receipt (requested, routed, delivered) is visible in run status and events, and the ordinary `timeoutMs` kill still applies if the child does not stop.
+
+An explicit `subagent` call value wins over this default. Choose a value at least as long as the child's longest expected tool call; a steer cannot land inside one. When the deadline leaves less than one second of run time before the checkpoint, the checkpoint is disarmed and the run behaves as if the option were absent. The global config value must be a positive integer no greater than `2147483647`; invalid values fail config loading rather than silently disabling the checkpoint.
 
 ## `globalConcurrencyLimit`
 
@@ -309,7 +331,7 @@ Caps cumulative logical child admissions in one top-level run tree. The default 
 
 Inline or file-backed top-level workflow calls may set a positive safe-integer `maxSubagentSpawnsPerRun`; it overrides the environment and config for that workflow. Inherited nested budgets remain authoritative, and the override is not forwarded to child calls.
 
-The budget counts single launches, expanded `tasks`/`count`, static chain steps and parallel groups, actual dynamic `expand` items, appended chain steps, workflow children, and nested child calls. Static and materialized dynamic groups are admitted atomically. Startup retries, model fallback, and retained-child resume reuse the original logical child claim. Claims are never released or refunded. This cap is independent from the session-wide cumulative spawn budget and `globalConcurrencyLimit`.
+The budget counts single launches, expanded `tasks`/`count`, static chain steps and parallel groups, actual dynamic `expand` items, appended chain steps, workflow children, and nested child calls. Static and materialized dynamic groups are admitted atomically. Retained-child resume reuses the original logical child claim. Claims are never released or refunded. This cap is independent from the session-wide cumulative spawn budget and `globalConcurrencyLimit`.
 
 ## `maxActiveAsyncRunsPerSession`
 
@@ -384,7 +406,7 @@ Routes relative `output` paths for single-agent `/run` calls under this director
 { "maxSubagentDepth": 1 }
 ```
 
-Controls nested delegation when no stricter limit is inherited from the launching child's runtime config. Per-agent `maxSubagentDepth` can tighten the limit for that agent's child runs, but cannot relax an inherited stricter limit. This applies even to children that explicitly declare `tools: subagent` or `allowNestedSubagents: true`; at the cap, execution fanout is blocked instead of silently hiding nested work.
+Controls nested delegation when no stricter limit is inherited from the launching child's runtime config. The default is 2 when neither the runtime limit, `PI_SUBAGENT_MAX_DEPTH`, nor this setting supplies a limit. Per-agent `maxSubagentDepth` can tighten the limit for that agent's child runs, but cannot relax an inherited stricter limit. This applies even to children that explicitly declare `tools: subagent` or `allowNestedSubagents: true`; at the cap, execution fanout is blocked instead of silently hiding nested work.
 
 ## `PI_SUBAGENT_PI_BINARY`
 
@@ -392,7 +414,27 @@ Controls nested delegation when no stricter limit is inherited from the launchin
 export PI_SUBAGENT_PI_BINARY=/path/to/pi-or-wrapper
 ```
 
-Overrides the `pi` command pi-subagents spawns for Herdr project panes (`action: "project.open"`) and for the profile model probe. Package wrappers can set this to their own `pi` binary so those launches inherit wrapper flags, environment setup, and bundled resources without relying on `PATH` ordering. Empty or whitespace-only values are ignored. It does not affect children: foreground children are sessions inside the parent Pi process and background children are sessions inside the detached runner process, and neither spawns a `pi` binary. Background children require pi installed as the npm package (`@earendil-works/pi-coding-agent`), because the runner imports pi's packages from that package directory; a standalone pi binary has no package directory, and background launches fail with an error saying so.
+Overrides the `pi` command pi-subagents spawns for project panes and the profile model probe. On a supported Bun-compiled Pi host it also selects the detached background host executable. That executable must accept Pi's bootstrap arguments and supply its compatible embedded SDK and adjacent release resources; bare Bun is not a substitute. Empty or whitespace-only values are ignored. Failed launches are not retried with another runtime.
+
+Foreground children remain sessions inside the parent. Npm background children retain their Node runner and host-package peer aliases; this variable does not turn npm Pi into a binary-backed runner. See [Standalone background execution](standalone-background.md) for the official tested target.
+
+## `PI_PACKAGE_DIR`
+
+```bash
+export PI_PACKAGE_DIR=/path/to/pi-coding-agent-package
+```
+
+Pi's own package/assets root is also authoritative when pi-subagents verifies the running host for dynamic tool activation. Host discovery prefers a package root owned by the real `process.argv[1]`, then a nonblank `PI_PACKAGE_DIR`, then `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`. For a proven Bun-compiled Pi process with a virtual argv entry, it can finally validate package assets adjacent to the canonical executable or in the installed `<prefix>/share/pi-coding-agent` layout. Every selected root must contain a `package.json` whose name is exactly `@earendil-works/pi-coding-agent`; an invalid explicit root fails closed rather than selecting another installation. Empty or whitespace-only values are ignored.
+
+## `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`
+
+```bash
+export PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT=/path/to/pi-coding-agent-package
+```
+
+Overrides host-package discovery for spawned children. Foreground CLI resolution uses this root to locate the `pi` CLI script, and the detached background runner uses it for jiti host resolution and peer-package aliases, so both child kinds agree on one host. For running-host activation verification it follows argv ownership and Pi's own `PI_PACKAGE_DIR`, and precedes inferred Bun image layouts. The value must be the root of a canonical `@earendil-works/pi-coding-agent` installation (the directory containing its `package.json`, with that package name); both child kinds still validate the package name and its peer packages from that install tree, so a package whose manifest carries a different name is rejected even with the override set. Empty or whitespace-only values are ignored.
+
+The default in-process child session loader consults the same discovery. Before falling back to a bare `@earendil-works/pi-coding-agent` import, it resolves the host package root (the running pi process's location, then this override, then pi-subagents' own install tree as a last fallback) and imports the host's entry file directly, so children share the host's single SDK instance instead of a second copy. Roots whose `package.json` name is not `@earendil-works/pi-coding-agent` are rejected. When this override is selected, an unimportable root is reported instead of falling back to a bare import from a different tree.
 
 ## `intercomBridge`
 
@@ -411,7 +453,7 @@ Controls whether subagents receive runtime coordination instructions and whether
 Fields:
 
 - `mode`: default `always`; use `fork-only` to inject only for forked runs, or `off` to disable the bridge.
-- `instructionFile`: optional Markdown template replacing the default bridge instructions. `{orchestratorTarget}` is interpolated. Relative paths resolve from `~/.pi/agent/extensions/subagent/`.
+- `instructionFile`: optional Markdown template replacing the default bridge instructions. `{orchestratorTarget}` is interpolated with the parent session target. Relative paths resolve from `~/.pi/agent/extensions/subagent/`. The default template does not name the session, because `contact_supervisor` resolves it from the child runtime config; a template that does name it ties `launchContractDigest` to the parent session, and launch-contract preflight then needs `orchestratorTarget` to match.
 - `resultDelivery`: default `false`; set `true` only when an external listener consumes `subagent:result-intercom` and acknowledges the grouped completion payload. This is optional external result delivery, not native supervisor messaging. Enabled delivery waits for acknowledgement and reports acknowledgement failures. It does not change supervisor asks or progress updates.
 
 Bridge activation requires a targetable current parent session id, which `pi-subagents` passes to children automatically. Native supervisor messaging does not require an external `pi-intercom` installation or per-agent extension allowlists: children use `contact_supervisor`, and parents use `subagent_supervisor` to inspect or reply. Agents can still use an external `intercom` tool when they explicitly request a provider that supplies it.
@@ -492,12 +534,16 @@ Automatic missions are enabled by default for ordinary launches with a task. Use
     "spawnBudgetGrant": "confirm",
     "scheduleCreate": "auto",
     "stopRun": "auto",
-    "steerRun": "auto"
+    "steerRun": "auto",
+    "inspectorOpen": "auto",
+    "projectOpen": "confirm"
   }
 }
 ```
 
 Each fixed action resolves to `"auto"`, `"confirm"`, or `"forbid"`. This is intentionally a small action map, not a generic policy language. Confirm-required control actions fail closed without an interactive UI.
+
+`inspectorOpen` and `projectOpen` cover the `inspector.open` and `project.open` tool actions, which launch an external inspector host or a Herdr project pane. `inspector.open` only reaches a plugin that reports itself available, so it defaults to `"auto"`; `project.open` runs `herdr` (or `HERDR_BIN`) with no such check and opens a pane that hosts its own Pi session, so it defaults to `"confirm"`. Set `"projectOpen": "auto"` to restore the previous unprompted behavior. The policy applies to the tool actions; opening an inspector from the fleet TUI is already an explicit operator keypress and is unaffected.
 
 ## `artifactDir`
 
@@ -542,6 +588,20 @@ Controls smart batching of async-completion notifications. When several backgrou
 ## `permissions`
 
 Native child tool permission rules. See [watchdog.md](watchdog.md#native-child-tool-permissions).
+
+## `PI_SUBAGENT_CACHE_RETENTION`
+
+Sets the prompt-cache retention tier for child sessions, overriding `PI_CACHE_RETENTION` for children only. Environment-only; there is no config key. Accepts the same values Pi accepts, normally `short` or `long`.
+
+Anthropic prices a cache write by the retention it is asked for: the 1h tier costs more per write than the 5m one. A parent that keeps a long-lived conversation earns that back by surviving idle gaps, but children are short-lived and rarely idle long enough to claim the longer window, so on a wide fanout the higher write price is paid without the benefit:
+
+```text
+PI_CACHE_RETENTION=long PI_SUBAGENT_CACHE_RETENTION=short
+```
+
+Unset by default, so children inherit the parent's retention and behaviour is unchanged unless you opt in. Both spawned children (through the launch environment) and in-process children (through the session's own stream function) honour it; the in-process path scopes the value per session rather than mutating `process.env`, so a child cannot change retention for a parent turn streaming at the same time.
+
+Provider-reported `cacheWrite1h` usage confirms which tier a request used: it matches `cacheWrite` on the 1h tier and is `0` on the short one.
 
 ## `PI_SUBAGENT_FS_RETRY_MAX_TOTAL_MS`
 

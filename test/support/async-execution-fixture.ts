@@ -14,10 +14,10 @@ import { channel } from "node:diagnostics_channel";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { asyncResultTimeoutEvidence } from "./async-result-timeout-evidence.ts";
 import { createEventBus, createMockPi, createTempDir, makeAgent, removeTempDir, resolveMockPiCallArgs, tryImport } from "./helpers.ts";
 import type { MockPi } from "./helpers.ts";
 import { CHILD_WATCHDOG_STATUS_EVENT } from "../../src/watchdog/child-status.ts";
-import { clearExclusions } from "../../src/runs/shared/model-exclusions.ts";
 
 interface LaunchResolvedExtensions {
 	version?: number;
@@ -72,7 +72,7 @@ interface AsyncResultPayload {
 	totalTokens?: { input: number; output: number; total: number };
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
 	usageBudget?: UsageBudgetState;
-	results: Array<{ agent?: string; sessionName?: string; launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions; output?: string; outputState?: "present" | "absent" | "unknown"; success?: boolean; error?: string; timedOut?: boolean; timeoutRecovery?: { changedFiles?: string[]; message?: string; warning?: string; recoveryNeeded?: boolean; reason?: string; reportStatus?: string }; stopped?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; thinking?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean; message?: string }; settlementDiagnostic?: { finalTextPresent?: boolean; mutation?: { expected?: boolean; attempted?: boolean; observed?: boolean }; requiredOutput?: { kind?: string; path?: string; missing?: boolean }; afterCompactionSettlement?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string; transcriptPath?: string }; outputSaveError?: string; metadataSaveError?: string; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
+	results: Array<{ agent?: string; sessionName?: string; launchContractDigest?: string; launchResolvedExtensions?: LaunchResolvedExtensions; runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions; output?: string; outputState?: "present" | "absent" | "unknown"; success?: boolean; error?: string; timedOut?: boolean; timeoutRecovery?: { changedFiles?: string[]; message?: string; warning?: string; recoveryNeeded?: boolean; reason?: string; reportStatus?: string }; stopped?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; thinking?: string; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; usage?: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number; turns: number }; structuredOutput?: unknown; agentContract?: { version: 1 }; execution?: { status?: string; success?: boolean; exitCode?: number }; effects?: { fileMutation?: { status?: string; attempted?: boolean }; settlementDiagnostic?: { finalTextPresent?: boolean; mutation?: { attempted?: boolean; observed?: boolean }; requiredOutput?: { kind?: string; path?: string; missing?: boolean }; afterCompactionSettlement?: boolean } }; intercomTarget?: string; acceptance?: { status?: string; effectiveAcceptance?: { level?: string }; childReport?: unknown; runtimeChecks?: Array<{ id?: string; status?: string; message?: string }> }; artifactPaths?: { outputPath?: string; inputPath?: string; metadataPath?: string; transcriptPath?: string }; outputSaveError?: string; artifactOutputSaveFailed?: true; metadataSaveError?: string; capabilityCeiling?: { version?: number; allowedTools?: string[]; denyExtensions?: boolean; sources?: string[] }; capabilityAudit?: { effectiveTools?: string[]; removedTools?: string[]; extensionsDenied?: boolean } }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; acceptanceStatus?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; acceptanceStatus?: string; error?: string }> }> };
 	parallelHandoff?: { version?: number; path?: string; groupCount?: number; childCount?: number; changedPatches?: number; cleanupState?: string };
@@ -131,7 +131,7 @@ interface AsyncStatusPayload {
 		launchResolvedExtensions?: LaunchResolvedExtensions;
 		runtimeAcknowledgedExtensions?: RuntimeAcknowledgedExtensions;
 		execution?: { status?: string; success?: boolean; exitCode?: number };
-		effects?: { fileMutation?: { status?: string; expected?: boolean; attempted?: boolean }; settlementDiagnostic?: { finalTextPresent?: boolean; mutation?: { expected?: boolean; attempted?: boolean; observed?: boolean }; requiredOutput?: { kind?: string; path?: string; missing?: boolean }; afterCompactionSettlement?: boolean } };
+		effects?: { fileMutation?: { status?: string; attempted?: boolean }; settlementDiagnostic?: { finalTextPresent?: boolean; mutation?: { attempted?: boolean; observed?: boolean }; requiredOutput?: { kind?: string; path?: string; missing?: boolean }; afterCompactionSettlement?: boolean } };
 		acceptance?: { status?: string };
 		contextLimit?: number;
 		turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; terminationDeferredAtTurn?: number; exceededAtTurn?: number };
@@ -339,25 +339,7 @@ async function waitForAsyncResultFile(id: string, timeoutMs = 15_000): Promise<s
 		if (Date.now() > deadline) {
 			const asyncDir = path.join(ASYNC_DIR, id);
 			// Summarize before teardown; never print free-form output, prompts or tokens.
-			const evidence = ["status.json", "runner-startup-proceed.json", "process-terminal.json", "events.jsonl", "runner.stdout.log", "runner.stderr.log"].map((name) => {
-				let text: string;
-				try {
-					text = fs.readFileSync(path.join(asyncDir, name), "utf-8");
-				} catch (error) {
-					const code = (error as NodeJS.ErrnoException).code;
-					return `${name}: ${code === "ENOENT" ? "absent" : `unreadable (${code ?? "unknown"})`}`;
-				}
-				if (!text.length) return `${name}: empty`;
-				const size = `${Buffer.byteLength(text)} bytes (contents withheld)`;
-				if (name !== "status.json") return `${name}: readable, ${size}`;
-				try {
-					const status = JSON.parse(text) as AsyncStatusPayload;
-					const knownState = (value: unknown) => ["pending", "running", "complete", "failed", "cancelled"].includes(String(value)) ? value : "other/absent";
-					return `${name}: ${JSON.stringify({ state: knownState(status.state), steps: status.steps?.map((step) => knownState(step.status)), endedAtPresent: typeof status.endedAt === "number" })}`;
-				} catch {
-					return `${name}: invalid status JSON, ${size}`;
-				}
-			});
+			const evidence = asyncResultTimeoutEvidence(asyncDir, id);
 			// The current fixture queue proves prompt entry, not per-run identity or settlement.
 			const queueDir = process.env.MOCK_PI_QUEUE_DIR;
 			let mockEvidence = "mock queue: not configured";
@@ -636,11 +618,9 @@ export function installAsyncExecutionHooks(): void {
 	beforeEach(() => {
 		tempDir = createTempDir();
 		mockPi.reset();
-		clearExclusions();
 	});
 
 	afterEach(() => {
-		clearExclusions();
 		removeTempDir(tempDir);
 	});
 }
@@ -671,7 +651,7 @@ export function installAsyncExecutionHooks(): void {
 		const receipt = executeAsyncSingle(id, {
 			agent: "worker",
 			task: "Exercise child protocol",
-			agentConfig: makeAgent("worker", { completionGuard: false }),
+			agentConfig: makeAgent("worker"),
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
 			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 			shareEnabled: false,

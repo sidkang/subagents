@@ -4,7 +4,7 @@
 
 # pi-subagents
 
-This fork snapshot is `pi-subagents@0.65.1+sid.1` on upstream `0.65.1` / `83be9c3de2cde1553c0269f383efc1eb1194dc8b`. See [Fork changes](./docs/fork-changes.md).
+This fork snapshot is `pi-subagents@0.71.0+sid.1` on upstream `main` / `2e9c51ba`. See [Fork changes](./docs/fork-changes.md).
 
 `pi-subagents` lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
 
@@ -34,7 +34,7 @@ pi update --extension git:github.com/sidkang/subagents@dev
 
 Do not load this package together with another extension that registers the same `subagent` surface.
 
-Background children require pi installed as the npm package (`@earendil-works/pi-coding-agent`): the detached runner imports pi's packages from that package directory. A standalone single-file pi binary has no package directory and cannot run background children; foreground children (`async: false`) still work there.
+Background children use the host's SDK: npm Pi keeps its detached Node runner; the official Pi 0.86.1 Linux x64 standalone release loads the same runner through Pi's embedded SDK, without a separate SDK install. See [Standalone background execution](docs/standalone-background.md) for the supported boundary and validation gate.
 
 ## Try this first
 
@@ -64,7 +64,9 @@ Pi is the parent session. A subagent is a focused child Pi session with its own 
 
 When you ask for a subagent, Pi starts the child, gives it the task, and brings the result back. Foreground children run as sessions inside the parent Pi process and stream in the conversation. Background children run as sessions inside a detached runner process that keeps working and can be checked later.
 
-Installing the extension does not start an automatic reviewer in the background. It gives Pi a delegation tool. If you want every implementation reviewed, say so in your prompt or project instructions:
+Installing the extension does not start an automatic reviewer in the background. Fresh parent sessions initially expose the small `subagents_enable` loader instead of the full `subagent` schema. When your request or applicable instructions authorize delegation, Pi can call the loader itself; the unchanged `subagent` tool is available on the next model request. Complexity alone does not authorize delegation. `bg_wait` and supervisor replies remain available without activation.
+
+If you want every implementation reviewed, say so in your prompt or project instructions:
 
 ```text
 When you finish implementing, run a reviewer subagent before summarizing.
@@ -128,7 +130,7 @@ For bounded orchestration, `maxSubagentSpawnsPerRun` limits cumulative logical c
 
 or ask: "Check whether subagents and intercom are set up correctly."
 
-For installed-version help, use `/subagents-guide [topic]` or `subagent({ action: "guide", topic: "workflows" })`. The default topic is `overview`; available topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, and `extension-api`.
+For installed-version help, use `/subagents-guide [topic]` or `subagent({ action: "guide", topic: "workflows" })`. The default topic is `overview`; available topics are `overview`, `workflows`, `agents`, `missions`, `observability`, `tool-reference`, `configuration`, `models`, `watchdog`, `extension-api`, and `council`.
 
 ## Documentation
 
@@ -137,7 +139,7 @@ The full reference lives in `docs/`:
 | Doc | What's in it |
 |-----|--------------|
 | [Agents](./docs/agents.md) | Custom agents, frontmatter reference, overriding builtins, tools, extensions, skills, per-agent memory. |
-| [Models](./docs/models.md) | Default models, per-role overrides, recommended tiering, fallbacks, thinking levels, model scope enforcement, profiles. |
+| [Models](./docs/models.md) | Single-model selection and launch, defaults, per-role overrides, recommended tiering, thinking levels, model scope enforcement, profiles. |
 | [Workflows](./docs/workflows.md) | Orchestration patterns, prompt shortcuts, scripted workflows, worktree isolation, child-to-parent coordination, the recursion guard. |
 | [Watchdog](./docs/watchdog.md) | The opt-in adversarial change reviewer, scope monitoring, LSP checks, and child tool permissions. |
 | [Tool reference](./docs/tool-reference.md) | Every `subagent` parameter, management actions, status/control actions, acceptance gates, external CLI runners. |
